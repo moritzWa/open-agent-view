@@ -8,6 +8,20 @@ and future released versions are intended to follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Pasting multi-line text into the composer no longer submits once per line.
+  Without bracketed paste, each line break in a clipboard arrived as Enter, so
+  a large paste could start hundreds of coding-agent sessions at once. The
+  dashboard now enables bracketed paste and inserts the clipboard as one
+  multi-line draft. On terminals without bracketed paste, an Enter that arrives
+  in the middle of a burst of queued input is treated as a pasted line break.
+
+### Tests
+
+- Added renderer, key-handling, and real-PTY coverage for legacy CR pastes,
+  bracketed pastes, typed Enter after a paste, and `/command⏎task` bursts.
+
 ## [0.1.53] - 2026-09-04
 
 ### Added

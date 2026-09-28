@@ -443,6 +443,7 @@ label.
 | New-task composer | `/filter TEXT` / `/help` | Apply a session filter or list dashboard slash commands without contacting a provider. |
 | New-task composer | `/setup [HARNESS]` | Open the selected or named harness's isolated install/login terminal. |
 | Writable composer | `ctrl+j` | Insert a newline rather than submit. |
+| Any view | paste | Pasted text is inserted as text, never submitted. Line breaks in the clipboard become newlines in one draft; a paste on the dashboard opens the new-task composer. Open Agent View enables bracketed paste, and on terminals without it treats an Enter that arrives in the middle of a burst of queued input as a pasted line break. Control characters other than tab and newline are dropped. |
 | Writable composer | `backspace` | Remove the last character. |
 | Writable composer/model filter | `option+backspace` or `ctrl+w` | Remove the previous word. |
 | Writable composer/model filter | `cmd+backspace` or `ctrl+u` | Remove to the beginning of the current line. |

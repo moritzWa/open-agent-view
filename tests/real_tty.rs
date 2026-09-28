@@ -2527,6 +2527,54 @@ fn wide_real_tty_exercises_primary_interactions_and_restores_terminal() {
 }
 
 #[test]
+fn pasted_clipboard_becomes_one_draft_instead_of_one_launch_per_line() {
+    let _serial = serialize_real_tty_test();
+    let mut app = PtyApp::spawn(105, 30);
+    app.wait_for("startup", |screen| screen.contains("owned-codex-worker"));
+    assert!(
+        contains_bytes(&app.raw, b"\x1b[?2004h"),
+        "dashboard did not enable bracketed paste"
+    );
+
+    // A terminal without bracketed paste delivers a paste as keystrokes with
+    // CR for every line break. Each CR used to submit the composer.
+    app.send(b"paste-line-one\rpaste-line-two\rpaste-line-three\r");
+    let legacy = app.wait_for("legacy paste stays in the composer", |screen| {
+        screen.contains("paste-line-one")
+            && screen.contains("paste-line-two")
+            && screen.contains("paste-line-three")
+    });
+    assert!(
+        !legacy.contains("launch failed"),
+        "a legacy paste submitted the composer: {legacy}"
+    );
+    app.send(ESC);
+    app.wait_for("legacy paste draft discarded", |screen| {
+        !screen.contains("paste-line-one") && screen.contains("describe a task")
+    });
+
+    app.send(b"\x1b[200~bracket-line-one\nbracket-line-two\r\nbracket-line-three\x1b[201~");
+    let bracketed = app.wait_for("bracketed paste stays in the composer", |screen| {
+        screen.contains("bracket-line-one")
+            && screen.contains("bracket-line-two")
+            && screen.contains("bracket-line-three")
+    });
+    assert!(
+        !bracketed.contains("launch failed"),
+        "a bracketed paste submitted the composer: {bracketed}"
+    );
+
+    // A typed Enter after the paste settles still submits the whole draft.
+    std::thread::sleep(Duration::from_millis(200));
+    app.send(ENTER);
+    app.wait_for("typed enter submits the pasted draft", |screen| {
+        screen.contains("launch failed:") && !screen.contains("bracket-line-one")
+    });
+
+    app.exit_cleanly();
+}
+
+#[test]
 fn fixture_fence_covers_launch_open_reply_interrupt_and_bulk_delete() {
     let _serial = serialize_real_tty_test();
     let mut app = PtyApp::spawn(105, 30);

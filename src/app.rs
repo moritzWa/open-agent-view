@@ -1068,6 +1068,25 @@ impl App {
         }
     }
 
+    /// Insert pasted text as text. A paste never submits, so a clipboard with
+    /// many lines becomes one multi-line draft instead of one launch per line.
+    pub fn paste_input(&mut self, text: &str) {
+        let text = normalize_pasted_text(text);
+        if text.is_empty() {
+            return;
+        }
+        if self.overlay == Overlay::None {
+            self.start_new_session(None);
+        }
+        for character in text.chars() {
+            if character == '\n' && self.overlay == Overlay::ModelPicker {
+                self.push_input(' ');
+            } else {
+                self.push_input(character);
+            }
+        }
+    }
+
     pub fn pop_input(&mut self) {
         if self.overlay == Overlay::ModelPicker {
             self.model_filter.pop();
@@ -1229,6 +1248,28 @@ impl App {
             .cloned()
             .or_else(|| keys.first().cloned());
     }
+}
+
+/// Keep printable text, tabs, and line breaks from a paste. `\r\n` and bare
+/// `\r` become `\n`; other control characters are dropped so a paste can never
+/// carry escape sequences into the draft.
+pub fn normalize_pasted_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                output.push('\n');
+            }
+            '\n' | '\t' => output.push(character),
+            other if other.is_control() => {}
+            other => output.push(other),
+        }
+    }
+    output
 }
 
 fn matches_filter(session: &AgentSession, needle: &str) -> bool {
@@ -1624,6 +1665,42 @@ mod tests {
             app.selection,
             Some(SelectionKey::Group("state:Working".into()))
         );
+    }
+
+    #[test]
+    fn pasting_many_lines_makes_one_draft_and_never_submits() {
+        let mut app = App::new(SessionSnapshot {
+            sessions: vec![session("one", SessionState::Working)],
+            warnings: vec![],
+        });
+
+        app.paste_input("first line\r\nsecond line\rthird line\r");
+
+        assert_eq!(app.overlay, Overlay::Composer(ComposerMode::NewSession));
+        assert_eq!(app.input, "first line\nsecond line\nthird line\n");
+
+        app.paste_input("\u{1b}[31mfour\u{7}th\t!");
+        assert_eq!(
+            app.input,
+            "first line\nsecond line\nthird line\n[31mfourth\t!"
+        );
+
+        app.escape();
+        app.paste_input("");
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn pasting_into_the_model_picker_keeps_the_filter_on_one_line() {
+        let mut app = App::new(SessionSnapshot::default());
+        app.start_new_session(None);
+        app.open_model_picker();
+
+        app.paste_input("sonnet\r\nopus");
+
+        assert_eq!(app.overlay, Overlay::ModelPicker);
+        assert_eq!(app.model_filter, "sonnet opus");
     }
 
     #[test]

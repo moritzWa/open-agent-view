@@ -18,7 +18,7 @@ path = "src/main.rs"
 # Exact versions keep the project buildable with the documented Rust 1.75 MSRV.
 anyhow = "=1.0.86"
 clap = { version = "=4.5.4", features = ["derive"] }
-crossterm = "=0.27.0"
+crossterm = { version = "=0.27.0", features = ["bracketed-paste"] }
 getrandom = "=0.2.17"
 libc = "=0.2.189"
 ratatui = "=0.26.3"

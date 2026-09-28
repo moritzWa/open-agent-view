@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -30,6 +31,11 @@ use crate::ui;
 // would repaint a frame that the user will never see and can saturate a remote
 // terminal or tmux pane.
 const MAX_READY_EVENTS_PER_TICK: usize = 256;
+// Terminals without bracketed paste deliver a paste as plain keystrokes, with
+// every line break arriving as Enter. Nobody types this many characters, then
+// Enter, then more text inside one input tick, so an Enter in the middle of
+// such a burst is a pasted line break, not a request to submit.
+const PASTE_BURST_CHARACTERS: usize = 3;
 const LAUNCH_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const LAUNCH_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const LAUNCH_ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
@@ -196,6 +202,7 @@ pub fn run_dashboard(
     let mut next_launch_animation = Instant::now();
     let mut next_live_animation = Instant::now() + LIVE_SESSION_ANIMATION_INTERVAL;
     let mut needs_draw = true;
+    let mut input_burst = InputBurst::default();
     schedule_refresh(
         &refresh_tx,
         &discovery_request_for_pending_launch(&current_request, pending_launch.as_ref()),
@@ -468,7 +475,14 @@ pub fn run_dashboard(
         if event::poll(until_refresh.min(Duration::from_millis(50)))? {
             for event_index in 0..MAX_READY_EVENTS_PER_TICK {
                 match event::read()? {
+                    Event::Paste(text) => {
+                        app.paste_input(&text);
+                        needs_draw = true;
+                    }
                     Event::Key(key) => {
+                        let more_input_pending = event::poll(Duration::ZERO)?;
+                        let draft_is_command = app.input.starts_with('/');
+                        let key = input_burst.classify(key, more_input_pending, draft_is_command);
                         let mut action = handle_key(&mut app, key);
                         if action == AppAction::Quit && migrating_target.is_some() {
                             app.should_quit = false;
@@ -664,6 +678,11 @@ pub fn run_dashboard(
                     break;
                 }
             }
+            if !event::poll(Duration::ZERO)? {
+                input_burst = InputBurst::default();
+            }
+        } else {
+            input_burst = InputBurst::default();
         }
         if !refresh_in_flight
             && pending_launch_retry_at.is_some_and(|retry_at| Instant::now() >= retry_at)
@@ -949,6 +968,55 @@ fn update_session_alias_from_app(
     } else {
         SessionAliasUpdate::Unchanged
     })
+}
+
+/// Tracks one uninterrupted run of ready input events so a pasted line break
+/// can be told apart from a typed Enter when the terminal has no bracketed
+/// paste. Reset it whenever the input queue drains.
+#[derive(Debug, Default)]
+struct InputBurst {
+    typed_characters: usize,
+    pasted_line_break: bool,
+}
+
+impl InputBurst {
+    /// `more_input_pending` reports whether further events were already queued
+    /// behind this key. A typed Enter is the last thing in the queue; a pasted
+    /// line break has the rest of the clipboard behind it. Once a burst has
+    /// proven to be a paste, its trailing line break is a line break too.
+    ///
+    /// `draft_is_command` exempts a `/command` draft: submitting one never
+    /// launches a session, and scripted `/harness x⏎task` sequences are common.
+    fn classify(
+        &mut self,
+        key: KeyEvent,
+        more_input_pending: bool,
+        draft_is_command: bool,
+    ) -> KeyEvent {
+        if key.kind == KeyEventKind::Release {
+            return key;
+        }
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        if key.code == KeyCode::Enter && plain && !draft_is_command {
+            let pasted = self.pasted_line_break
+                || (more_input_pending && self.typed_characters >= PASTE_BURST_CHARACTERS);
+            if pasted {
+                self.pasted_line_break = true;
+                return KeyEvent {
+                    code: KeyCode::Char('j'),
+                    modifiers: KeyModifiers::CONTROL,
+                    kind: key.kind,
+                    state: key.state,
+                };
+            }
+        }
+        if matches!(key.code, KeyCode::Char(_)) && plain {
+            self.typed_characters += 1;
+        }
+        key
+    }
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
@@ -1679,7 +1747,8 @@ impl TerminalSession {
                 PushKeyboardEnhancementFlags(
                     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                )
+                ),
+                EnableBracketedPaste
             )?;
         }
         execute!(stdout, crossterm::cursor::Hide)?;
@@ -1697,7 +1766,11 @@ impl TerminalSession {
         }
         disable_raw_mode()?;
         if self.keyboard_enhancement {
-            execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags)?;
+            execute!(
+                self.terminal.backend_mut(),
+                DisableBracketedPaste,
+                PopKeyboardEnhancementFlags
+            )?;
         }
         execute!(
             self.terminal.backend_mut(),
@@ -1720,7 +1793,8 @@ impl TerminalSession {
                 PushKeyboardEnhancementFlags(
                     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                         | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                )
+                ),
+                EnableBracketedPaste
             )?;
         }
         execute!(self.terminal.backend_mut(), crossterm::cursor::Hide)?;
@@ -1747,7 +1821,11 @@ impl Drop for TerminalSession {
         }
         let _ = disable_raw_mode();
         if self.keyboard_enhancement {
-            let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
+            let _ = execute!(
+                self.terminal.backend_mut(),
+                DisableBracketedPaste,
+                PopKeyboardEnhancementFlags
+            );
         }
         let _ = execute!(
             self.terminal.backend_mut(),
@@ -2148,6 +2226,143 @@ mod tests {
             }
         );
         assert!(app.input.is_empty());
+    }
+
+    /// Feed one queued burst of raw input the way a legacy terminal delivers a
+    /// paste: every byte is already buffered, so each key except the last has
+    /// more input pending behind it.
+    fn feed_burst(app: &mut App, burst: &mut InputBurst, text: &str) -> usize {
+        let characters: Vec<char> = text.chars().collect();
+        let mut launches = 0;
+        for (index, character) in characters.iter().enumerate() {
+            let code = if *character == '\r' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(*character)
+            };
+            let more_pending = index + 1 < characters.len();
+            let command = app.input.starts_with('/');
+            let key = burst.classify(key(code), more_pending, command);
+            if matches!(handle_key(app, key), AppAction::Launch { .. }) {
+                launches += 1;
+            }
+        }
+        launches
+    }
+
+    #[test]
+    fn a_pasted_burst_with_trailing_newline_is_one_draft_not_three_launches() {
+        let mut app = app();
+        let mut burst = InputBurst::default();
+
+        let launches = feed_burst(
+            &mut app,
+            &mut burst,
+            "first line\rsecond line\rthird line\r",
+        );
+
+        assert_eq!(launches, 0);
+        assert_eq!(
+            app.overlay,
+            Overlay::Composer(crate::app::ComposerMode::NewSession)
+        );
+        assert_eq!(app.input, "first line\nsecond line\nthird line\n");
+    }
+
+    #[test]
+    fn typed_text_followed_by_enter_in_one_burst_still_submits() {
+        let mut app = app();
+        let mut burst = InputBurst::default();
+
+        let launches = feed_burst(&mut app, &mut burst, "ship\r");
+
+        assert_eq!(launches, 1);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn a_slash_command_followed_by_a_task_in_one_burst_runs_the_command() {
+        let mut app = app();
+        let mut burst = InputBurst::default();
+
+        let mut app = App::with_launch_targets(
+            app.snapshot.clone(),
+            true,
+            Provider::Claude,
+            vec![
+                LaunchTarget {
+                    provider: Provider::Claude,
+                    supports_model: true,
+                },
+                LaunchTarget {
+                    provider: Provider::Codex,
+                    supports_model: true,
+                },
+            ],
+        );
+
+        let launches = feed_burst(&mut app, &mut burst, "/harness codex\rnext task");
+
+        assert_eq!(launches, 0);
+        assert_eq!(app.launch_provider, Provider::Codex);
+        assert_eq!(app.input, "next task");
+    }
+
+    #[test]
+    fn typed_enter_still_submits_after_the_queue_drains() {
+        let mut app = app();
+        let mut burst = InputBurst::default();
+        feed_burst(&mut app, &mut burst, "ship");
+        burst = InputBurst::default();
+
+        let enter = burst.classify(key(KeyCode::Enter), false, false);
+        assert_eq!(enter.code, KeyCode::Enter);
+        assert_eq!(
+            handle_key(&mut app, enter),
+            AppAction::Launch {
+                provider: Provider::Claude,
+                model: None,
+                prompt: "ship".into()
+            }
+        );
+    }
+
+    #[test]
+    fn short_bursts_and_modified_keys_do_not_change_enter() {
+        let mut burst = InputBurst::default();
+        for character in "ok".chars() {
+            burst.classify(key(KeyCode::Char(character)), true, false);
+        }
+        assert_eq!(
+            burst.classify(key(KeyCode::Enter), true, false).code,
+            KeyCode::Enter
+        );
+
+        let mut burst = InputBurst::default();
+        for character in "abc".chars() {
+            burst.classify(control_key(character), true, false);
+        }
+        assert_eq!(
+            burst.classify(key(KeyCode::Enter), true, false).code,
+            KeyCode::Enter
+        );
+
+        let mut burst = InputBurst::default();
+        for character in "abc".chars() {
+            burst.classify(
+                KeyEvent {
+                    kind: KeyEventKind::Release,
+                    ..key(KeyCode::Char(character))
+                },
+                true,
+                false,
+            );
+        }
+        assert_eq!(
+            burst.classify(key(KeyCode::Enter), true, false).code,
+            KeyCode::Enter
+        );
     }
 
     #[test]
