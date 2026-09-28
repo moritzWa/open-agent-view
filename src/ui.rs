@@ -11,17 +11,17 @@ use crate::app::{
 };
 use crate::domain::{AgentSession, Capability, Provider, SessionState};
 
-const BG: Color = Color::Rgb(24, 26, 27);
-const FG: Color = Color::Rgb(205, 205, 205);
-const DIM: Color = Color::Rgb(145, 145, 145);
-const SELECTED_BG: Color = Color::Rgb(58, 60, 61);
-const ACCENT: Color = Color::Rgb(89, 194, 201);
-const ATTENTION: Color = Color::Rgb(232, 191, 72);
-const COMPLETE: Color = Color::Rgb(101, 187, 120);
+fn palette() -> crate::theme::Palette {
+    crate::theme::active_palette()
+}
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
+    crate::theme::set_active_palette(crate::theme::Palette::for_scheme(app.color_scheme));
     let area = frame.size();
-    frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(palette().bg).fg(palette().fg)),
+        area,
+    );
     if area.width < 32 || area.height < 8 {
         let message = if area.width >= 18 && area.height >= 2 {
             vec![
@@ -33,7 +33,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         };
         frame.render_widget(
             Paragraph::new(message)
-                .style(Style::default().bg(BG).fg(ATTENTION))
+                .style(Style::default().bg(palette().bg).fg(palette().attention))
                 .alignment(Alignment::Center),
             area,
         );
@@ -115,11 +115,13 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let lines = if area.height <= 2 {
         vec![
             Line::from(vec![
-                Span::styled("◇ ", Style::default().fg(ACCENT)),
+                Span::styled("◇ ", Style::default().fg(palette().accent)),
                 Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
                 Span::styled(
                     if app.yolo { "  ⚠ YOLO" } else { "" },
-                    Style::default().fg(ATTENTION).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(palette().attention)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(format!(
@@ -129,20 +131,20 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else if area.width >= 70 {
         vec![
             Line::from(vec![
-                Span::styled("  ◇◇  ", Style::default().fg(ACCENT)),
+                Span::styled("  ◇◇  ", Style::default().fg(palette().accent)),
                 Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
-                Span::styled(" ◇  ◇ ", Style::default().fg(ACCENT)),
-                Span::styled(format!("{providers} · {cwd}"), Style::default().fg(DIM)),
+                Span::styled(" ◇  ◇ ", Style::default().fg(palette().accent)),
+                Span::styled(format!("{providers} · {cwd}"), Style::default().fg(palette().dim)),
             ]),
             Line::from(vec![
-                Span::styled("  ◇◇  ", Style::default().fg(ACCENT)),
+                Span::styled("  ◇◇  ", Style::default().fg(palette().accent)),
                 Span::styled(
                     format!(
                         "{awaiting} awaiting input · {working} working · {completed_status} · {mode} view"
                     ),
-                    Style::default().fg(DIM),
+                    Style::default().fg(palette().dim),
                 ),
             ]),
             Line::from(Span::styled(
@@ -152,7 +154,7 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     ""
                 },
                 Style::default()
-                    .fg(ATTENTION)
+                    .fg(palette().attention)
                     .add_modifier(Modifier::BOLD),
             )),
         ]
@@ -164,11 +166,11 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
             )),
             Line::from(Span::styled(
                 format!("{providers} · {cwd}"),
-                Style::default().fg(DIM),
+                Style::default().fg(palette().dim),
             )),
             Line::from(Span::styled(
                 format!("{awaiting} awaiting · {working} working · {completed_status}"),
-                Style::default().fg(DIM),
+                Style::default().fg(palette().dim),
             )),
             Line::from(Span::styled(
                 if app.yolo {
@@ -176,12 +178,14 @@ fn render_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 } else {
                     ""
                 },
-                Style::default().fg(ATTENTION).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette().attention)
+                    .add_modifier(Modifier::BOLD),
             )),
         ]
     };
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(BG).fg(FG)),
+        Paragraph::new(lines).style(Style::default().bg(palette().bg).fg(palette().fg)),
         area,
     );
 }
@@ -261,7 +265,7 @@ fn render_session_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 } else {
                     "No sessions match the current filter"
                 },
-                Style::default().fg(DIM),
+                Style::default().fg(palette().dim),
             )));
         }
     }
@@ -277,7 +281,7 @@ fn render_session_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .min(u16::MAX as usize);
     frame.render_widget(
         Paragraph::new(lines)
-            .style(Style::default().bg(BG).fg(FG))
+            .style(Style::default().bg(palette().bg).fg(palette().fg))
             .scroll((scroll as u16, 0)),
         area,
     );
@@ -287,10 +291,10 @@ fn render_show_more_row(hidden: usize, page_size: usize, selected: bool) -> Line
     let next = hidden.min(page_size);
     styled_line(
         vec![
-            Span::styled("  ↓ ", Style::default().fg(ACCENT)),
+            Span::styled("  ↓ ", Style::default().fg(palette().accent)),
             Span::styled(
                 format!("Show {next} more · {hidden} hidden"),
-                Style::default().fg(DIM),
+                Style::default().fg(palette().dim),
             ),
         ],
         selected,
@@ -305,7 +309,7 @@ fn empty_state_lines(includes_completed: bool) -> Vec<Line<'static>> {
         )),
         Line::from(Span::styled(
             " Sessions that have a question or need your decision land here",
-            Style::default().fg(DIM),
+            Style::default().fg(palette().dim),
         )),
         Line::default(),
         Line::from(Span::styled(
@@ -314,7 +318,7 @@ fn empty_state_lines(includes_completed: bool) -> Vec<Line<'static>> {
         )),
         Line::from(Span::styled(
             " Sessions your coding agents are actively working on",
-            Style::default().fg(DIM),
+            Style::default().fg(palette().dim),
         )),
         Line::default(),
         Line::from(Span::styled(
@@ -327,12 +331,12 @@ fn empty_state_lines(includes_completed: bool) -> Vec<Line<'static>> {
             } else {
                 " Hidden for this view · use /completed show or restart without --hide-completed"
             },
-            Style::default().fg(DIM),
+            Style::default().fg(palette().dim),
         )),
         Line::default(),
         Line::from(Span::styled(
             "Hand off a substantial task below. Open Agent View will organize it by status so you can see when it needs you.",
-            Style::default().fg(DIM),
+            Style::default().fg(palette().dim),
         )),
     ]
 }
@@ -387,9 +391,12 @@ fn render_session_row(
     let spans = vec![
         Span::styled(format!(" {symbol} "), symbol_style),
         Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {provider} "), Style::default().fg(ACCENT)),
-        Span::styled(summary, Style::default().fg(DIM)),
-        Span::styled(right, Style::default().fg(DIM)),
+        Span::styled(
+            format!(" {provider} "),
+            Style::default().fg(palette().accent),
+        ),
+        Span::styled(summary, Style::default().fg(palette().dim)),
+        Span::styled(right, Style::default().fg(palette().dim)),
     ];
     styled_line(spans, selected)
 }
@@ -418,20 +425,24 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let mut block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(if renaming || naming_migration {
-            ACCENT
+            palette().accent
         } else {
-            DIM
+            palette().dim
         }))
-        .style(Style::default().bg(BG));
+        .style(Style::default().bg(palette().bg));
     if renaming {
         block = block.title(Span::styled(
             " rename session ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(palette().accent)
+                .add_modifier(Modifier::BOLD),
         ));
     } else if let Overlay::Composer(ComposerMode::MigrationName { target, .. }) = &app.overlay {
         block = block.title(Span::styled(
             format!(" migrate to {} · choose local name ", target.label()),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(palette().accent)
+                .add_modifier(Modifier::BOLD),
         ));
     } else if matches!(
         app.overlay,
@@ -450,7 +461,9 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 app.launch_provider.label(),
             ),
             if app.yolo {
-                Style::default().fg(ATTENTION).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(palette().attention)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             },
@@ -475,9 +488,9 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ),
     };
     let text_style = if editable {
-        Style::default().fg(FG)
+        Style::default().fg(palette().fg)
     } else {
-        Style::default().fg(DIM)
+        Style::default().fg(palette().dim)
     };
     let content_lines = if editable {
         input_lines(content)
@@ -487,9 +500,9 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Line::from(vec![
                     Span::styled(if index == 0 { prefix } else { "" }, {
                         let style = Style::default().fg(if renaming || naming_migration {
-                            ACCENT
+                            palette().accent
                         } else {
-                            FG
+                            palette().fg
                         });
                         if renaming || naming_migration {
                             style.add_modifier(Modifier::BOLD)
@@ -506,9 +519,9 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::styled(
                 prefix,
                 Style::default().fg(if renaming || naming_migration {
-                    ACCENT
+                    palette().accent
                 } else {
-                    FG
+                    palette().fg
                 }),
             ),
             Span::styled(content.to_owned(), text_style),
@@ -544,8 +557,8 @@ fn render_peek(frame: &mut Frame<'_>, app: &App, area: Rect) {
             session.runtime.label()
         )))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(ACCENT))
-        .style(Style::default().bg(BG));
+        .border_style(Style::default().fg(palette().accent))
+        .style(Style::default().bg(palette().bg));
     let summary = app.selected_detail().unwrap_or_else(|| {
         if session.summary.is_empty() {
             "No summary is available from this provider."
@@ -566,7 +579,7 @@ fn render_peek(frame: &mut Frame<'_>, app: &App, area: Rect) {
         };
         vec![Line::from(Span::styled(
             choices,
-            Style::default().fg(ATTENTION),
+            Style::default().fg(palette().attention),
         ))]
     } else if can_respond {
         editable_response_lines("answer", &app.input)
@@ -575,7 +588,7 @@ fn render_peek(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         vec![Line::from(Span::styled(
             "enter to open native session",
-            Style::default().fg(DIM),
+            Style::default().fg(palette().dim),
         ))]
     };
     let summary_capacity = area.height.saturating_sub(3 + response.len() as u16).max(1) as usize;
@@ -607,7 +620,7 @@ fn editable_response_lines(label: &str, input: &str) -> Vec<Line<'static>> {
     if input.is_empty() {
         return vec![Line::from(Span::styled(
             format!("❯ {label}"),
-            Style::default().fg(DIM),
+            Style::default().fg(palette().dim),
         ))];
     }
     input_lines(input)
@@ -620,7 +633,7 @@ fn editable_response_lines(label: &str, input: &str) -> Vec<Line<'static>> {
                     if index == 0 { "❯ " } else { "" },
                     sanitize_inline(&line)
                 ),
-                Style::default().fg(FG),
+                Style::default().fg(palette().fg),
             ))
         })
         .collect()
@@ -643,12 +656,14 @@ fn input_line_count(input: &str) -> u16 {
 fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(ACCENT))
+        .border_style(Style::default().fg(palette().accent))
         .title(Span::styled(
             " shortcuts ",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(palette().accent)
+                .add_modifier(Modifier::BOLD),
         ))
-        .style(Style::default().bg(BG));
+        .style(Style::default().bg(palette().bg));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -668,21 +683,23 @@ fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 if let Some((keys, description)) = action.split_once(" to ") {
                     spans.push(Span::styled(
                         keys.to_owned(),
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(palette().accent)
+                            .add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::styled(
                         format!(" to {description}"),
-                        Style::default().fg(FG),
+                        Style::default().fg(palette().fg),
                     ));
                 } else {
-                    spans.push(Span::styled(action, Style::default().fg(FG)));
+                    spans.push(Span::styled(action, Style::default().fg(palette().fg)));
                 }
             }
             Line::from(spans)
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(BG).fg(FG)),
+        Paragraph::new(lines).style(Style::default().bg(palette().bg).fg(palette().fg)),
         inner,
     );
 }
@@ -699,7 +716,7 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(footer)
-            .style(Style::default().bg(BG).fg(DIM))
+            .style(Style::default().bg(palette().bg).fg(palette().dim))
             .alignment(Alignment::Left),
         area,
     );
@@ -1027,15 +1044,15 @@ fn render_harness_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
             );
             Line::from(label).style(if selected {
                 Style::default()
-                    .bg(SELECTED_BG)
-                    .fg(Color::White)
+                    .bg(palette().selected_bg)
+                    .fg(palette().selected_fg)
                     .add_modifier(Modifier::BOLD)
             } else if yolo_unavailable {
-                Style::default().bg(BG).fg(ATTENTION)
+                Style::default().bg(palette().bg).fg(palette().attention)
             } else if current {
-                Style::default().bg(BG).fg(ACCENT)
+                Style::default().bg(palette().bg).fg(palette().accent)
             } else {
-                Style::default().bg(BG).fg(FG)
+                Style::default().bg(palette().bg).fg(palette().fg)
             })
         })
         .collect::<Vec<_>>();
@@ -1045,7 +1062,7 @@ fn render_harness_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             " ↑/↓ · enter · esc"
         })
-        .style(Style::default().fg(DIM)),
+        .style(Style::default().fg(palette().dim)),
     );
 
     frame.render_widget(Clear, popup);
@@ -1059,9 +1076,9 @@ fn render_harness_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         app.launch_targets.len()
                     ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(ACCENT)),
+                    .border_style(Style::default().fg(palette().accent)),
             )
-            .style(Style::default().bg(BG).fg(FG)),
+            .style(Style::default().bg(palette().bg).fg(palette().fg)),
         popup,
     );
 }
@@ -1090,8 +1107,8 @@ fn render_migration_target_picker(frame: &mut Frame<'_>, app: &App, area: Rect) 
         .map(|session| session.provider.label())
         .unwrap_or("session");
     let mut lines = vec![Line::from(vec![
-        Span::styled(" from  ", Style::default().fg(DIM)),
-        Span::styled(source, Style::default().fg(FG)),
+        Span::styled(" from  ", Style::default().fg(palette().dim)),
+        Span::styled(source, Style::default().fg(palette().fg)),
     ])];
     lines.extend(
         app.migration_targets
@@ -1108,11 +1125,11 @@ fn render_migration_target_picker(frame: &mut Frame<'_>, app: &App, area: Rect) 
                 ))
                 .style(if selected {
                     Style::default()
-                        .bg(SELECTED_BG)
-                        .fg(Color::White)
+                        .bg(palette().selected_bg)
+                        .fg(palette().selected_fg)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().bg(BG).fg(FG)
+                    Style::default().bg(palette().bg).fg(palette().fg)
                 })
             }),
     );
@@ -1122,7 +1139,7 @@ fn render_migration_target_picker(frame: &mut Frame<'_>, app: &App, area: Rect) 
         } else {
             " ↑/↓ · enter · esc"
         })
-        .style(Style::default().fg(DIM)),
+        .style(Style::default().fg(palette().dim)),
     );
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -1135,9 +1152,9 @@ fn render_migration_target_picker(frame: &mut Frame<'_>, app: &App, area: Rect) 
                         app.migration_targets.len()
                     ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(ACCENT)),
+                    .border_style(Style::default().fg(palette().accent)),
             )
-            .style(Style::default().bg(BG).fg(FG)),
+            .style(Style::default().bg(palette().bg).fg(palette().fg)),
         popup,
     );
 }
@@ -1187,7 +1204,7 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         (app.model_selection / visible_rows) * visible_rows
     };
     let mut lines = vec![Line::from(vec![
-        Span::styled(" filter  ", Style::default().fg(DIM)),
+        Span::styled(" filter  ", Style::default().fg(palette().dim)),
         Span::styled(
             if app.model_filter.is_empty() {
                 "type to search".into()
@@ -1195,9 +1212,9 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 sanitize_inline(&app.model_filter)
             },
             if app.model_filter.is_empty() {
-                Style::default().fg(DIM)
+                Style::default().fg(palette().dim)
             } else {
-                Style::default().fg(FG)
+                Style::default().fg(palette().fg)
             },
         ),
     ])];
@@ -1209,13 +1226,13 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 } else {
                     "  ◌ Loading models…"
                 },
-                Style::default().fg(ACCENT),
+                Style::default().fg(palette().accent),
             )));
         } else if !error_lines.is_empty() {
             lines.extend(error_lines.iter().map(|line| {
                 Line::from(Span::styled(
                     format!("  {line}"),
-                    Style::default().fg(ATTENTION),
+                    Style::default().fg(palette().attention),
                 ))
             }));
         } else {
@@ -1225,7 +1242,7 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 } else {
                     "  No matching models"
                 },
-                Style::default().fg(DIM),
+                Style::default().fg(palette().dim),
             )));
         }
         if app.has_valid_custom_model_input() {
@@ -1236,8 +1253,8 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 ))
                 .style(
                     Style::default()
-                        .bg(SELECTED_BG)
-                        .fg(Color::White)
+                        .bg(palette().selected_bg)
+                        .fg(palette().selected_fg)
                         .add_modifier(Modifier::BOLD),
                 ),
             );
@@ -1268,13 +1285,13 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     ))
                     .style(if selected {
                         Style::default()
-                            .bg(SELECTED_BG)
-                            .fg(Color::White)
+                            .bg(palette().selected_bg)
+                            .fg(palette().selected_fg)
                             .add_modifier(Modifier::BOLD)
                     } else if current {
-                        Style::default().bg(BG).fg(ACCENT)
+                        Style::default().bg(palette().bg).fg(palette().accent)
                     } else {
-                        Style::default().bg(BG).fg(FG)
+                        Style::default().bg(palette().bg).fg(palette().fg)
                     })
                 }),
         );
@@ -1286,7 +1303,7 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
             } else {
                 " Discovering available models…"
             },
-            Style::default().fg(DIM),
+            Style::default().fg(palette().dim),
         )));
     }
     lines.push(
@@ -1303,7 +1320,7 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             " ↑/↓ · enter · esc"
         })
-        .style(Style::default().fg(DIM)),
+        .style(Style::default().fg(palette().dim)),
     );
 
     frame.render_widget(Clear, popup);
@@ -1319,9 +1336,9 @@ fn render_model_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         if choices.len() == 1 { "" } else { "s" }
                     ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(ACCENT)),
+                    .border_style(Style::default().fg(palette().accent)),
             )
-            .style(Style::default().bg(BG).fg(FG)),
+            .style(Style::default().bg(palette().bg).fg(palette().fg)),
         popup,
     );
     let filter_prefix = " filter  ";
@@ -1369,9 +1386,9 @@ fn render_confirmation(frame: &mut Frame<'_>, _: &App, target: &ConfirmTarget, a
                 Block::default()
                     .title(" confirm action ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(ATTENTION)),
+                    .border_style(Style::default().fg(palette().attention)),
             )
-            .style(Style::default().bg(BG).fg(FG))
+            .style(Style::default().bg(palette().bg).fg(palette().fg))
             .wrap(Wrap { trim: true }),
         popup,
     );
@@ -1387,9 +1404,11 @@ fn provider_summary(app: &App) -> String {
 
 fn styled_line(spans: Vec<Span<'static>>, selected: bool) -> Line<'static> {
     let style = if selected {
-        Style::default().bg(SELECTED_BG).fg(Color::White)
+        Style::default()
+            .bg(palette().selected_bg)
+            .fg(palette().selected_fg)
     } else {
-        Style::default().bg(BG).fg(FG)
+        Style::default().bg(palette().bg).fg(palette().fg)
     };
     Line::from(spans).style(style)
 }
@@ -1407,10 +1426,10 @@ fn state_symbol(state: SessionState, live_animation_visible: bool) -> &'static s
 
 fn state_color(state: SessionState) -> Color {
     match state {
-        SessionState::ReadyForReview | SessionState::NeedsInput => ATTENTION,
-        SessionState::Working => ACCENT,
-        SessionState::Completed => COMPLETE,
-        SessionState::Unknown => DIM,
+        SessionState::ReadyForReview | SessionState::NeedsInput => palette().attention,
+        SessionState::Working => palette().accent,
+        SessionState::Completed => palette().complete,
+        SessionState::Unknown => palette().dim,
     }
 }
 
@@ -2256,8 +2275,8 @@ mod tests {
         assert!(rendered.contains("name ❯ worker"));
         assert!(rendered.contains("type a new name"));
         assert!(rendered.contains("empty resets to provider name"));
-        assert_eq!(buffer.get(0, 21).fg, ACCENT);
-        assert_eq!(buffer.get(7, 21).fg, FG);
+        assert_eq!(buffer.get(0, 21).fg, palette().accent);
+        assert_eq!(buffer.get(7, 21).fg, palette().fg);
         assert_ne!(buffer.get(0, 21).fg, buffer.get(7, 21).fg);
         assert_eq!(terminal.get_cursor().unwrap(), (13, 21));
     }
@@ -2458,6 +2477,40 @@ mod tests {
         let rendered = buffer_text(terminal.backend().buffer());
 
         assert!(rendered.contains("native: ←/→ twice · shift+←/→"));
+    }
+
+    #[test]
+    fn light_theme_uses_a_paper_background_and_dark_selected_text() {
+        let mut app = App::new(SessionSnapshot {
+            sessions: vec![session("worker", SessionState::Completed)],
+            warnings: vec![],
+        });
+        app.color_scheme = crate::theme::ColorScheme::Light;
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let light = crate::theme::Palette::light();
+
+        assert_eq!(buffer.get(0, 0).bg, light.bg);
+        assert_ne!(buffer.get(0, 0).bg, crate::theme::Palette::dark().bg);
+        let mut saw_selection = false;
+        let mut saw_dark_text = false;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = buffer.get(x, y);
+                if cell.bg == light.selected_bg {
+                    saw_selection = true;
+                    assert_ne!(cell.fg, Color::White);
+                    if cell.fg == light.selected_fg {
+                        saw_dark_text = true;
+                    }
+                }
+            }
+        }
+        assert!(saw_selection);
+        assert!(saw_dark_text);
     }
 
     fn session(name: &str, state: SessionState) -> AgentSession {

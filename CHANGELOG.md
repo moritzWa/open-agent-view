@@ -8,6 +8,12 @@ and future released versions are intended to follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- A light dashboard palette. `--theme auto` (the default) follows the terminal
+  background, then the operating system appearance. `--theme dark` and
+  `--theme light` force a palette.
+
 ## [0.1.53] - 2026-09-04
 
 ### Added

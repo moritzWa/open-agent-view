@@ -35,6 +35,7 @@ use open_agent_view::pi_supervisor::run_pi_supervisor_daemon;
 #[cfg(target_os = "linux")]
 use open_agent_view::pi_supervisor::PiSupervisor;
 use open_agent_view::terminal::{run_dashboard, MigrationServices};
+use open_agent_view::theme::{self, ThemePreference};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum LaunchProvider {
@@ -204,6 +205,10 @@ struct Cli {
     /// Print machine-readable JSON instead of the interactive or text view.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Dashboard colors. Auto follows the terminal background, then the OS appearance.
+    #[arg(long, value_enum, default_value = "auto")]
+    theme: ThemePreference,
 
     /// Compatibility flag; completed sessions are shown by default.
     #[arg(long)]
@@ -986,6 +991,7 @@ fn main() -> Result<()> {
         hidden_sessions,
         session_aliases,
         MigrationServices::new(migration_client, migration_registry),
+        theme::resolve(cli.theme),
     )?;
 
     Ok(())
@@ -2250,6 +2256,25 @@ mod tests {
             assert!(!discovery_request(&cli).include_completed);
         }
         assert!(Cli::try_parse_from(["open-agent-view", "--all", "--hide-completed"]).is_err());
+    }
+
+    #[test]
+    fn theme_defaults_to_auto_and_rejects_unknown_names() {
+        let cli = Cli::try_parse_from(["open-agent-view"]).unwrap();
+        assert_eq!(cli.theme, ThemePreference::Auto);
+        assert_eq!(
+            Cli::try_parse_from(["open-agent-view", "--theme", "light"])
+                .unwrap()
+                .theme,
+            ThemePreference::Light
+        );
+        assert_eq!(
+            Cli::try_parse_from(["open-agent-view", "--theme", "dark"])
+                .unwrap()
+                .theme,
+            ThemePreference::Dark
+        );
+        assert!(Cli::try_parse_from(["open-agent-view", "--theme", "sepia"]).is_err());
     }
 
     #[test]

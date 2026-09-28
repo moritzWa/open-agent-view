@@ -5,6 +5,7 @@ use std::time::SystemTime;
 use crate::domain::{
     AgentSession, Capability, LaunchTarget, Provider, SessionSnapshot, SessionState,
 };
+use crate::theme::ColorScheme;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewMode {
@@ -175,6 +176,7 @@ pub struct App {
     pub details: BTreeMap<String, String>,
     pub refreshed_at: SystemTime,
     pub should_quit: bool,
+    pub color_scheme: ColorScheme,
 }
 
 impl App {
@@ -247,6 +249,7 @@ impl App {
             details: BTreeMap::new(),
             refreshed_at: SystemTime::now(),
             should_quit: false,
+            color_scheme: ColorScheme::Dark,
         };
         app.rebuild_snapshot_cache();
         app.reconcile_selection();

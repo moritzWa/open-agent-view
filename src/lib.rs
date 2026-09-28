@@ -17,6 +17,7 @@ pub mod opencode_supervisor;
 pub mod pi_supervisor;
 pub mod process;
 pub mod terminal;
+pub mod theme;
 pub mod ui;
 
 #[cfg(test)]
