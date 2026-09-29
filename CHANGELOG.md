@@ -17,6 +17,13 @@ and future released versions are intended to follow Semantic Versioning.
   Enter/Right resumes the chat natively and Inspect lists the recorded prompts.
   `--cursor-chats-dir` overrides the store location.
 
+### Fixed
+
+- Returning from a provider's full-screen interface to the dashboard no longer
+  freezes that process. A Cursor turn (and any other native CLI opened from a
+  row) keeps running on its own terminal, so several agents can work at once.
+  Enter on the same row shows the screen it has produced since.
+
 ## [0.1.53] - 2026-09-04
 
 ### Added
