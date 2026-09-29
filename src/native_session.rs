@@ -1465,7 +1465,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[test]
     fn provider_output_keeps_arriving_while_the_dashboard_is_detached() {
         let mut command = Command::new("sh");
         command.args([
@@ -1493,6 +1492,7 @@ mod tests {
         let _ = child.wait();
     }
 
+    #[test]
     fn empty_left_margin_prompt_keeps_return_window_across_provider_redraw() {
         let mut screen = vt100::Parser::new(6, 40, 0);
         screen.process(b"\x1b[1;3H> \x1b[?25h");
