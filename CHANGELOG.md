@@ -29,6 +29,10 @@ and future released versions are intended to follow Semantic Versioning.
   dashboard now enables bracketed paste and inserts the clipboard as one
   multi-line draft. On terminals without bracketed paste, an Enter that arrives
   in the middle of a burst of queued input is treated as a pasted line break.
+- Returning from a provider's full-screen interface to the dashboard no longer
+  freezes that process. A Cursor turn (and any other native CLI opened from a
+  row) keeps running on its own terminal, so several agents can work at once.
+  Enter on the same row shows the screen it has produced since.
 
 ### Tests
 

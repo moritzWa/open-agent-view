@@ -200,8 +200,9 @@ no-session TUI (`/login` inside Pi), `opencode auth login`, `cursor-agent login`
 `grok login`, `kilo auth login`, and `openhands login`. OAV suspends its
 alternate screen before these commands and never reads or copies credentials.
 The setup/login UI always gets its own private terminal; Left/Right twice at a
-cursor boundary or Shift+Left/Right anywhere backgrounds it as a visible
-Terminal row, and Enter/Right resumes that exact screen. `/setup
+cursor boundary or Shift+Left/Right anywhere returns to the dashboard and
+leaves that process running. Enter/Right shows its latest screen. The
+frontend is stopped only when the dashboard itself exits. `/setup
 HARNESS` uses the same terminal for an installation check, confirmed official
 installer, and native login. It never attaches setup to the last agent session.
 
