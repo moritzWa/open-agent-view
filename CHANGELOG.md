@@ -23,6 +23,10 @@ and future released versions are intended to follow Semantic Versioning.
   freezes that process. A Cursor turn (and any other native CLI opened from a
   row) keeps running on its own terminal, so several agents can work at once.
   Enter on the same row shows the screen it has produced since.
+- A Cursor chat left running behind the dashboard no longer flips to "needs
+  input" during long thinking or tool calls. Its state now comes from Cursor's
+  own `ctrl+c to stop` hint on the chat's screen instead of how recently the
+  chat store was written.
 
 ## [0.1.53] - 2026-09-04
 
