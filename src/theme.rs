@@ -206,6 +206,7 @@ pub fn scheme_from_colorfgbg(value: Option<&str>) -> Option<ColorScheme> {
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn scheme_from_apple_interface_style(stdout: &str, stderr: &str) -> Option<ColorScheme> {
     if stdout.trim().eq_ignore_ascii_case("Dark") {
         Some(ColorScheme::Dark)
