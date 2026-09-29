@@ -41,7 +41,8 @@ open-agent-view
 ```
 
 The dashboard follows the terminal's light or dark background, then the
-operating system appearance. Force one with `--theme light` or `--theme dark`.
+operating system appearance, and switches live when the system appearance
+changes. Force one with `--theme light` or `--theme dark`.
 
 [![A real Open Agent View walkthrough: browse coding-harness sessions, preview native coding CLIs, ask Kimi Code about Open Agent View, and return to the shared dashboard](docs/assets/open-agent-view.gif)](https://open-agent-view.github.io/open-agent-view-demo.mp4)
 

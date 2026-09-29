@@ -24,7 +24,7 @@ use crate::control::{ControlHub, ControlOutcome, LaunchPresentation};
 use crate::domain::{AgentSession, Capability, Provider, SessionSnapshot, SessionState};
 use crate::hidden::HiddenSessions;
 use crate::migration::{MigrationClient, MigrationOutcome, MigrationRegistry, MigrationRequest};
-use crate::theme::ColorScheme;
+use crate::theme::{ColorScheme, SchemeWatcher, ThemePreference};
 use crate::ui;
 
 // Apply a burst of already-buffered terminal input before drawing. Holding an
@@ -116,6 +116,7 @@ pub fn run_dashboard(
     hidden_sessions: HiddenSessions,
     session_aliases: SessionAliases,
     migrations: MigrationServices,
+    theme_preference: ThemePreference,
     color_scheme: ColorScheme,
 ) -> Result<()> {
     let MigrationServices {
@@ -188,6 +189,7 @@ pub fn run_dashboard(
     );
     app.set_yolo(control.yolo_enabled(), control.yolo_supported_providers());
     app.color_scheme = color_scheme;
+    let scheme_watcher = SchemeWatcher::spawn(theme_preference);
     let mut terminal = TerminalSession::enter()?;
     let initial_size = terminal.terminal.size()?;
     app.set_session_page_size(session_page_size_for_terminal(initial_size.height));
@@ -464,6 +466,12 @@ pub fn run_dashboard(
         if Instant::now() >= next_live_animation {
             needs_draw |= app.advance_live_animation();
             next_live_animation = Instant::now() + LIVE_SESSION_ANIMATION_INTERVAL;
+        }
+        if let Some(scheme) = scheme_watcher.as_ref().and_then(SchemeWatcher::take_change) {
+            if app.color_scheme != scheme {
+                app.color_scheme = scheme;
+                needs_draw = true;
+            }
         }
         if needs_draw {
             terminal.terminal.draw(|frame| ui::render(frame, &app))?;

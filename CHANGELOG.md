@@ -11,8 +11,9 @@ and future released versions are intended to follow Semantic Versioning.
 ### Added
 
 - A light dashboard palette. `--theme auto` (the default) follows the terminal
-  background, then the operating system appearance. `--theme dark` and
-  `--theme light` force a palette.
+  background, then the operating system appearance, and switches live when
+  the operating system appearance changes. `--theme dark` and `--theme light`
+  force a palette.
 - External Cursor chats are now discovered on every platform from Cursor's own
   chat store (`~/.cursor/chats`), with `--include-external
   --include-interactive`. Rows show the chat title, workspace, and latest
