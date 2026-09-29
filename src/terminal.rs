@@ -986,7 +986,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
                 app.start_filter();
                 AppAction::None
             }
-            KeyCode::Char('p')
+            KeyCode::Char('p') | KeyCode::Char('t')
                 if matches!(app.overlay, Overlay::None | Overlay::Peek) =>
             {
                 app.toggle_pin()
@@ -1990,6 +1990,13 @@ mod tests {
             AppAction::SetPin {
                 session_id: "worker".into(),
                 pinned: false,
+            }
+        );
+        assert_eq!(
+            handle_key(&mut app, control_key('t')),
+            AppAction::SetPin {
+                session_id: "worker".into(),
+                pinned: true,
             }
         );
         app.start_new_session(None);
