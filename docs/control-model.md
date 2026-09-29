@@ -324,12 +324,28 @@ platforms retain CLI history inspection and native resume.
 
 ## Cursor ownership boundary
 
-Cursor exposes a TTY-only history picker, not a machine-readable global session
-list. Open Agent View therefore shows only Cursor sessions it launched itself
-on Linux. Foreground launch creates an exact Cursor chat, records it, and
-immediately resumes that ID in Cursor's interactive interface. Inline replies
-still use detached stream-JSON mode and record the exact process identity plus
-bounded output paths under:
+Cursor's picker is TTY-only, but the CLI persists every chat on disk under
+`~/.cursor/chats/<hash of cwd>/<chat id>/` with a small `meta.json` (title,
+cwd, timestamps) and a `prompt_history.json` of the user's prompts. Open Agent
+View lists those chats on every platform when `--include-external
+--include-interactive` are set. The store's SQLite transcript is left alone:
+rows carry the title, cwd, and the latest prompt, and Inspect shows the
+recorded prompts, not the assistant's replies.
+
+Liveness comes from the process, not the files. Cursor drops a PID marker in
+`~/.local/share/cursor-agent/versions/<version>/.running/` for each CLI it
+starts; OAV verifies each PID is alive, then asks which chat's `store.db` that
+process holds open (`/proc/<pid>/fd` on Linux, `lsof -p` elsewhere). A chat
+with a live holder is *working* while its store or metadata changed within the
+last 20 seconds and *waiting at prompt* otherwise; chats without a holder are
+*closed* history. Because these rows are observe/native-open only, a stale
+marker or a misread PID can at worst mislabel a row's state; nothing is ever
+signalled based on it.
+
+Managed control is separate. Foreground launch on Linux creates an exact Cursor
+chat, records it, and immediately resumes that ID in Cursor's interactive
+interface. Inline replies still use detached stream-JSON mode and record the
+exact process identity plus bounded output paths under:
 
 ```text
 $XDG_STATE_HOME/open-agent-view/cursor/
@@ -342,15 +358,17 @@ never signals a PID merely because it appears in the registry.
 
 | Operation | OAV-owned managed Cursor run | External Cursor session |
 | --- | --- | --- |
-| Discover | Private registry plus bounded stream-JSON logs | Unavailable; the global picker is TTY-only |
-| Inspect | Bounded assistant transcript from the owned log | Disabled |
-| Open | Refused while an owned print worker is active; native resume otherwise | Not listed; use Cursor's own TTY picker |
+| Discover | Private registry plus bounded stream-JSON logs | `~/.cursor/chats` metadata plus live-process check (all platforms) |
+| Inspect | Bounded assistant transcript from the owned log | Recorded user prompts from `prompt_history.json` |
+| Open | Refused while an owned print worker is active; native resume otherwise | Native resume (`cursor-agent --resume <id> --workspace <cwd>`) |
 | Launch/reply | Create a chat and open it in the foreground; inline reply only after the prior process/native frontend exits | Disabled |
 | Interrupt | `SIGINT` only after exact live-process verification | Disabled |
 | Permission/archive/delete | Disabled | Disabled |
 
-Managed Cursor launch and rediscovery currently require Linux. Open Agent View
-does not scrape the provider's picker or infer ownership from a chat ID.
+Managed Cursor launch and rediscovery currently require Linux. A chat OAV
+launched itself is listed once, by the managed source; the history source skips
+IDs the supervisor owns. Open Agent View does not scrape the provider's picker
+or infer ownership from a chat ID.
 
 ## GitHub Copilot ownership boundary
 

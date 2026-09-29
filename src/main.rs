@@ -8,9 +8,10 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use open_agent_view::adapters::{
-    default_managed_docker_registry_path, default_pi_session_dir, generate_managed_instance_id,
-    AntigravityController, AntigravityOwnership, AntigravitySource, ClaudeSource, CodexSource,
-    CopilotController, CopilotOwnedSource, CopilotSource, CopilotSupervisor, CursorController,
+    default_cursor_chats_dir, default_cursor_versions_dir, default_managed_docker_registry_path,
+    default_pi_session_dir, generate_managed_instance_id, AntigravityController,
+    AntigravityOwnership, AntigravitySource, ClaudeSource, CodexSource, CopilotController,
+    CopilotOwnedSource, CopilotSource, CopilotSupervisor, CursorController, CursorHistorySource,
     DiscoveryEngine, DiscoveryRequest, DockerTarget, FixtureSource, KimiController, KimiOwnership,
     KimiSource, ManagedDockerCreateSpec, ManagedDockerService, ManagedDockerStatus,
     MistralVibeController, MistralVibeOwnership, MistralVibeSource, MuseController, MuseOwnership,
@@ -294,6 +295,10 @@ struct Cli {
         global = true
     )]
     cursor_bin: String,
+
+    /// Override the directory Cursor's CLI writes chats to (default `~/.cursor/chats`).
+    #[arg(long, value_name = "PATH", global = true)]
+    cursor_chats_dir: Option<PathBuf>,
 
     /// Disable Cursor session control on the host.
     #[arg(long)]
@@ -693,6 +698,10 @@ fn main() -> Result<()> {
             );
             #[cfg(not(target_os = "linux"))]
             let controller = CursorController::host(cli.cursor_bin.clone());
+            let controller = match &cli.cursor_chats_dir {
+                Some(chats_dir) => controller.with_chats_root(chats_dir.clone()),
+                None => controller,
+            };
             control.register_controller(Arc::new(controller))?;
         }
         if antigravity_open_enabled {
@@ -878,8 +887,26 @@ fn main() -> Result<()> {
             }
         }
         #[cfg(target_os = "linux")]
-        if let Some(supervisor) = cursor_supervisor {
+        if let Some(supervisor) = cursor_supervisor.clone() {
             engine.add_source(CursorSource::managed(supervisor));
+        }
+        if cursor_enabled && request.include_external {
+            // Cursor's CLI writes every chat under ~/.cursor/chats. Listing that
+            // store is what makes external Cursor sessions visible, on every
+            // platform. Rows are observe/native-open only.
+            let chats_root = match &cli.cursor_chats_dir {
+                Some(chats_dir) => chats_dir.clone(),
+                None => default_cursor_chats_dir()?,
+            };
+            let source = CursorHistorySource::host(chats_root, default_cursor_versions_dir().ok());
+            #[cfg(target_os = "linux")]
+            let source = match cursor_supervisor {
+                Some(supervisor) => source.skipping(Arc::new(move |chat_id: &str| {
+                    supervisor.owns_chat_id(chat_id)
+                })),
+                None => source,
+            };
+            engine.add_source(source);
         }
         if antigravity_enabled {
             if let Some(ownership) = antigravity_ownership {

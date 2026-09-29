@@ -280,6 +280,7 @@ pub fn parse_cursor_chat_id(output: &str) -> Result<String> {
 /// so this controller intentionally offers native resume only.
 pub struct CursorController {
     invocation: CursorInvocation,
+    chats_root: Option<PathBuf>,
     #[cfg(target_os = "linux")]
     supervisor: Option<Arc<CursorSupervisor>>,
 }
@@ -288,6 +289,7 @@ impl CursorController {
     pub fn host(executable: impl Into<String>) -> Self {
         Self {
             invocation: CursorInvocation::host(executable),
+            chats_root: None,
             #[cfg(target_os = "linux")]
             supervisor: None,
         }
@@ -299,8 +301,15 @@ impl CursorController {
     pub fn managed(supervisor: Arc<CursorSupervisor>) -> Self {
         Self {
             invocation: CursorInvocation::host(supervisor.executable()),
+            chats_root: None,
             supervisor: Some(supervisor),
         }
+    }
+
+    /// Read on-disk chats from `chats_root` instead of `~/.cursor/chats`.
+    pub fn with_chats_root(mut self, chats_root: PathBuf) -> Self {
+        self.chats_root = Some(chats_root);
+        self
     }
 }
 
@@ -463,14 +472,19 @@ impl ProviderController for CursorController {
 
     fn inspect(&self, session: &AgentSession) -> Result<String> {
         #[cfg(target_os = "linux")]
-        {
-            self.managed_supervisor()?.inspect(session)
+        if let Some(supervisor) = &self.supervisor {
+            if supervisor.owns(session) {
+                return supervisor.inspect(session);
+            }
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = session;
-            bail!("managed Cursor inspection is unavailable on this platform")
-        }
+        // Chats discovered from Cursor's on-disk store: show the prompts it
+        // recorded. The chats directory can be overridden for tests.
+        let chats_root = self
+            .chats_root
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(super::cursor_history::default_cursor_chats_dir)?;
+        super::cursor_history::inspect_cursor_history(&chats_root, session)
     }
 
     fn reply(&self, session: &AgentSession, prompt: &str) -> Result<ControlOutcome> {

@@ -13,6 +13,12 @@ and future released versions are intended to follow Semantic Versioning.
 - A light dashboard palette. `--theme auto` (the default) follows the terminal
   background, then the operating system appearance. `--theme dark` and
   `--theme light` force a palette.
+- External Cursor chats are now discovered on every platform from Cursor's own
+  chat store (`~/.cursor/chats`), with `--include-external
+  --include-interactive`. Rows show the chat title, workspace, and latest
+  prompt; state comes from verifying the CLI process that holds the chat open.
+  Enter/Right resumes the chat natively and Inspect lists the recorded prompts.
+  `--cursor-chats-dir` overrides the store location.
 
 ### Fixed
 

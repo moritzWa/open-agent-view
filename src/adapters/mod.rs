@@ -4,6 +4,7 @@ mod codex;
 mod copilot;
 mod copilot_managed;
 mod cursor;
+mod cursor_history;
 #[cfg(target_os = "linux")]
 mod cursor_managed;
 mod docker;
@@ -44,6 +45,10 @@ pub use copilot_managed::{default_copilot_state_dir, CopilotOwnedSource, Copilot
 pub use cursor::{
     parse_cursor_chat_id, parse_cursor_stream_event, CursorCommandSpec, CursorController,
     CursorInvocation, CursorStreamEvent,
+};
+pub use cursor_history::{
+    default_cursor_chats_dir, default_cursor_versions_dir, inspect_cursor_history,
+    parse_lsof_store_files, CursorHistorySource,
 };
 #[cfg(target_os = "linux")]
 pub use cursor_managed::{default_cursor_state_dir, CursorSource, CursorSupervisor};
