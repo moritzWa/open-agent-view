@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+#[cfg(not(target_os = "linux"))]
+use open_agent_view::adapters::CursorOwnership;
 use open_agent_view::adapters::{
     default_cursor_versions_dir, default_managed_docker_registry_path, default_pi_session_dir,
     generate_managed_instance_id, AntigravityController, AntigravityOwnership, AntigravitySource,
@@ -26,7 +28,6 @@ use open_agent_view::control::{ControlHub, ControlHubConfig};
 use open_agent_view::doctor::{diagnose, render_text};
 use open_agent_view::domain::Provider;
 use open_agent_view::hidden::{HiddenSessionRecord, HiddenSessions};
-use open_agent_view::pins::PinnedSessions;
 use open_agent_view::maintenance::{
     execute_completed_archive, plan_completed_archive, BulkArchiveReport,
 };
@@ -36,6 +37,7 @@ use open_agent_view::opencode_supervisor::OpenCodeSupervisor;
 use open_agent_view::pi_supervisor::run_pi_supervisor_daemon;
 #[cfg(target_os = "linux")]
 use open_agent_view::pi_supervisor::PiSupervisor;
+use open_agent_view::pins::PinnedSessions;
 use open_agent_view::terminal::{run_dashboard, MigrationServices};
 use open_agent_view::theme::{self, ThemePreference};
 
@@ -622,6 +624,12 @@ fn main() -> Result<()> {
     let cursor_supervisor = cursor_enabled
         .then(|| CursorSupervisor::host(cli.cursor_bin.clone()).map(Arc::new))
         .transpose()?;
+    // Off Linux there is no managed Cursor registry; chats the dashboard
+    // creates are recorded here so they are listed without external discovery.
+    #[cfg(not(target_os = "linux"))]
+    let cursor_ownership = cursor_enabled
+        .then(CursorOwnership::load_default)
+        .transpose()?;
     let antigravity_ownership = antigravity_open_enabled
         .then(AntigravityOwnership::load_default)
         .transpose()?;
@@ -698,7 +706,12 @@ fn main() -> Result<()> {
                     .clone(),
             );
             #[cfg(not(target_os = "linux"))]
-            let controller = CursorController::host(cli.cursor_bin.clone());
+            let controller = CursorController::host(cli.cursor_bin.clone()).with_ownership(
+                cursor_ownership
+                    .as_ref()
+                    .expect("Cursor ownership exists when Cursor is enabled")
+                    .clone(),
+            );
             let controller = match &cli.cursor_chats_dir {
                 Some(chats_dir) => controller.with_chats_root(chats_dir.clone()),
                 None => controller,
@@ -891,7 +904,12 @@ fn main() -> Result<()> {
         if let Some(supervisor) = cursor_supervisor.clone() {
             engine.add_source(CursorSource::managed(supervisor));
         }
-        if cursor_enabled && request.include_external {
+        #[cfg(target_os = "linux")]
+        let cursor_history_enabled = cursor_enabled && request.include_external;
+        // Off Linux the store is also where chats this dashboard created live.
+        #[cfg(not(target_os = "linux"))]
+        let cursor_history_enabled = cursor_enabled;
+        if cursor_history_enabled {
             // Cursor's CLI writes every chat under ~/.cursor/chats. Listing that
             // store is what makes external Cursor sessions visible, on every
             // platform. Rows are observe/native-open only.
@@ -904,6 +922,11 @@ fn main() -> Result<()> {
             #[cfg(target_os = "linux")]
             let source = match cursor_supervisor {
                 Some(supervisor) => source.skipping(Arc::new(move || supervisor.owned_chat_ids())),
+                None => source,
+            };
+            #[cfg(not(target_os = "linux"))]
+            let source = match &cursor_ownership {
+                Some(ownership) => source.owned(ownership.clone()),
                 None => source,
             };
             engine.add_source(source);

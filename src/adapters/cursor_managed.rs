@@ -13,7 +13,8 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::cursor::{
-    parse_cursor_chat_id, parse_cursor_stream_event, CursorInvocation, CursorStreamEvent,
+    parse_cursor_chat_id, parse_cursor_models, parse_cursor_stream_event, CursorInvocation,
+    CursorStreamEvent,
 };
 use super::{DiscoveryRequest, SessionSource};
 use crate::domain::{
@@ -810,48 +811,6 @@ fn prompt_name(prompt: &str) -> String {
         value.push('…');
         value
     }
-}
-
-fn parse_cursor_models(output: &str) -> Vec<String> {
-    let rendered = if output.contains('\x1b') {
-        let mut parser = vt100::Parser::new(200, 240, 0);
-        parser.process(output.as_bytes());
-        parser.screen().contents()
-    } else {
-        output.to_owned()
-    };
-    let mut models = BTreeSet::new();
-    for line in rendered.lines() {
-        let line = line.trim().trim_start_matches(|character: char| {
-            character.is_whitespace() || matches!(character, '-' | '*' | '•' | '›' | '>' | '✓')
-        });
-        let Some(candidate) = line.split_whitespace().next() else {
-            continue;
-        };
-        let candidate = candidate.trim_matches(|character: char| matches!(character, ':' | ','));
-        let lower = candidate.to_ascii_lowercase();
-        if matches!(
-            lower.as_str(),
-            "loading" | "models" | "model" | "available" | "no" | "name" | "id"
-        ) {
-            continue;
-        }
-        if candidate.is_empty()
-            || candidate.len() > 128
-            || !candidate.chars().all(|character| {
-                character.is_ascii_alphanumeric()
-                    || matches!(character, '-' | '_' | '.' | ':' | '/' | '@')
-            })
-        {
-            continue;
-        }
-        models.insert(if candidate.eq_ignore_ascii_case("auto") {
-            "auto".into()
-        } else {
-            candidate.into()
-        });
-    }
-    models.into_iter().collect()
 }
 
 fn private_append_file(path: &Path) -> Result<File> {

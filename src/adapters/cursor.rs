@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(target_os = "linux")]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::cursor_history::CursorOwnership;
 #[cfg(target_os = "linux")]
 use super::cursor_managed::CursorSupervisor;
 use crate::control::{
@@ -93,9 +93,7 @@ impl CursorInvocation {
     ) -> Result<CursorCommandSpec> {
         require_session_id(session_id)?;
         require_absolute_cwd(cwd)?;
-        if prompt.trim().is_empty() {
-            bail!("Cursor prompt must not be empty");
-        }
+        require_prompt(prompt)?;
         let mut spec = self.resume(session_id, cwd)?;
         if yolo {
             spec.args.insert(0, "--force".into());
@@ -170,9 +168,7 @@ impl CursorInvocation {
     ) -> Result<CursorCommandSpec> {
         require_session_id(session_id)?;
         require_absolute_cwd(cwd)?;
-        if prompt.trim().is_empty() {
-            bail!("Cursor prompt must not be empty");
-        }
+        require_prompt(prompt)?;
         let mut args = Vec::new();
         if yolo {
             args.push("--force".into());
@@ -284,6 +280,9 @@ pub fn parse_cursor_chat_id(output: &str) -> Result<String> {
 pub struct CursorController {
     invocation: CursorInvocation,
     chats_root: Option<PathBuf>,
+    /// Chats this dashboard created off Linux, listed by the history source
+    /// without `--include-external`.
+    ownership: Option<Arc<CursorOwnership>>,
     #[cfg(target_os = "linux")]
     supervisor: Option<Arc<CursorSupervisor>>,
 }
@@ -293,6 +292,7 @@ impl CursorController {
         Self {
             invocation: CursorInvocation::host(executable),
             chats_root: None,
+            ownership: None,
             #[cfg(target_os = "linux")]
             supervisor: None,
         }
@@ -305,6 +305,7 @@ impl CursorController {
         Self {
             invocation: CursorInvocation::host(supervisor.executable()),
             chats_root: None,
+            ownership: None,
             supervisor: Some(supervisor),
         }
     }
@@ -312,6 +313,12 @@ impl CursorController {
     /// Read on-disk chats from `chats_root` instead of `~/.cursor/chats`.
     pub fn with_chats_root(mut self, chats_root: PathBuf) -> Self {
         self.chats_root = Some(chats_root);
+        self
+    }
+
+    /// Record the chats this controller creates in `ownership`.
+    pub fn with_ownership(mut self, ownership: Arc<CursorOwnership>) -> Self {
+        self.ownership = Some(ownership);
         self
     }
 }
@@ -322,6 +329,12 @@ impl ProviderController for CursorController {
     }
 
     fn launch_mode(&self) -> LaunchMode {
+        // Linux launches go through the supervisor's registry; without one a
+        // new chat would have no owner and never appear as a row.
+        #[cfg(target_os = "linux")]
+        if self.supervisor.is_none() {
+            return LaunchMode::Unavailable;
+        }
         LaunchMode::SelectableModel
     }
 
@@ -375,18 +388,12 @@ impl ProviderController for CursorController {
         if request.provider != Provider::Cursor {
             bail!("the Cursor controller cannot launch another provider");
         }
+        // Off Linux the composer only opens Cursor in the foreground; a
+        // background launch would have nowhere to deliver the prompt.
         #[cfg(not(target_os = "linux"))]
-        {
-            let session_id = create_host_chat(
-                &self.invocation,
-                &request.cwd,
-                request.model.as_deref(),
-            )?;
-            return Ok(ControlOutcome {
-                message: format!("created Cursor chat {session_id}"),
-                provider_session_hint: Some(session_id),
-            });
-        }
+        bail!(
+            "background Cursor launch is unavailable on this platform; open it in the foreground"
+        );
         #[cfg(target_os = "linux")]
         let supervisor = self.managed_supervisor()?;
         #[cfg(target_os = "linux")]
@@ -427,46 +434,44 @@ impl ProviderController for CursorController {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            return self.open_new_chat(request);
+            self.open_new_chat(request)
         }
         #[cfg(target_os = "linux")]
-        let supervisor = self.managed_supervisor()?;
-        #[cfg(target_os = "linux")]
-        let session_id = supervisor.allocate_chat_with_model(
-            &request.prompt,
-            &request.cwd,
-            request.model.as_deref(),
-        )?;
-        #[cfg(target_os = "linux")]
-        let spec = self.invocation.resume_with_prompt(
-            &session_id,
-            &request.cwd,
-            &request.prompt,
-            request.model.as_deref(),
-        )?;
-        #[cfg(target_os = "linux")]
-        let key = format!("cursor:host:{session_id}");
-        #[cfg(target_os = "linux")]
-        match crate::native_session::run(spec.command(), &key)? {
-            crate::native_session::NativeSessionExit::Backgrounded => {
-                supervisor.mark_native_opened(&session_id)?;
-                Ok(ControlOutcome {
-                    message: format!(
-                        "backgrounded Cursor session {session_id}; Enter/Right resumes it"
-                    ),
-                    provider_session_hint: Some(session_id),
-                })
-            }
-            crate::native_session::NativeSessionExit::Exited(status) if status.success() => {
-                supervisor.mark_native_opened(&session_id)?;
-                Ok(ControlOutcome {
-                    message: format!("returned from Cursor session {session_id}"),
-                    provider_session_hint: Some(session_id),
-                })
-            }
-            crate::native_session::NativeSessionExit::Exited(status) => {
-                supervisor.mark_native_opened(&session_id)?;
-                bail!("Cursor session exited with status {status}")
+        {
+            let supervisor = self.managed_supervisor()?;
+            let session_id = supervisor.allocate_chat_with_model(
+                &request.prompt,
+                &request.cwd,
+                request.model.as_deref(),
+            )?;
+            let spec = self.invocation.resume_with_prompt(
+                &session_id,
+                &request.cwd,
+                &request.prompt,
+                request.model.as_deref(),
+            )?;
+            let key = format!("cursor:host:{session_id}");
+            match crate::native_session::run(spec.command(), &key)? {
+                crate::native_session::NativeSessionExit::Backgrounded => {
+                    supervisor.mark_native_opened(&session_id)?;
+                    Ok(ControlOutcome {
+                        message: format!(
+                            "backgrounded Cursor session {session_id}; Enter/Right resumes it"
+                        ),
+                        provider_session_hint: Some(session_id),
+                    })
+                }
+                crate::native_session::NativeSessionExit::Exited(status) if status.success() => {
+                    supervisor.mark_native_opened(&session_id)?;
+                    Ok(ControlOutcome {
+                        message: format!("returned from Cursor session {session_id}"),
+                        provider_session_hint: Some(session_id),
+                    })
+                }
+                crate::native_session::NativeSessionExit::Exited(status) => {
+                    supervisor.mark_native_opened(&session_id)?;
+                    bail!("Cursor session exited with status {status}")
+                }
             }
         }
     }
@@ -535,8 +540,13 @@ impl ProviderController for CursorController {
             }
         }
         // An external chat with a live holder is already open in another
-        // cursor-agent; a second resume would write the same chat store.
-        if let (false, Some(pid)) = (owned, session.pid) {
+        // cursor-agent; a second resume would write the same chat store. The
+        // holder may be the terminal this dashboard keeps in the background,
+        // which the resume below reattaches instead of starting a second one.
+        let ours = crate::native_session::detached_session_keys()
+            .iter()
+            .any(|key| *key == session.id);
+        if let (false, false, Some(pid)) = (owned, ours, session.pid) {
             bail!("chat is open in cursor-agent (pid {pid}); close it there first");
         }
         #[cfg(target_os = "linux")]
@@ -671,6 +681,21 @@ fn require_session_id(session_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The prompt is cursor-agent's trailing positional argument. Its help does
+/// not document `--` as an end-of-options marker, so a prompt that looks like
+/// an option (`-f`, `--yolo`) would be parsed as one and could turn on Run
+/// Everything without OAV's warning. Refuse it instead.
+fn require_prompt(prompt: &str) -> Result<()> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        bail!("Cursor prompt must not be empty");
+    }
+    if prompt.starts_with('-') {
+        bail!("Cursor prompts cannot start with '-'; cursor-agent would read it as an option");
+    }
+    Ok(())
+}
+
 fn require_absolute_cwd(cwd: &Path) -> Result<()> {
     if !cwd.is_absolute() {
         bail!("Cursor workspace must be absolute");
@@ -680,18 +705,27 @@ fn require_absolute_cwd(cwd: &Path) -> Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 impl CursorController {
+    /// Create a chat and open it with the prompt in Cursor's interface.
+    ///
+    /// `create-chat` runs on the dashboard thread (bounded at 20 seconds)
+    /// because this is a foreground launch. Moving it to the launch worker
+    /// would mean a deferred open like Linux's, which needs the new chat's
+    /// row to be discoverable before its first turn; the chat store is not
+    /// known to list a chat that early, so the allocation stays here.
     fn open_new_chat(&self, request: &LaunchRequest) -> Result<ControlOutcome> {
-        let session_id = create_host_chat(
-            &self.invocation,
-            &request.cwd,
-            request.model.as_deref(),
-        )?;
+        let session_id =
+            create_host_chat(&self.invocation, &request.cwd, request.model.as_deref())?;
         let spec = self.invocation.resume_with_prompt(
             &session_id,
             &request.cwd,
             &request.prompt,
             request.model.as_deref(),
         )?;
+        // Record the chat before opening it, so its row is listed on return
+        // even when external discovery is off.
+        if let Some(ownership) = &self.ownership {
+            ownership.record(&session_id, &request.cwd, &request.prompt)?;
+        }
         let key = format!("cursor:host:{session_id}");
         match crate::native_session::run(spec.command(), &key)? {
             crate::native_session::NativeSessionExit::Backgrounded => Ok(ControlOutcome {
@@ -713,9 +747,19 @@ impl CursorController {
     }
 }
 
-fn parse_cursor_model_ids(output: &str) -> Vec<String> {
+/// Model ids from `cursor-agent models`. The CLI colours its output when
+/// `FORCE_COLOR` is set and redraws a progress line before the list, so escape
+/// sequences are rendered away before the ids are read.
+pub(super) fn parse_cursor_models(output: &str) -> Vec<String> {
+    let rendered = if output.contains('\x1b') {
+        let mut parser = vt100::Parser::new(200, 240, 0);
+        parser.process(output.as_bytes());
+        parser.screen().contents()
+    } else {
+        output.to_owned()
+    };
     let mut models = std::collections::BTreeSet::new();
-    for line in output.lines() {
+    for line in rendered.lines() {
         let line = line.trim().trim_start_matches(|character: char| {
             character.is_whitespace() || matches!(character, '-' | '*' | '•' | '›' | '>' | '✓')
         });
@@ -723,18 +767,6 @@ fn parse_cursor_model_ids(output: &str) -> Vec<String> {
             continue;
         };
         let candidate = candidate.trim_matches(|character: char| matches!(character, ':' | ','));
-        if candidate.eq_ignore_ascii_case("auto") {
-            models.insert("auto".to_owned());
-            continue;
-        }
-        if candidate.len() > 128
-            || !candidate.chars().all(|character| {
-                character.is_ascii_alphanumeric()
-                    || matches!(character, '-' | '_' | '.' | ':' | '/' | '@')
-            })
-        {
-            continue;
-        }
         let lower = candidate.to_ascii_lowercase();
         if matches!(
             lower.as_str(),
@@ -742,7 +774,20 @@ fn parse_cursor_model_ids(output: &str) -> Vec<String> {
         ) {
             continue;
         }
-        models.insert(candidate.to_owned());
+        if candidate.is_empty()
+            || candidate.len() > 128
+            || !candidate.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '-' | '_' | '.' | ':' | '/' | '@')
+            })
+        {
+            continue;
+        }
+        models.insert(if candidate.eq_ignore_ascii_case("auto") {
+            "auto".into()
+        } else {
+            candidate.into()
+        });
     }
     models.into_iter().collect()
 }
@@ -762,9 +807,12 @@ fn host_available_models(executable: &str) -> Result<Vec<String>> {
                 "Cursor is not authenticated or this account has no models; press Enter to sign in"
             );
         }
-        bail!("Cursor model catalog failed with status {}: {stderr}", output.status);
+        bail!(
+            "Cursor model catalog failed with status {}: {stderr}",
+            output.status
+        );
     }
-    let models = parse_cursor_model_ids(stdout);
+    let models = parse_cursor_models(stdout);
     if models.is_empty() {
         bail!("Cursor returned no account models; press Enter to sign in or check plan access");
     }
@@ -781,7 +829,9 @@ fn create_host_chat(
     let mut request = CommandRequest::new(spec.program, spec.args);
     request.current_dir = Some(spec.current_dir);
     request.timeout = Duration::from_secs(20);
-    let output = ProcessRunner.run(&request).context("Cursor create-chat did not respond")?;
+    let output = ProcessRunner
+        .run(&request)
+        .context("Cursor create-chat did not respond")?;
     let stdout = output.stdout_text()?;
     if output.status != 0 {
         bail!(
@@ -812,8 +862,17 @@ mod tests {
 
     #[test]
     fn model_catalog_keeps_auto_and_named_ids() {
-        let models = parse_cursor_model_ids(
+        let models = parse_cursor_models(
             "Available models\n\nauto - Auto (default)\ncomposer-2.5 - Composer\nTip: use --model\n",
+        );
+        assert_eq!(models, vec!["auto".to_owned(), "composer-2.5".to_owned()]);
+    }
+
+    #[test]
+    fn model_catalog_reads_ids_through_forced_colour() {
+        // `FORCE_COLOR=1 cursor-agent models` wraps each id in SGR codes.
+        let models = parse_cursor_models(
+            "\x1b[1mAvailable models\x1b[22m\n\n\x1b[36mauto\x1b[39m - Auto (default)\n\x1b[36mcomposer-2.5\x1b[39m - Composer\n\x1b[2mTip: use --model\x1b[22m\n",
         );
         assert_eq!(models, vec!["auto".to_owned(), "composer-2.5".to_owned()]);
     }
@@ -821,6 +880,10 @@ mod tests {
     #[test]
     fn host_cursor_is_a_selectable_harness() {
         let controller = CursorController::host("cursor-agent");
+        // Linux launches need the supervisor's registry.
+        #[cfg(target_os = "linux")]
+        assert_eq!(controller.launch_mode(), LaunchMode::Unavailable);
+        #[cfg(not(target_os = "linux"))]
         assert_eq!(controller.launch_mode(), LaunchMode::SelectableModel);
         #[cfg(not(target_os = "linux"))]
         assert_eq!(
@@ -971,6 +1034,44 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "chat is open in cursor-agent (pid 4242); close it there first"
+        );
+    }
+
+    #[test]
+    fn refuses_prompts_cursor_agent_would_parse_as_options() {
+        let invocation = CursorInvocation::host("cursor-agent");
+        let cwd = Path::new("/work/repo");
+        for prompt in ["--yolo", "-f", "  --force fix it", "-p"] {
+            let error = invocation
+                .resume_with_prompt("chat-id", cwd, prompt, None)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("cannot start with '-'"),
+                "{error}"
+            );
+            assert!(invocation.print_turn("chat-id", cwd, prompt, None).is_err());
+        }
+        // A dash later in the prompt is ordinary text.
+        let spec = invocation
+            .resume_with_prompt("chat-id", cwd, "fix the -f flag", None)
+            .unwrap();
+        assert_eq!(spec.args.last().unwrap(), "fix the -f flag");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn background_launch_is_refused_off_linux_instead_of_dropping_the_prompt() {
+        let error = CursorController::host("/nonexistent/cursor-agent")
+            .launch(&LaunchRequest {
+                provider: Provider::Cursor,
+                prompt: "check the tests".into(),
+                cwd: PathBuf::from("/work/repo"),
+                model: None,
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unavailable on this platform"),
+            "{error}"
         );
     }
 
