@@ -430,7 +430,7 @@ label.
 | Session list | `ctrl+s` | Toggle status and working-directory grouping. |
 | Session list | `ctrl+f` | Edit the case-insensitive name/summary/path/provider filter. |
 | Session list | `ctrl+l` | Request an immediate provider refresh. |
-| Session list | `ctrl+g` | Search sessions hidden with `ctrl+x` by name, harness, or ID. `enter` unhides the chosen one and selects its row as soon as discovery lists it; `esc` or `ctrl+g` closes the picker. |
+| Session list | `ctrl+g` | Search sessions hidden with `ctrl+x` by name, harness, or ID; `page up` / `page down` move by the rows that fit. `enter` unhides the chosen one and selects its row once discovery lists it, unless you have moved the cursor or opened another panel meanwhile; a row the current filter excludes is reported rather than the filter being cleared. `esc` or `ctrl+g` closes the picker. Zellij binds `ctrl+g` to its lock mode by default, so under Zellij use `/hidden` instead or unbind that key. |
 | Session list | `ctrl+t` or `ctrl+p` | Pin or unpin the selected session. Pinned rows stay in a group at the top. `ctrl+t` matches Claude Code's agent-view pin key; `cmd+p` also works when the terminal delivers it as the super modifier. |
 | Session list | `tab`, `/`, or printable text | Compose a new host task. `/` begins a dashboard command rather than a filter. |
 | New-task composer | `tab` | Open the visible harness picker. |
@@ -446,6 +446,7 @@ label.
 | New-task composer | `/model NAME` / `/model default` | Select an exact custom model identifier or reset to the provider default. The provider revalidates it at launch. |
 | New-task composer | `/completed [show\|hide]` | Toggle completed discovery, or set it explicitly. `show` refreshes providers; `hide` immediately removes completed rows and keeps later refreshes active-only. |
 | New-task composer | `/filter TEXT` / `/help` | Apply a session filter or list dashboard slash commands without contacting a provider. |
+| New-task composer | `/hidden` | Open the hidden-session restore picker, the same as `ctrl+g`. |
 | New-task composer | `/setup [HARNESS]` | Open the selected or named harness's isolated install/login terminal. |
 | Writable composer | `ctrl+j` | Insert a newline rather than submit. |
 | Any view | paste | Pasted text is inserted as text, never submitted. Line breaks in the clipboard become newlines in one draft; a paste on the dashboard opens the new-task composer. Open Agent View enables bracketed paste. On terminals without it, keys arriving within milliseconds of each other count as one paste: an Enter with more input right behind it is a pasted line break, pasted characters never act as shortcuts, and only an Enter after a known dashboard command still runs it. Control characters other than tab and newline are dropped; the model picker, filter, rename, and migration-name fields turn line breaks and tabs into spaces. |

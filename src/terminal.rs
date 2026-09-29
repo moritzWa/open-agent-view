@@ -19,7 +19,7 @@ use ratatui::Terminal;
 
 use crate::adapters::{DiscoveryEngine, DiscoveryRequest};
 use crate::aliases::SessionAliases;
-use crate::app::{App, AppAction, Overlay, SESSION_PAGE_SIZE};
+use crate::app::{hidden_picker_rows_for_height, App, AppAction, Overlay, SESSION_PAGE_SIZE};
 use crate::control::{ControlHub, ControlOutcome, LaunchPresentation};
 use crate::domain::{AgentSession, Capability, Provider, SessionSnapshot, SessionState};
 use crate::hidden::HiddenSessions;
@@ -207,6 +207,7 @@ pub fn run_dashboard(
     let mut terminal = TerminalSession::enter()?;
     let initial_size = terminal.terminal.size()?;
     app.set_session_page_size(session_page_size_for_terminal(initial_size.height));
+    app.set_hidden_picker_rows(hidden_picker_rows_for_height(initial_size.height));
     let mut last_refresh = Instant::now();
     let mut current_request = request.clone();
     let mut refresh_in_flight = false;
@@ -263,21 +264,7 @@ pub fn run_dashboard(
                     }
                     let changed = snapshot != app.snapshot;
                     app.replace_snapshot(snapshot);
-                    if let Some(reveal) = pending_reveal.as_ref() {
-                        if app.select_and_reveal_session(&reveal.session_id) {
-                            let name = app
-                                .selected_session()
-                                .map(|session| session.name.clone())
-                                .unwrap_or_else(|| reveal.session_id.clone());
-                            app.set_notice(format!("restored {name}"));
-                            pending_reveal = None;
-                        } else if complete && Instant::now() >= reveal.deadline {
-                            app.set_notice(
-                                "unhidden, but discovery does not list that session right now",
-                            );
-                            pending_reveal = None;
-                        }
-                    }
+                    resolve_pending_reveal(&mut app, &mut pending_reveal, complete, Instant::now());
                     if let Some(session_id) =
                         select_pending_launch(&mut app, pending_launch.as_ref())
                     {
@@ -536,7 +523,7 @@ pub fn run_dashboard(
                         needs_draw = true;
                     }
                     Event::Key(key) => {
-                        let mut action = handle_key(&mut app, key);
+                        let mut action = handle_key_with_reveal(&mut app, key, &mut pending_reveal);
                         if action == AppAction::Quit && migrating_target.is_some() {
                             app.should_quit = false;
                             app.set_notice(
@@ -755,6 +742,7 @@ pub fn run_dashboard(
                     }
                     Event::Resize(_, height) => {
                         app.set_session_page_size(session_page_size_for_terminal(height));
+                        app.set_hidden_picker_rows(hidden_picker_rows_for_height(height));
                         needs_draw = true;
                     }
                     _ => {}
@@ -954,6 +942,61 @@ fn provider_session_ids(app: &App, provider: &Provider) -> BTreeSet<String> {
         .filter(|session| &session.provider == provider)
         .map(|session| session.id.clone())
         .collect()
+}
+
+/// Handle a key and abandon a pending restore jump when the key moved the
+/// selection: the user has moved on, and a late refresh must not yank the
+/// cursor back to the restored row.
+fn handle_key_with_reveal(
+    app: &mut App,
+    key: KeyEvent,
+    pending: &mut Option<PendingReveal>,
+) -> AppAction {
+    let selection_before = app.selection.clone();
+    let action = handle_key(app, key);
+    if app.selection != selection_before {
+        *pending = None;
+    }
+    action
+}
+
+/// Select a just-unhidden session once a refresh lists it.
+///
+/// The jump waits while any overlay is open: Peek, Rename, and Confirm act on
+/// the selected row, so moving the selection underneath them could send a
+/// reply or confirmation to the restored session instead of the one on screen.
+/// A row the current filter excludes ends the wait without clearing the
+/// user's filter.
+fn resolve_pending_reveal(
+    app: &mut App,
+    pending: &mut Option<PendingReveal>,
+    complete: bool,
+    now: Instant,
+) {
+    let Some(reveal) = pending.as_ref() else {
+        return;
+    };
+    if app.overlay == Overlay::None && app.select_and_reveal_session(&reveal.session_id) {
+        let name = app
+            .selected_session()
+            .map(|session| session.name.clone())
+            .unwrap_or_else(|| reveal.session_id.clone());
+        app.set_notice(format!("restored {name}"));
+        *pending = None;
+    } else if app.snapshot_contains(&reveal.session_id)
+        && !app.groups().iter().any(|group| {
+            group
+                .sessions
+                .iter()
+                .any(|index| app.snapshot.sessions[*index].id == reveal.session_id)
+        })
+    {
+        app.set_notice("restored; hidden by the current filter");
+        *pending = None;
+    } else if complete && now >= reveal.deadline && !app.snapshot_contains(&reveal.session_id) {
+        app.set_notice("unhidden, but discovery does not list that session right now");
+        *pending = None;
+    }
 }
 
 fn select_pending_launch(app: &mut App, pending: Option<&PendingLaunch>) -> Option<String> {
@@ -2260,6 +2303,108 @@ mod tests {
         assert_eq!(app.overlay, Overlay::None);
         app.start_new_session(None);
         assert_eq!(handle_key(&mut app, control_key('g')), AppAction::None);
+    }
+
+    fn app_with_rows(ids: &[&str]) -> App {
+        let template = app().snapshot.sessions[0].clone();
+        App::new(SessionSnapshot {
+            sessions: ids
+                .iter()
+                .map(|id| AgentSession {
+                    id: (*id).into(),
+                    provider_session_id: (*id).into(),
+                    name: (*id).into(),
+                    ..template.clone()
+                })
+                .collect(),
+            warnings: vec![],
+        })
+    }
+
+    fn pending(session_id: &str, deadline: Instant) -> Option<PendingReveal> {
+        Some(PendingReveal {
+            session_id: session_id.into(),
+            deadline,
+        })
+    }
+
+    #[test]
+    fn a_pending_restore_selects_its_row_once_the_list_is_free() {
+        let mut app = app_with_rows(&["alpha", "restored"]);
+        app.selection = Some(SelectionKey::Session("alpha".into()));
+        let later = Instant::now() + Duration::from_secs(30);
+        let mut reveal = pending("restored", later);
+
+        // Peek on "alpha": a reply typed there must stay on "alpha".
+        app.toggle_peek();
+        assert_eq!(app.overlay, Overlay::Peek);
+        resolve_pending_reveal(&mut app, &mut reveal, true, Instant::now());
+        assert_eq!(app.selection, Some(SelectionKey::Session("alpha".into())));
+        assert_eq!(app.overlay, Overlay::Peek);
+        assert!(
+            reveal.is_some(),
+            "the restore waits for the overlay to close"
+        );
+
+        app.escape();
+        assert_eq!(app.overlay, Overlay::None);
+        resolve_pending_reveal(&mut app, &mut reveal, true, Instant::now());
+        assert_eq!(
+            app.selection,
+            Some(SelectionKey::Session("restored".into()))
+        );
+        assert_eq!(app.notice.as_deref(), Some("restored restored"));
+        assert!(reveal.is_none());
+    }
+
+    #[test]
+    fn moving_the_selection_abandons_a_pending_restore() {
+        let mut app = app_with_rows(&["alpha", "beta"]);
+        app.selection = Some(SelectionKey::Session("alpha".into()));
+        let mut reveal = pending("restored", Instant::now() + Duration::from_secs(30));
+
+        // A key that leaves the selection alone keeps the restore pending.
+        handle_key_with_reveal(&mut app, control_key('l'), &mut reveal);
+        assert!(reveal.is_some());
+
+        handle_key_with_reveal(&mut app, key(KeyCode::Down), &mut reveal);
+        assert_eq!(app.selection, Some(SelectionKey::Session("beta".into())));
+        assert!(reveal.is_none());
+    }
+
+    #[test]
+    fn a_restored_row_hidden_by_the_filter_reports_the_filter_not_discovery() {
+        let mut app = app_with_rows(&["alpha", "restored"]);
+        app.set_filter("alpha");
+        app.selection = Some(SelectionKey::Session("alpha".into()));
+        let mut reveal = pending("restored", Instant::now() + Duration::from_secs(30));
+
+        resolve_pending_reveal(&mut app, &mut reveal, false, Instant::now());
+        assert!(reveal.is_none());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("restored; hidden by the current filter")
+        );
+        assert_eq!(app.filter, "alpha", "the user's filter is kept");
+        assert_eq!(app.selection, Some(SelectionKey::Session("alpha".into())));
+    }
+
+    #[test]
+    fn an_unlisted_restore_waits_for_the_deadline_on_a_complete_refresh() {
+        let mut app = app_with_rows(&["alpha"]);
+        let now = Instant::now();
+        let mut reveal = pending("restored", now + Duration::from_secs(30));
+
+        resolve_pending_reveal(&mut app, &mut reveal, true, now);
+        assert!(reveal.is_some());
+        resolve_pending_reveal(&mut app, &mut reveal, false, now + Duration::from_secs(31));
+        assert!(reveal.is_some(), "partial refreshes never time out");
+        resolve_pending_reveal(&mut app, &mut reveal, true, now + Duration::from_secs(31));
+        assert!(reveal.is_none());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("unhidden, but discovery does not list that session right now")
+        );
     }
 
     #[test]

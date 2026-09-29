@@ -83,6 +83,7 @@ opens that harness's native interface.
 | Rename a session in OAV | `Ctrl+R` |
 | Migrate a session to another harness | `Ctrl+M` |
 | Filter the session list | `Ctrl+F` |
+| Find and restore a hidden session | `Ctrl+G` (or `/hidden`) |
 | Stop, then delete or hide a managed session | `Ctrl+X`, then `Ctrl+X` again |
 | See the complete contextual key map | `?` |
 

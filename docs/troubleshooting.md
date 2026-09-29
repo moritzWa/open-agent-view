@@ -159,7 +159,7 @@ processes but does not target separately supervised provider backends.
 
 `ctrl+f` is the session filter. `/` starts a local dashboard command: `/help`,
 `/harness`, `/harness NAME`, `/model`, `/model NAME`, `/model default`,
-`/login`, `/setup [HARNESS]`, `/completed show|hide`, or `/filter TEXT`;
+`/login`, `/setup [HARNESS]`, `/completed show|hide`, `/filter TEXT`, or `/hidden`;
 `/provider` remains an alias. These
 commands are never forwarded as task prompts. The composer border always
 displays the chosen harness and model.

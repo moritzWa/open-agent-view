@@ -27,9 +27,12 @@ and future released versions are intended to follow Semantic Versioning.
   still holds it) and Inspect lists the recorded prompts.
   `--cursor-chats-dir` overrides the store location. Running-state detection
   works on macOS and Linux; elsewhere every chat is listed as closed history.
-- `ctrl+g` opens a searchable picker of sessions hidden with `ctrl+x`.
-  Enter unhides the chosen session and selects its row when discovery lists
-  it, without leaving the dashboard.
+- `ctrl+g` (or `/hidden`, for terminals such as Zellij that take `ctrl+g`)
+  opens a searchable picker of sessions hidden with `ctrl+x`. Enter unhides
+  the chosen session and selects its row when discovery lists it, without
+  leaving the dashboard. The jump waits while Peek or another panel is open,
+  is dropped once you move the cursor, and a restored row that the current
+  filter excludes is reported instead of timing out.
 
 ### Fixed
 
