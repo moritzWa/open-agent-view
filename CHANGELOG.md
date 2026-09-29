@@ -10,8 +10,9 @@ and future released versions are intended to follow Semantic Versioning.
 
 ### Added
 
-- `ctrl+p` pins the selected session to a Pinned group at the top of the list
-  and unpins it again. The pin is remembered locally.
+- `ctrl+t` (Claude Code's pin key) or `ctrl+p` pins the selected session to a
+  Pinned group at the top of the list and unpins it again. The pin is
+  remembered locally.
 - A light dashboard palette. `--theme auto` (the default) follows the terminal
   background, then the operating system appearance, and switches live when
   the operating system appearance changes. `--theme dark` and `--theme light`

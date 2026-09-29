@@ -431,7 +431,7 @@ label.
 | Session list | `ctrl+f` | Edit the case-insensitive name/summary/path/provider filter. |
 | Session list | `ctrl+l` | Request an immediate provider refresh. |
 | Session list | `ctrl+g` | Search sessions hidden with `ctrl+x` by name, harness, or ID. `enter` unhides the chosen one and selects its row as soon as discovery lists it; `esc` or `ctrl+g` closes the picker. |
-| Session list | `ctrl+p` | Pin or unpin the selected session. Pinned rows stay in a group at the top. `cmd+p` is the same key when the terminal delivers it as the super modifier. |
+| Session list | `ctrl+t` or `ctrl+p` | Pin or unpin the selected session. Pinned rows stay in a group at the top. `ctrl+t` matches Claude Code's agent-view pin key; `cmd+p` also works when the terminal delivers it as the super modifier. |
 | Session list | `tab`, `/`, or printable text | Compose a new host task. `/` begins a dashboard command rather than a filter. |
 | New-task composer | `tab` | Open the visible harness picker. |
 | New-task composer | `shift+tab` | Open the selected harness's model picker—or Terminal shell picker—without changing the task draft. |
