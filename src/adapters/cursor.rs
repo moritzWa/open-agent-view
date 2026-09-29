@@ -508,10 +508,22 @@ impl ProviderController for CursorController {
             bail!("the Cursor host controller cannot open this session");
         }
         #[cfg(target_os = "linux")]
+        let owned = match &self.supervisor {
+            Some(supervisor) => supervisor.owns(session),
+            None => false,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let owned = false;
+        #[cfg(target_os = "linux")]
         if let Some(supervisor) = &self.supervisor {
-            if supervisor.owns(session) && supervisor.is_running(session)? {
+            if owned && supervisor.is_running(session)? {
                 bail!("interrupt the active managed Cursor turn before opening it natively");
             }
+        }
+        // An external chat with a live holder is already open in another
+        // cursor-agent; a second resume would write the same chat store.
+        if let (false, Some(pid)) = (owned, session.pid) {
+            bail!("chat is open in cursor-agent (pid {pid}); close it there first");
         }
         #[cfg(target_os = "linux")]
         let pending_native = self
@@ -780,6 +792,36 @@ mod tests {
                 session_id: "abc".into(),
                 text: "done".into(),
             }
+        );
+    }
+
+    #[test]
+    fn refuses_to_open_an_external_chat_another_process_holds() {
+        let session = AgentSession {
+            id: "cursor:host:2a243dcb-b43b-47be-8dfc-73f656a3f5ea".into(),
+            provider_session_id: "2a243dcb-b43b-47be-8dfc-73f656a3f5ea".into(),
+            provider: Provider::Cursor,
+            runtime: Runtime::Host,
+            kind: crate::domain::SessionKind::Interactive,
+            name: "Agent Comparison".into(),
+            cwd: PathBuf::from("/work/repo"),
+            state: crate::domain::SessionState::NeedsInput,
+            summary: String::new(),
+            raw_state: Some("waiting at prompt".into()),
+            pid: Some(4242),
+            started_at: None,
+            updated_at: None,
+            pull_requests: None,
+            capabilities: std::collections::BTreeSet::new(),
+        };
+        // The executable does not exist: reaching the resume would fail
+        // differently, so this error proves the guard ran first.
+        let error = CursorController::host("/nonexistent/cursor-agent")
+            .open(&session)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "chat is open in cursor-agent (pid 4242); close it there first"
         );
     }
 

@@ -360,7 +360,7 @@ never signals a PID merely because it appears in the registry.
 | --- | --- | --- |
 | Discover | Private registry plus bounded stream-JSON logs | `~/.cursor/chats` metadata plus live-process check (all platforms) |
 | Inspect | Bounded assistant transcript from the owned log | Recorded user prompts from `prompt_history.json` |
-| Open | Refused while an owned print worker is active; native resume otherwise | Native resume (`cursor-agent --resume <id> --workspace <cwd>`) |
+| Open | Refused while an owned print worker is active; native resume otherwise | Refused while another live `cursor-agent` holds the chat; native resume (`cursor-agent --resume <id> --workspace <cwd>`) otherwise |
 | Launch/reply | Create a chat and open it in the foreground; inline reply only after the prior process/native frontend exits | Disabled |
 | Interrupt | `SIGINT` only after exact live-process verification | Disabled |
 | Permission/archive/delete | Disabled | Disabled |
