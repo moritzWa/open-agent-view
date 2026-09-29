@@ -20,6 +20,9 @@ and future released versions are intended to follow Semantic Versioning.
   prompt; state comes from verifying the CLI process that holds the chat open.
   Enter/Right resumes the chat natively and Inspect lists the recorded prompts.
   `--cursor-chats-dir` overrides the store location.
+- `ctrl+g` opens a searchable picker of sessions hidden with `ctrl+x`.
+  Enter unhides the chosen session and selects its row when discovery lists
+  it, without leaving the dashboard.
 
 ### Fixed
 
@@ -33,6 +36,9 @@ and future released versions are intended to follow Semantic Versioning.
   freezes that process. A Cursor turn (and any other native CLI opened from a
   row) keeps running on its own terminal, so several agents can work at once.
   Enter on the same row shows the screen it has produced since.
+- Hiding, deleting, or losing the selected row keeps the cursor on the row
+  that followed it (or the one before it at the end of the list) instead of
+  jumping back to the first row.
 
 ### Tests
 

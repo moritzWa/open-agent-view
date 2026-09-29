@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style};
@@ -7,7 +7,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{
     is_active_session_state, project_group_path, App, ComposerMode, ConfirmTarget, Overlay,
-    SelectionKey, ViewMode, MIGRATION_PICKER_PAGE_SIZE, MODEL_PICKER_PAGE_SIZE,
+    SelectionKey, ViewMode, HIDDEN_PICKER_PAGE_SIZE, MIGRATION_PICKER_PAGE_SIZE,
+    MODEL_PICKER_PAGE_SIZE,
 };
 use crate::domain::{AgentSession, Capability, Provider, SessionState};
 
@@ -80,6 +81,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         render_harness_picker(frame, app, area);
     } else if app.overlay == Overlay::ModelPicker {
         render_model_picker(frame, app, area);
+    } else if app.overlay == Overlay::HiddenPicker {
+        render_hidden_picker(frame, app, area);
     } else if matches!(app.overlay, Overlay::MigrationTargetPicker { .. }) {
         render_migration_target_picker(frame, app, area);
     }
@@ -195,7 +198,10 @@ fn render_session_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let mut selected_line = None;
     let selection_visible = !matches!(
         app.overlay,
-        Overlay::Composer(_) | Overlay::HarnessPicker | Overlay::ModelPicker
+        Overlay::Composer(_)
+            | Overlay::HarnessPicker
+            | Overlay::ModelPicker
+            | Overlay::HiddenPicker
     );
 
     for (group_position, group) in app.groups().iter().enumerate() {
@@ -762,6 +768,10 @@ fn contextual_footer(app: &App, width: u16) -> String {
             if selected_shell_install(app) { "install" } else { "select" }
         ),
         Overlay::ModelPicker => "type filter · ↑/↓ · enter · esc".into(),
+        Overlay::HiddenPicker if width >= 70 => {
+            "type to search hidden sessions · ↑/↓ move · enter restore · esc close".into()
+        }
+        Overlay::HiddenPicker => "type to search · ↑/↓ · enter restore · esc".into(),
         Overlay::MigrationTargetPicker { .. } if width >= 58 => {
             "↑/↓ move · page up/down · enter choose · esc cancel".into()
         }
@@ -917,6 +927,7 @@ fn help_actions(app: &App) -> Vec<String> {
         actions.push("ctrl+m to migrate session".into());
     }
     actions.push("ctrl+f to filter".into());
+    actions.push("ctrl+g to search and restore hidden sessions".into());
     actions.push("/filter text to filter sessions".into());
     actions.push("ctrl+j for newline".into());
     actions.push("tab for new task/harness picker".into());
@@ -1155,6 +1166,114 @@ fn render_migration_target_picker(frame: &mut Frame<'_>, app: &App, area: Rect) 
                     .border_style(Style::default().fg(palette().accent)),
             )
             .style(Style::default().bg(palette().bg).fg(palette().fg)),
+        popup,
+    );
+}
+
+fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let choices = app.hidden_choices();
+    let popup_width = area.width.saturating_sub(2).min(84).max(30);
+    let visible_rows = HIDDEN_PICKER_PAGE_SIZE
+        .min(area.height.saturating_sub(7).max(1) as usize)
+        .max(1);
+    let result_rows = choices.len().clamp(1, visible_rows);
+    let popup_height = (result_rows as u16 + 4)
+        .min(area.height.saturating_sub(2))
+        .max(5);
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(popup_width) / 2,
+        area.y + area.height.saturating_sub(popup_height) / 2,
+        popup_width,
+        popup_height,
+    );
+    let start = if choices.is_empty() {
+        0
+    } else {
+        (app.hidden_selection / visible_rows) * visible_rows
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(" search  ", Style::default().fg(DIM)),
+        Span::styled(
+            if app.hidden_filter.is_empty() {
+                "type a name, harness, or ID".into()
+            } else {
+                sanitize_inline(&app.hidden_filter)
+            },
+            if app.hidden_filter.is_empty() {
+                Style::default().fg(DIM)
+            } else {
+                Style::default().fg(FG)
+            },
+        ),
+    ])];
+    if choices.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No hidden sessions match",
+            Style::default().fg(DIM),
+        )));
+    } else {
+        let now = SystemTime::now();
+        let inner_width = popup_width.saturating_sub(4) as usize;
+        lines.extend(
+            choices
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible_rows)
+                .map(|(index, record)| {
+                    let selected = index == app.hidden_selection;
+                    let provider = record
+                        .provider
+                        .as_ref()
+                        .map(|provider| provider.label().to_owned())
+                        .unwrap_or_else(|| "unknown".into());
+                    let hidden_for = now
+                        .duration_since(
+                            UNIX_EPOCH + std::time::Duration::from_millis(record.hidden_at_ms),
+                        )
+                        .ok();
+                    let age = format!("hidden {} ago", format_age(hidden_for));
+                    let name = sanitize_inline(record.name.as_deref().unwrap_or(&record.id));
+                    let tail = format!("  {provider} · {age}");
+                    let name_width = inner_width.saturating_sub(display_width(&tail) + 3);
+                    let name = truncate(&name, name_width.max(8));
+                    Line::from(format!(
+                        " {} {name}{tail}",
+                        if selected { "›" } else { " " }
+                    ))
+                    .style(if selected {
+                        Style::default()
+                            .bg(SELECTED_BG)
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().bg(BG).fg(FG)
+                    })
+                }),
+        );
+    }
+    lines.push(
+        Line::from(if popup_width >= 60 {
+            " ↑/↓ move · PgUp/PgDn page · enter restore to the list · esc close"
+        } else {
+            " ↑/↓ · enter restore · esc"
+        })
+        .style(Style::default().fg(DIM)),
+    );
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(format!(
+                        " restore hidden session · {} of {} ",
+                        choices.len(),
+                        app.hidden_candidates.len()
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT)),
+            )
+            .style(Style::default().bg(BG).fg(FG)),
         popup,
     );
 }
