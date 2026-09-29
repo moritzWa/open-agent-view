@@ -8,6 +8,15 @@ and future released versions are intended to follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- External Cursor chats are now discovered on every platform from Cursor's own
+  chat store (`~/.cursor/chats`), with `--include-external
+  --include-interactive`. Rows show the chat title, workspace, and latest
+  prompt; state comes from verifying the CLI process that holds the chat open.
+  Enter/Right resumes the chat natively and Inspect lists the recorded prompts.
+  `--cursor-chats-dir` overrides the store location.
+
 ## [0.1.53] - 2026-09-04
 
 ### Added

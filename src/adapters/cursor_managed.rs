@@ -398,6 +398,11 @@ impl CursorSupervisor {
             && self.lookup(&session.provider_session_id).is_ok()
     }
 
+    /// Whether this supervisor created the chat with the given Cursor chat ID.
+    pub fn owns_chat_id(&self, chat_id: &str) -> bool {
+        self.lookup(chat_id).is_ok()
+    }
+
     pub fn yolo_if_owned(&self, session: &AgentSession) -> bool {
         self.lookup(&session.provider_session_id)
             .is_ok_and(|record| record.yolo)

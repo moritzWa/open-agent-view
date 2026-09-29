@@ -1,0 +1,760 @@
+//! Cursor's CLI keeps every chat on disk. Each one lives under
+//! `~/.cursor/chats/<md5 of the working directory>/<chat id>/` with a small
+//! `meta.json` (title, working directory, created/updated timestamps), a
+//! `prompt_history.json` (the user's prompts, newest first), and a SQLite
+//! `store.db` holding the conversation blobs.
+//!
+//! This source lists those chats on every platform. It only reads the two
+//! small JSON files; the conversation store is never opened. A running
+//! `cursor-agent` process keeps its chat's `store.db` open, which is how a
+//! chat is recognised as live without scraping the CLI's TTY picker.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+
+use super::native_owned::sanitize;
+use super::{DiscoveryRequest, SessionSource};
+use crate::domain::{AgentSession, Capability, Provider, Runtime, SessionKind, SessionState};
+use crate::process::{CommandRequest, CommandRunner, ProcessRunner};
+
+const MAX_META_BYTES: u64 = 64 * 1024;
+const MAX_PROMPT_HISTORY_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_HASH_DIRS: usize = 4_096;
+const MAX_CHATS_PER_DIR: usize = 4_096;
+/// A chat whose store changed this recently while its process is alive is
+/// treated as mid-turn rather than idle at the prompt.
+const ACTIVE_WINDOW: Duration = Duration::from_secs(20);
+const PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Filter for chats another source already reports, such as the managed
+/// registry on Linux, so one chat does not appear twice.
+pub type ChatFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+pub struct CursorHistorySource {
+    chats_root: PathBuf,
+    versions_root: Option<PathBuf>,
+    runner: Arc<dyn CommandRunner>,
+    skip: Option<ChatFilter>,
+}
+
+impl CursorHistorySource {
+    pub fn host(chats_root: PathBuf, versions_root: Option<PathBuf>) -> Self {
+        Self {
+            chats_root,
+            versions_root,
+            runner: Arc::new(ProcessRunner),
+            skip: None,
+        }
+    }
+
+    pub fn host_default() -> Result<Self> {
+        Ok(Self::host(
+            default_cursor_chats_dir()?,
+            default_cursor_versions_dir().ok(),
+        ))
+    }
+
+    /// Leave out chats for which `skip` returns true.
+    pub fn skipping(mut self, skip: ChatFilter) -> Self {
+        self.skip = Some(skip);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_runner(mut self, runner: Arc<dyn CommandRunner>) -> Self {
+        self.runner = runner;
+        self
+    }
+}
+
+impl SessionSource for CursorHistorySource {
+    fn label(&self) -> &str {
+        "Cursor (host)"
+    }
+
+    fn discover(&self, request: &DiscoveryRequest) -> Result<Vec<AgentSession>> {
+        if !request.include_interactive {
+            // Every chat in this store is a foreground TUI session.
+            return Ok(Vec::new());
+        }
+        let mut chats = read_cursor_chats(&self.chats_root)?;
+        if let Some(skip) = &self.skip {
+            chats.retain(|chat| !skip(&chat.id));
+        }
+        if chats.is_empty() {
+            return Ok(Vec::new());
+        }
+        let live = live_chats(
+            self.versions_root.as_deref(),
+            &self.chats_root,
+            self.runner.as_ref(),
+        );
+        let now = SystemTime::now();
+        chats.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(a.id.cmp(&b.id)));
+        let mut sessions = Vec::new();
+        let mut completed = 0usize;
+        for chat in chats {
+            let pid = live.get(&chat.dir).copied();
+            let (state, raw_state) = chat_state(&chat, pid, now);
+            if state == SessionState::Completed {
+                if !request.include_completed || completed >= request.history_limit.max(1) {
+                    continue;
+                }
+                completed += 1;
+            }
+            let summary = latest_prompt(&chat.dir)
+                .map(|prompt| sanitize(&prompt, 180, &chat.title))
+                .unwrap_or_else(|| format!("no prompts recorded · {}", chat.cwd.display()));
+            sessions.push(AgentSession {
+                id: format!("cursor:host:{}", chat.id),
+                provider_session_id: chat.id.clone(),
+                provider: Provider::Cursor,
+                runtime: Runtime::Host,
+                kind: SessionKind::Interactive,
+                name: chat.title.clone(),
+                cwd: chat.cwd.clone(),
+                state,
+                summary,
+                raw_state: Some(raw_state.into()),
+                pid,
+                started_at: chat.created_at,
+                updated_at: chat.updated_at,
+                pull_requests: None,
+                capabilities: BTreeSet::from([Capability::Inspect]),
+            });
+        }
+        Ok(sessions)
+    }
+}
+
+/// A bounded transcript of the user's own prompts, newest last. Cursor keeps
+/// the assistant side in an encrypted blob store that this dashboard does not
+/// open, so the prompts are what an operator can review.
+pub fn inspect_cursor_history(chats_root: &Path, session: &AgentSession) -> Result<String> {
+    let chat = read_cursor_chats(chats_root)?
+        .into_iter()
+        .find(|chat| chat.id == session.provider_session_id)
+        .with_context(|| format!("Cursor chat {} was not found on disk", session.name))?;
+    let prompts = read_prompt_history(&chat.dir)?;
+    let mut lines = vec![
+        format!("{} · {}", chat.title, chat.cwd.display()),
+        String::new(),
+    ];
+    if prompts.is_empty() {
+        lines.push("No prompts recorded for this chat yet.".into());
+    } else {
+        lines.push(format!("Last {} prompt(s):", prompts.len().min(20)));
+        for prompt in prompts.iter().take(20).rev() {
+            lines.push(format!("❯ {}", sanitize(prompt, 400, "(empty prompt)")));
+        }
+    }
+    lines.push(String::new());
+    lines.push("Open the row to resume the chat in Cursor.".into());
+    Ok(lines.join("\n"))
+}
+
+pub fn default_cursor_chats_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".cursor/chats"))
+}
+
+/// Where the CLI installer keeps versioned builds. Each build records live
+/// process IDs under `.running/`, which bounds the process probe.
+pub fn default_cursor_versions_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".local/share/cursor-agent/versions"))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CursorChat {
+    id: String,
+    dir: PathBuf,
+    title: String,
+    cwd: PathBuf,
+    created_at: Option<SystemTime>,
+    updated_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CursorChatMeta {
+    #[serde(default)]
+    created_at_ms: Option<u64>,
+    #[serde(default)]
+    updated_at_ms: Option<u64>,
+    #[serde(default)]
+    has_conversation: Option<bool>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+}
+
+fn read_cursor_chats(chats_root: &Path) -> Result<Vec<CursorChat>> {
+    let root_metadata = match fs::symlink_metadata(chats_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("failed to read the Cursor chats directory"),
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        bail!("Cursor chats root must be a real directory");
+    }
+    let mut chats = Vec::new();
+    for hash_dir in real_subdirectories(chats_root)?
+        .into_iter()
+        .take(MAX_HASH_DIRS)
+    {
+        for chat_dir in real_subdirectories(&hash_dir)?
+            .into_iter()
+            .take(MAX_CHATS_PER_DIR)
+        {
+            let Some(id) = chat_dir.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !is_chat_id(id) {
+                continue;
+            }
+            match read_chat(&chat_dir, id) {
+                Ok(Some(chat)) => chats.push(chat),
+                // One damaged chat must not hide the rest of the history.
+                Ok(None) | Err(_) => continue,
+            }
+        }
+    }
+    Ok(chats)
+}
+
+fn real_subdirectories(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        paths.push(entry.path());
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn read_chat(chat_dir: &Path, id: &str) -> Result<Option<CursorChat>> {
+    let meta: CursorChatMeta = read_bounded_json(&chat_dir.join("meta.json"), MAX_META_BYTES)?;
+    if meta.has_conversation == Some(false) {
+        return Ok(None);
+    }
+    let Some(cwd) = meta.cwd.filter(|path| path.is_absolute()) else {
+        return Ok(None);
+    };
+    let title = meta
+        .title
+        .map(|title| sanitize(&title, 120, "Cursor chat"))
+        .unwrap_or_else(|| "Cursor chat".into());
+    Ok(Some(CursorChat {
+        id: id.to_owned(),
+        dir: chat_dir.to_owned(),
+        title,
+        cwd,
+        created_at: meta.created_at_ms.map(millis),
+        updated_at: meta.updated_at_ms.map(millis),
+    }))
+}
+
+fn read_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path, limit: u64) -> Result<T> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{} must be a real file", path.display());
+    }
+    if metadata.len() > limit {
+        bail!("{} exceeded the {limit}-byte safety limit", path.display());
+    }
+    let file = File::open(path)?;
+    serde_json::from_reader(BufReader::new(file))
+        .with_context(|| format!("invalid JSON in {}", path.display()))
+}
+
+fn read_prompt_history(chat_dir: &Path) -> Result<Vec<String>> {
+    let path = chat_dir.join("prompt_history.json");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => read_bounded_json::<Vec<String>>(&path, MAX_PROMPT_HISTORY_BYTES),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn latest_prompt(chat_dir: &Path) -> Option<String> {
+    read_prompt_history(chat_dir)
+        .ok()?
+        .into_iter()
+        .find(|prompt| !prompt.trim().is_empty())
+}
+
+fn chat_state(
+    chat: &CursorChat,
+    pid: Option<u32>,
+    now: SystemTime,
+) -> (SessionState, &'static str) {
+    if pid.is_none() {
+        return (SessionState::Completed, "closed");
+    }
+    let last_write = store_mtime(&chat.dir).max(chat.updated_at);
+    let active = last_write
+        .and_then(|written| now.duration_since(written).ok())
+        .is_some_and(|age| age <= ACTIVE_WINDOW);
+    if active {
+        (SessionState::Working, "running turn")
+    } else {
+        (SessionState::NeedsInput, "waiting at prompt")
+    }
+}
+
+/// The newest write to the conversation store. Cursor appends to the SQLite
+/// WAL while a turn streams, so this moves during work and rests otherwise.
+fn store_mtime(chat_dir: &Path) -> Option<SystemTime> {
+    ["store.db-wal", "store.db", "meta.json"]
+        .iter()
+        .filter_map(|name| fs::metadata(chat_dir.join(name)).ok()?.modified().ok())
+        .max()
+}
+
+fn is_chat_id(value: &str) -> bool {
+    value.len() == 36
+        && value.chars().enumerate().all(|(index, character)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                character == '-'
+            } else {
+                character.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn millis(value: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(value)
+}
+
+/// Chat directories held open by a live `cursor-agent`, keyed by directory.
+fn live_chats(
+    versions_root: Option<&Path>,
+    chats_root: &Path,
+    runner: &dyn CommandRunner,
+) -> BTreeMap<PathBuf, u32> {
+    let pids = candidate_pids(versions_root)
+        .into_iter()
+        .filter(|pid| process_alive(*pid))
+        .collect::<Vec<_>>();
+    if pids.is_empty() {
+        return BTreeMap::new();
+    }
+    // The probe may report the resolved path (macOS `/private/tmp`), so match
+    // against the root as configured and as canonicalised.
+    let mut roots = vec![chats_root.to_owned()];
+    if let Ok(canonical) = fs::canonicalize(chats_root) {
+        if canonical != chats_root {
+            roots.push(canonical);
+        }
+    }
+    let mut live = BTreeMap::new();
+    for (pid, path) in open_store_files(&pids, runner) {
+        let Some(relative) = roots.iter().find_map(|root| path.strip_prefix(root).ok()) else {
+            continue;
+        };
+        let parts = relative.components().collect::<Vec<_>>();
+        // `<hash>/<chat id>/store.db`
+        if parts.len() != 3 {
+            continue;
+        }
+        let chat_dir = chats_root.join(parts[0]).join(parts[1]);
+        live.entry(chat_dir).or_insert(pid);
+    }
+    live
+}
+
+/// The CLI records each live process under `<version>/.running/<pid>`. Stale
+/// markers are common, so every candidate is verified before use.
+fn candidate_pids(versions_root: Option<&Path>) -> BTreeSet<u32> {
+    let mut pids = BTreeSet::new();
+    let Some(versions_root) = versions_root else {
+        return pids;
+    };
+    let Ok(versions) = fs::read_dir(versions_root) else {
+        return pids;
+    };
+    for version in versions.flatten() {
+        let Ok(markers) = fs::read_dir(version.path().join(".running")) else {
+            continue;
+        };
+        for marker in markers.flatten() {
+            if let Some(pid) = marker
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            {
+                pids.insert(pid);
+            }
+        }
+    }
+    pids
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        // Signal 0 checks existence only. EPERM still means the process exists.
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// `store.db` paths each candidate process holds open.
+fn open_store_files(pids: &[u32], runner: &dyn CommandRunner) -> Vec<(u32, PathBuf)> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = runner;
+        let mut files = Vec::new();
+        for pid in pids {
+            let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if let Ok(target) = fs::read_link(entry.path()) {
+                    if target.file_name().and_then(|name| name.to_str()) == Some("store.db") {
+                        files.push((*pid, target));
+                    }
+                }
+            }
+        }
+        files
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let list = pids
+            .iter()
+            .map(|pid| pid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut request =
+            CommandRequest::new("lsof", vec!["-F".into(), "pn".into(), "-p".into(), list]);
+        request.timeout = PROCESS_PROBE_TIMEOUT;
+        // lsof exits non-zero when any listed PID has gone away; the output it
+        // did produce is still valid, so only an unreadable stream is fatal.
+        match runner.run(&request) {
+            Ok(output) => output
+                .stdout_text()
+                .map(parse_lsof_store_files)
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pids, runner);
+        Vec::new()
+    }
+}
+
+/// Parse `lsof -F pn` output: a `p<pid>` line starts each process, and every
+/// `n<path>` line after it belongs to that process.
+pub fn parse_lsof_store_files(output: &str) -> Vec<(u32, PathBuf)> {
+    let mut files = Vec::new();
+    let mut current = None;
+    for line in output.lines() {
+        if let Some(pid) = line.strip_prefix('p') {
+            current = pid.trim().parse::<u32>().ok();
+        } else if let (Some(pid), Some(path)) = (current, line.strip_prefix('n')) {
+            let path = PathBuf::from(path);
+            if path.file_name().and_then(|name| name.to_str()) == Some("store.db") {
+                files.push((pid, path));
+            }
+        }
+    }
+    files
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::process::CommandOutput;
+
+    const CHAT_A: &str = "2a243dcb-b43b-47be-8dfc-73f656a3f5ea";
+    const CHAT_B: &str = "499e4a32-b12d-4fc1-b0a0-01ee8c58601d";
+    const CHAT_EMPTY: &str = "7ceca4ee-479c-4a75-83b0-0ae564583cdb";
+
+    struct StaticRunner {
+        stdout: String,
+        requests: Mutex<Vec<CommandRequest>>,
+    }
+
+    impl CommandRunner for StaticRunner {
+        fn run(&self, request: &CommandRequest) -> Result<CommandOutput> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(CommandOutput {
+                status: 0,
+                stdout: self.stdout.clone().into_bytes(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn write_chat(root: &Path, hash: &str, id: &str, title: &str, cwd: &str, updated: u64) {
+        let dir = root.join(hash).join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("meta.json"),
+            format!(
+                r#"{{"schemaVersion":1,"createdAtMs":{},"hasConversation":true,"title":"{title}","updatedAtMs":{updated},"cwd":"{cwd}"}}"#,
+                updated - 60_000
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("prompt_history.json"),
+            r#"["  newest   prompt\nhere ", "older prompt"]"#,
+        )
+        .unwrap();
+        fs::write(dir.join("store.db"), b"sqlite").unwrap();
+    }
+
+    fn request() -> DiscoveryRequest {
+        DiscoveryRequest {
+            include_completed: true,
+            include_interactive: true,
+            include_external: true,
+            cwd: None,
+            history_limit: 100,
+            history_oldest_first: false,
+        }
+    }
+
+    #[test]
+    fn chat_ids_are_uuid_shaped() {
+        assert!(is_chat_id(CHAT_A));
+        assert!(!is_chat_id("2a243dcb"));
+        assert!(!is_chat_id("../../../../etc/passwd/xxxxxxxxxxxxxxxxxx"));
+        assert!(!is_chat_id("2a243dcbXb43bX47beX8dfcX73f656a3f5ea"));
+    }
+
+    #[test]
+    fn lists_chats_from_meta_json_and_skips_unusable_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        write_chat(
+            root,
+            "8550e5f0",
+            CHAT_A,
+            "Agent Comparison",
+            "/Users/m",
+            2_000_000,
+        );
+        write_chat(
+            root,
+            "d3643a72",
+            CHAT_B,
+            "Agent View Setup",
+            "/Users/m/Code",
+            1_000_000,
+        );
+        // No conversation yet: an empty composer, not a session.
+        let empty = root.join("f8dbe6c9").join(CHAT_EMPTY);
+        fs::create_dir_all(&empty).unwrap();
+        fs::write(
+            empty.join("meta.json"),
+            r#"{"schemaVersion":1,"createdAtMs":1,"hasConversation":false,"title":"New","updatedAtMs":1,"cwd":"/tmp"}"#,
+        )
+        .unwrap();
+        // Not a chat id.
+        fs::create_dir_all(root.join("8550e5f0").join("notes")).unwrap();
+        // Damaged meta must not hide the rest.
+        let broken = root
+            .join("8550e5f0")
+            .join("11111111-2222-4333-8444-555555555555");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("meta.json"), "{ not json").unwrap();
+
+        let source = CursorHistorySource::host(root.to_owned(), None);
+        let sessions = source.discover(&request()).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].id, format!("cursor:host:{CHAT_A}"));
+        assert_eq!(sessions[0].name, "Agent Comparison");
+        assert_eq!(sessions[0].cwd, PathBuf::from("/Users/m"));
+        assert_eq!(sessions[0].summary, "newest prompt here");
+        assert_eq!(sessions[0].state, SessionState::Completed);
+        assert_eq!(sessions[0].kind, SessionKind::Interactive);
+        assert_eq!(sessions[0].raw_state.as_deref(), Some("closed"));
+        assert_eq!(sessions[0].updated_at, Some(millis(2_000_000)));
+        assert_eq!(sessions[0].started_at, Some(millis(1_940_000)));
+        assert_eq!(sessions[1].provider_session_id, CHAT_B);
+        assert!(sessions
+            .iter()
+            .all(|session| session.capabilities == BTreeSet::from([Capability::Inspect])));
+    }
+
+    #[test]
+    fn foreground_chats_are_hidden_without_include_interactive() {
+        let temp = tempfile::tempdir().unwrap();
+        write_chat(temp.path(), "8550e5f0", CHAT_A, "A", "/Users/m", 2_000_000);
+        let source = CursorHistorySource::host(temp.path().to_owned(), None);
+        let mut request = request();
+        request.include_interactive = false;
+        assert!(source.discover(&request).unwrap().is_empty());
+    }
+
+    #[test]
+    fn completed_history_honours_the_limit_and_completed_toggle() {
+        let temp = tempfile::tempdir().unwrap();
+        write_chat(temp.path(), "8550e5f0", CHAT_A, "A", "/Users/m", 2_000_000);
+        write_chat(temp.path(), "8550e5f0", CHAT_B, "B", "/Users/m", 1_000_000);
+        let source = CursorHistorySource::host(temp.path().to_owned(), None);
+        let mut limited = request();
+        limited.history_limit = 1;
+        let sessions = source.discover(&limited).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].provider_session_id, CHAT_A);
+        let mut active_only = request();
+        active_only.include_completed = false;
+        assert!(source.discover(&active_only).unwrap().is_empty());
+    }
+
+    #[test]
+    fn skip_filter_removes_chats_another_source_owns() {
+        let temp = tempfile::tempdir().unwrap();
+        write_chat(temp.path(), "8550e5f0", CHAT_A, "A", "/Users/m", 2_000_000);
+        write_chat(temp.path(), "8550e5f0", CHAT_B, "B", "/Users/m", 1_000_000);
+        let source = CursorHistorySource::host(temp.path().to_owned(), None)
+            .skipping(Arc::new(|id: &str| id == CHAT_A));
+        let sessions = source.discover(&request()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].provider_session_id, CHAT_B);
+    }
+
+    #[test]
+    fn a_live_process_holding_the_store_marks_the_chat_active_or_idle() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("chats");
+        let versions = temp.path().join("versions");
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        write_chat(&root, "8550e5f0", CHAT_A, "Active", "/Users/m", now_ms);
+        write_chat(
+            &root,
+            "8550e5f0",
+            CHAT_B,
+            "Idle",
+            "/Users/m",
+            now_ms - 3_600_000,
+        );
+        // Make the idle chat's files old so it is not mistaken for a running turn.
+        let old = filetime_old();
+        for name in ["store.db", "meta.json", "prompt_history.json"] {
+            let path = root.join("8550e5f0").join(CHAT_B).join(name);
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let running = versions.join("2026.09.28-64d2043").join(".running");
+        fs::create_dir_all(&running).unwrap();
+        let me = std::process::id();
+        fs::write(running.join(me.to_string()), b"").unwrap();
+        fs::write(running.join("999999"), b"").unwrap();
+
+        let store_a = root.join("8550e5f0").join(CHAT_A).join("store.db");
+        let store_b = root.join("8550e5f0").join(CHAT_B).join("store.db");
+        let runner = Arc::new(StaticRunner {
+            stdout: format!(
+                "p{me}\nfcwd\nn/Users/m\nn{}\nn{}\nn{}-wal\n",
+                store_a.display(),
+                store_b.display(),
+                store_a.display()
+            ),
+            requests: Mutex::new(Vec::new()),
+        });
+        let source =
+            CursorHistorySource::host(root.clone(), Some(versions)).with_runner(runner.clone());
+        let sessions = source.discover(&request()).unwrap();
+        let by_id = sessions
+            .iter()
+            .map(|session| (session.provider_session_id.as_str(), session))
+            .collect::<BTreeMap<_, _>>();
+
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            let requests = runner.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].program, "lsof");
+            assert_eq!(requests[0].args[3], me.to_string(), "dead PIDs are pruned");
+            assert_eq!(by_id[CHAT_A].state, SessionState::Working);
+            assert_eq!(by_id[CHAT_A].pid, Some(me));
+            assert_eq!(by_id[CHAT_B].state, SessionState::NeedsInput);
+            assert_eq!(
+                by_id[CHAT_B].raw_state.as_deref(),
+                Some("waiting at prompt")
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // /proc shows this test process does not hold the stores open.
+            assert_eq!(by_id[CHAT_A].state, SessionState::Completed);
+            assert_eq!(by_id[CHAT_B].state, SessionState::Completed);
+        }
+    }
+
+    #[test]
+    fn lsof_parser_keeps_only_store_paths_under_their_pid() {
+        let parsed = parse_lsof_store_files(
+            "p100\nfcwd\nn/Users/m\nf12\nn/Users/m/.cursor/chats/h/id/store.db\nn/Users/m/.cursor/chats/h/id/store.db-wal\np200\nn/tmp/other/store.db\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                (100, PathBuf::from("/Users/m/.cursor/chats/h/id/store.db")),
+                (200, PathBuf::from("/tmp/other/store.db")),
+            ]
+        );
+    }
+
+    #[test]
+    fn inspect_lists_recent_prompts_oldest_first() {
+        let temp = tempfile::tempdir().unwrap();
+        write_chat(
+            temp.path(),
+            "8550e5f0",
+            CHAT_A,
+            "Agent Comparison",
+            "/Users/m",
+            2_000_000,
+        );
+        let source = CursorHistorySource::host(temp.path().to_owned(), None);
+        let session = source.discover(&request()).unwrap().remove(0);
+        let text = inspect_cursor_history(temp.path(), &session).unwrap();
+        assert!(text.starts_with("Agent Comparison · /Users/m"));
+        let older = text.find("older prompt").unwrap();
+        let newest = text.find("newest prompt here").unwrap();
+        assert!(older < newest);
+        assert!(text.contains("Open the row to resume"));
+    }
+
+    fn filetime_old() -> SystemTime {
+        SystemTime::now() - Duration::from_secs(3_600)
+    }
+}

@@ -50,7 +50,8 @@ Open Agent View is already up to date.
 | `--no-host-pi` | Disable host Pi history and managed supervision. |
 | `--opencode-bin PATH` / `--no-host-opencode` | Select or disable OpenCode history plus durable managed supervision on Linux. |
 | `--copilot-bin PATH` / `--no-host-copilot` | Select or disable persisted Copilot discovery and process-local managed ACP control. |
-| `--cursor-bin PATH` / `--no-host-cursor` | Select or disable OAV-owned managed Cursor support on Linux. Cursor has no machine-readable global list. |
+| `--cursor-bin PATH` / `--no-host-cursor` | Select or disable Cursor support on the host. External chats are read from Cursor's own chat store with `--include-external --include-interactive`; managed launch/reply additionally requires Linux. |
+| `--cursor-chats-dir PATH` | Override the chat store Cursor's CLI writes to (default `~/.cursor/chats`). |
 | `--antigravity-bin PATH` / `--no-host-antigravity` | Select or disable host Antigravity discovery. |
 | `--mistral-vibe-bin PATH` / `--mistral-vibe-app-server-bin PATH` / `--no-host-mistral-vibe` | Select or disable Mistral Vibe native control and app-server discovery. |
 | `--muse-bin PATH` / `--no-host-muse` | Select or disable Muse Code native control and owned local-history discovery. |
