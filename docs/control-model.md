@@ -342,17 +342,18 @@ this dashboard opened and is keeping in the background, its state is read from
 that terminal's screen. Cursor shows `ctrl+c to stop` at the right end of the
 composer while a turn is processing and the composer input is empty, so a
 composer row ending in the hint means *working*, including long thinking and
-tool calls that write nothing to disk. The empty idle composer, its
-`Add a follow-up` or `Plan, search, build anything` placeholder without the
-hint, means *waiting at prompt*. Anything else, such as a follow-up typed mid-turn, a
-startup or login screen, or a hint Cursor has since renamed, is not taken as
-evidence either way. Those rows, and chats held by a CLI in some other terminal
-whose screen is not visible, fall back to the store: a live chat is *working*
-while its store or metadata changed within the last 20 seconds and *waiting at
-prompt* otherwise. Because these rows are observe/native-open only, a stale
-marker or a misread PID can at worst mislabel a row's state; nothing is ever
-signalled based on it. Running-state detection is implemented on macOS and
-Linux only; on other platforms every chat is listed as closed history.
+tool calls that write nothing to disk. The empty idle composer, its `Add a
+follow-up` or `Plan, search, build anything` placeholder without the hint,
+means *waiting at prompt*. Anything else, such as a follow-up typed mid-turn,
+a startup or login screen, or a hint Cursor has since renamed, is not taken as
+evidence either way. Those rows, and chats held by a CLI in some other
+terminal whose screen is not visible, fall back to the store: a live chat is
+*working* while its store or metadata changed within the last 20 seconds and
+*waiting at prompt* otherwise. Because these rows are observe/native-open
+only, a stale marker or a misread PID can at worst mislabel a row's state;
+nothing is ever signalled based on it. Running-state detection is implemented
+on macOS and Linux only; on other platforms every chat is listed as closed
+history.
 
 Managed control is separate. Foreground launch on Linux creates an exact Cursor
 chat, records it, and immediately resumes that ID in Cursor's interactive
@@ -372,15 +373,20 @@ never signals a PID merely because it appears in the registry.
 | --- | --- | --- |
 | Discover | Private registry plus bounded stream-JSON logs | `~/.cursor/chats` metadata plus live-process check (all platforms) |
 | Inspect | Bounded assistant transcript from the owned log | Recorded user prompts from `prompt_history.json` |
-| Open | Refused while an owned print worker is active; native resume otherwise | Refused while another live `cursor-agent` holds the chat; native resume (`cursor-agent --resume <id> --workspace <cwd>`) otherwise |
+| Open | Refused while an owned print worker is active; native resume otherwise | Refused while another live `cursor-agent` holds the chat; the dashboard's own background terminal for the chat is reattached; native resume (`cursor-agent --resume <id> --workspace <cwd>`) otherwise |
 | Launch/reply | Create a chat and open it in the foreground; inline reply only after the prior process/native frontend exits | Create a chat and open it in Cursor's interface. Inline reply stays disabled |
 | Interrupt | `SIGINT` only after exact live-process verification | Disabled |
 | Permission/archive/delete | Disabled | Disabled |
 
-Managed Cursor reply, interrupt, and rediscovery currently require Linux. Starting a new chat from the harness list works on every platform: OAV runs `create-chat` and opens that id in Cursor's interface. A chat OAV
-launched itself is listed once, by the managed source; the history source skips
-IDs the supervisor owns. Open Agent View does not scrape the provider's picker
-or infer ownership from a chat ID.
+Managed Cursor reply, interrupt, and rediscovery currently require Linux. A
+chat OAV launched there is listed once, by the managed source; the history
+source skips IDs the supervisor owns. Starting a new chat from the harness list
+works on every platform. Elsewhere, OAV runs `create-chat`, records the exact
+returned ID in a private `cursor-owned.json`, and opens that ID with the prompt
+in Cursor's interface. The history source lists recorded IDs even without
+`--include-external`, as native-open/inspect rows; the prompt must not start
+with `-`, since `cursor-agent` would parse it as an option. Open Agent View
+does not scrape the provider's picker or infer ownership from a chat ID.
 
 ## GitHub Copilot ownership boundary
 

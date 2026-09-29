@@ -11,7 +11,11 @@ and future released versions are intended to follow Semantic Versioning.
 ### Added
 
 - Cursor is a launch harness on every platform. Choosing it from the harness
-  list creates a chat and opens it in Cursor's interface.
+  list creates a chat and opens it in Cursor's interface. Outside Linux the
+  chat is recorded as the dashboard's own, so its row is listed on return
+  without `--include-external` and Enter/Right reattaches it. A Cursor prompt
+  that starts with `-` is refused, since `cursor-agent` would read it as an
+  option such as `--force`.
 - External Cursor chats are now discovered on every platform from Cursor's own
   chat store (`~/.cursor/chats`), with `--include-external
   --include-interactive`. Rows show the chat title, workspace, and latest

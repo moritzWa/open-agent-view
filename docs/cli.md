@@ -50,7 +50,7 @@ Open Agent View is already up to date.
 | `--no-host-pi` | Disable host Pi history and managed supervision. |
 | `--opencode-bin PATH` / `--no-host-opencode` | Select or disable OpenCode history plus durable managed supervision on Linux. |
 | `--copilot-bin PATH` / `--no-host-copilot` | Select or disable persisted Copilot discovery and process-local managed ACP control. |
-| `--cursor-bin PATH` / `--no-host-cursor` | Select or disable Cursor support on the host. External chats are read from Cursor's own chat store with `--include-external --include-interactive`; managed launch/reply additionally requires Linux. |
+| `--cursor-bin PATH` / `--no-host-cursor` | Select or disable Cursor support on the host. External chats are read from Cursor's own chat store with `--include-external --include-interactive`. On Linux, launch and inline reply go through OAV's managed supervisor. Elsewhere, choosing Cursor in the harness list runs `cursor-agent create-chat` and opens that chat with the prompt in Cursor's interface; OAV records the chat id in `cursor-owned.json`, so its row is listed without `--include-external`. Inline reply stays Linux-only. |
 | `--cursor-chats-dir PATH` | Override the chat store Cursor's CLI writes to (default `~/.cursor/chats`). |
 | `--antigravity-bin PATH` / `--no-host-antigravity` | Select or disable host Antigravity discovery. |
 | `--mistral-vibe-bin PATH` / `--mistral-vibe-app-server-bin PATH` / `--no-host-mistral-vibe` | Select or disable Mistral Vibe native control and app-server discovery. |
@@ -549,6 +549,7 @@ when `XDG_STATE_HOME` is unset, the current implementation stores:
 | `opencode/` | Private authenticated-loopback server record, lock, log, and exact OAV-owned OpenCode session IDs. |
 | `cursor/` | Linux ownership registry, process identities, locks, and bounded logs for OAV-owned Cursor runs. |
 | `copilot/` | Exact OAV-created Copilot IDs, workspaces, titles, latest bounded summaries, provider timestamps, and registry lock. No credentials or full transcripts. |
+| `cursor-owned.json` | Exact Cursor chat IDs this dashboard created outside Linux, so their rows are listed without `--include-external`. |
 | `hidden-sessions.json` | Reversible local suppression records; provider history and live processes are not changed. |
 | `managed-docker/owners.json` | Exact external proof for managed-container lifecycle. |
 
