@@ -6,6 +6,8 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -94,6 +96,82 @@ pub fn resolve(preference: ThemePreference) -> ColorScheme {
         ThemePreference::Dark => ColorScheme::Dark,
         ThemePreference::Light => ColorScheme::Light,
         ThemePreference::Auto => detect_color_scheme().unwrap_or(ColorScheme::Dark),
+    }
+}
+
+/// Follows operating-system appearance changes while the dashboard runs.
+///
+/// The terminal cannot be re-asked for its background once the event loop
+/// owns stdin, so the watcher polls the OS appearance instead and reports only
+/// changes. The scheme chosen at startup therefore stands until the user
+/// actually switches appearance, even when a dark terminal sits on a light
+/// desktop.
+pub struct SchemeWatcher {
+    changes: mpsc::Receiver<ColorScheme>,
+    stop: Arc<AtomicBool>,
+}
+
+impl SchemeWatcher {
+    const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+    /// Starts polling for `auto`; explicit preferences never change.
+    pub fn spawn(preference: ThemePreference) -> Option<Self> {
+        if preference != ThemePreference::Auto {
+            return None;
+        }
+        let (tx, changes) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        thread::Builder::new()
+            .name("theme-watcher".into())
+            .spawn(move || {
+                let mut previous = os_color_scheme();
+                while !stop_flag.load(Ordering::Relaxed) {
+                    thread::sleep(Self::POLL_INTERVAL);
+                    if let Some(scheme) = scheme_change(&mut previous, os_color_scheme()) {
+                        if tx.send(scheme).is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok()?;
+        Some(Self { changes, stop })
+    }
+
+    /// The most recent appearance change since the last call, if any.
+    pub fn take_change(&self) -> Option<ColorScheme> {
+        let mut latest = None;
+        while let Ok(scheme) = self.changes.try_recv() {
+            latest = Some(scheme);
+        }
+        latest
+    }
+}
+
+impl Drop for SchemeWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Reports `observed` only when it is a real reading that differs from the
+/// last real reading. A failed probe neither changes the theme nor forgets
+/// what was seen before.
+fn scheme_change(
+    previous: &mut Option<ColorScheme>,
+    observed: Option<ColorScheme>,
+) -> Option<ColorScheme> {
+    let scheme = observed?;
+    if *previous == Some(scheme) {
+        return None;
+    }
+    let first_reading = previous.is_none();
+    *previous = Some(scheme);
+    if first_reading {
+        None
+    } else {
+        Some(scheme)
     }
 }
 
@@ -342,6 +420,30 @@ fn scale_hex(hex: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn appearance_changes_are_reported_only_after_a_real_switch() {
+        let mut previous = None;
+        assert_eq!(scheme_change(&mut previous, None), None);
+        assert_eq!(scheme_change(&mut previous, Some(ColorScheme::Dark)), None);
+        assert_eq!(scheme_change(&mut previous, Some(ColorScheme::Dark)), None);
+        assert_eq!(scheme_change(&mut previous, None), None);
+        assert_eq!(
+            scheme_change(&mut previous, Some(ColorScheme::Light)),
+            Some(ColorScheme::Light)
+        );
+        assert_eq!(scheme_change(&mut previous, Some(ColorScheme::Light)), None);
+        assert_eq!(
+            scheme_change(&mut previous, Some(ColorScheme::Dark)),
+            Some(ColorScheme::Dark)
+        );
+    }
+
+    #[test]
+    fn explicit_themes_never_start_a_watcher() {
+        assert!(SchemeWatcher::spawn(ThemePreference::Dark).is_none());
+        assert!(SchemeWatcher::spawn(ThemePreference::Light).is_none());
+    }
 
     #[test]
     fn explicit_preferences_do_not_inspect_the_environment() {

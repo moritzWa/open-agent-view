@@ -11,8 +11,9 @@ and future released versions are intended to follow Semantic Versioning.
 ### Added
 
 - A light dashboard palette. `--theme auto` (the default) follows the terminal
-  background, then the operating system appearance. `--theme dark` and
-  `--theme light` force a palette.
+  background, then the operating system appearance, and switches live when
+  the operating system appearance changes. `--theme dark` and `--theme light`
+  force a palette.
 
 ## [0.1.53] - 2026-09-04
 

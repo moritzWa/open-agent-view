@@ -991,6 +991,7 @@ fn main() -> Result<()> {
         hidden_sessions,
         session_aliases,
         MigrationServices::new(migration_client, migration_registry),
+        cli.theme,
         theme::resolve(cli.theme),
     )?;
 
