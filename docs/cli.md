@@ -51,7 +51,7 @@ Open Agent View is already up to date.
 | `--no-host-pi` | Disable host Pi history and managed supervision. |
 | `--opencode-bin PATH` / `--no-host-opencode` | Select or disable OpenCode history plus durable managed supervision on Linux. |
 | `--copilot-bin PATH` / `--no-host-copilot` | Select or disable persisted Copilot discovery and process-local managed ACP control. |
-| `--cursor-bin PATH` / `--no-host-cursor` | Select or disable Cursor support on the host. External chats are read from Cursor's own chat store with `--include-external --include-interactive`; managed launch/reply additionally requires Linux. |
+| `--cursor-bin PATH` / `--no-host-cursor` | Select or disable Cursor support on the host. External chats are read from Cursor's own chat store with `--include-external --include-interactive`. On Linux, launch and inline reply go through OAV's managed supervisor. Elsewhere, choosing Cursor in the harness list runs `cursor-agent create-chat` and opens that chat with the prompt in Cursor's interface; OAV records the chat id in `cursor-owned.json`, so its row is listed without `--include-external`. Inline reply stays Linux-only. |
 | `--cursor-chats-dir PATH` | Override the chat store Cursor's CLI writes to (default `~/.cursor/chats`). |
 | `--antigravity-bin PATH` / `--no-host-antigravity` | Select or disable host Antigravity discovery. |
 | `--mistral-vibe-bin PATH` / `--mistral-vibe-app-server-bin PATH` / `--no-host-mistral-vibe` | Select or disable Mistral Vibe native control and app-server discovery. |
@@ -431,7 +431,7 @@ label.
 | Session list | `ctrl+f` | Edit the case-insensitive name/summary/path/provider filter. |
 | Session list | `ctrl+l` | Request an immediate provider refresh. |
 | Session list | `ctrl+g` | Search sessions hidden with `ctrl+x` by name, harness, or ID; `page up` / `page down` move by the rows that fit. `enter` unhides the chosen one and selects its row once discovery lists it, unless you have moved the cursor or opened another panel meanwhile; a row the current filter excludes is reported rather than the filter being cleared. `esc` or `ctrl+g` closes the picker. Zellij binds `ctrl+g` to its lock mode by default, so under Zellij use `/hidden` instead or unbind that key. |
-| Session list | `ctrl+t` or `ctrl+p` | Pin or unpin the selected session. Pinned rows stay in a group at the top. `ctrl+t` matches Claude Code's agent-view pin key; `cmd+p` also works when the terminal delivers it as the super modifier. |
+| Session list | `ctrl+t` or `ctrl+p` | Pin or unpin the selected session. Pinned rows stay in a group at the top. `ctrl+t` matches Claude Code's agent-view pin key; `cmd+p` also works when the terminal delivers it as the super modifier. Both also work in Peek. A pin is kept while the session is hidden with `ctrl+x` and applies again once it is restored. |
 | Session list | `tab`, `/`, or printable text | Compose a new host task. `/` begins a dashboard command rather than a filter. |
 | New-task composer | `tab` | Open the visible harness picker. |
 | New-task composer | `shift+tab` | Open the selected harness's model picker—or Terminal shell picker—without changing the task draft. |
@@ -554,7 +554,9 @@ when `XDG_STATE_HOME` is unset, the current implementation stores:
 | `opencode/` | Private authenticated-loopback server record, lock, log, and exact OAV-owned OpenCode session IDs. |
 | `cursor/` | Linux ownership registry, process identities, locks, and bounded logs for OAV-owned Cursor runs. |
 | `copilot/` | Exact OAV-created Copilot IDs, workspaces, titles, latest bounded summaries, provider timestamps, and registry lock. No credentials or full transcripts. |
+| `cursor-owned.json` | Exact Cursor chat IDs this dashboard created outside Linux, so their rows are listed without `--include-external`. |
 | `hidden-sessions.json` | Reversible local suppression records; provider history and live processes are not changed. |
+| `pinned-sessions.json` | Local pin records (session ID and pin time) for the dashboard's Pinned group. Pins never change the provider session. |
 | `managed-docker/owners.json` | Exact external proof for managed-container lifecycle. |
 
 These files contain authority metadata and should not be shared between users.

@@ -11,10 +11,15 @@ and future released versions are intended to follow Semantic Versioning.
 ### Added
 
 - Cursor is a launch harness on every platform. Choosing it from the harness
-  list creates a chat and opens it in Cursor's interface.
+  list creates a chat and opens it in Cursor's interface. Outside Linux the
+  chat is recorded as the dashboard's own, so its row is listed on return
+  without `--include-external` and Enter/Right reattaches it. A Cursor prompt
+  that starts with `-` is refused, since `cursor-agent` would read it as an
+  option such as `--force`.
 - `ctrl+t` (Claude Code's pin key) or `ctrl+p` pins the selected session to a
-  Pinned group at the top of the list and unpins it again. The pin is
-  remembered locally.
+  Pinned group at the top of the list and unpins it again, also from Peek. The
+  row stays selected in its new group. The pin is remembered locally, kept
+  while the session is hidden, and taken back if it cannot be saved.
 - A light dashboard palette. `--theme auto` (the default) follows the terminal
   background, then the operating system appearance, and switches live when
   the operating system appearance changes. `--theme dark` and `--theme light`
