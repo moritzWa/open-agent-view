@@ -32,11 +32,15 @@ use crate::ui;
 // would repaint a frame that the user will never see and can saturate a remote
 // terminal or tmux pane.
 const MAX_READY_EVENTS_PER_TICK: usize = 256;
-// Terminals without bracketed paste deliver a paste as plain keystrokes, with
-// every line break arriving as Enter. Nobody types this many characters, then
-// Enter, then more text inside one input tick, so an Enter in the middle of
-// such a burst is a pasted line break, not a request to submit.
-const PASTE_BURST_CHARACTERS: usize = 3;
+// Terminals without bracketed paste (including the legacy Windows console,
+// where crossterm cannot enable it) deliver a paste as plain keystrokes, with
+// every line break arriving as Enter. A key that arrives within this gap of the
+// previous one continues the same burst. Human keystrokes are further apart,
+// while a paste split into chunks by ssh or tmux arrives well inside it.
+const PASTE_BURST_GAP: Duration = Duration::from_millis(30);
+// How long an Enter waits for more input before it counts as a typed submit.
+// A pasted line break has the rest of the clipboard right behind it.
+const PASTE_ENTER_LOOKAHEAD: Duration = Duration::from_millis(8);
 const LAUNCH_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const LAUNCH_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const REVEAL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -511,15 +515,27 @@ pub fn run_dashboard(
         };
         if event::poll(until_refresh.min(Duration::from_millis(50)))? {
             for event_index in 0..MAX_READY_EVENTS_PER_TICK {
-                match event::read()? {
+                let event = match event::read()? {
+                    Event::Key(key) => {
+                        let more_input = event::poll(InputBurst::lookahead(&key))?;
+                        match input_burst.classify(
+                            key,
+                            Instant::now(),
+                            more_input,
+                            app.draft_is_dashboard_command(),
+                        ) {
+                            BurstInput::Key(key) => Event::Key(key),
+                            BurstInput::Pasted(character) => Event::Paste(character.to_string()),
+                        }
+                    }
+                    other => other,
+                };
+                match event {
                     Event::Paste(text) => {
                         app.paste_input(&text);
                         needs_draw = true;
                     }
                     Event::Key(key) => {
-                        let more_input_pending = event::poll(Duration::ZERO)?;
-                        let draft_is_command = app.input.starts_with('/');
-                        let key = input_burst.classify(key, more_input_pending, draft_is_command);
                         let mut action = handle_key(&mut app, key);
                         if action == AppAction::Quit && migrating_target.is_some() {
                             app.should_quit = false;
@@ -750,11 +766,6 @@ pub fn run_dashboard(
                     break;
                 }
             }
-            if !event::poll(Duration::ZERO)? {
-                input_burst = InputBurst::default();
-            }
-        } else {
-            input_burst = InputBurst::default();
         }
         if !refresh_in_flight
             && pending_launch_retry_at.is_some_and(|retry_at| Instant::now() >= retry_at)
@@ -1042,53 +1053,99 @@ fn update_session_alias_from_app(
     })
 }
 
-/// Tracks one uninterrupted run of ready input events so a pasted line break
-/// can be told apart from a typed Enter when the terminal has no bracketed
-/// paste. Reset it whenever the input queue drains.
+/// Tells a pasted burst of keystrokes apart from typing when the terminal has
+/// no bracketed paste. Decisions rest on inter-key timing, never on how many
+/// characters preceded an Enter, so `a⏎b⏎c` pastes as one draft too.
+///
+/// A burst is recognised once a key has more input queued right behind it
+/// (keystrokes a human types are read one at a time), and it lasts while each
+/// key follows the previous one within `PASTE_BURST_GAP`. Its characters then
+/// bypass `handle_key` so that a pasted space, `?`, `q`, `y`, or `n` is text,
+/// not a dashboard shortcut or an approval.
+///
+/// If the dashboard stalls while the user types ahead, typed keys queue up and
+/// look like a burst: a typed Enter followed by more typing then becomes a
+/// newline in the draft rather than a submit. That fails safe, since the user
+/// can still press Enter once the dashboard catches up.
 #[derive(Debug, Default)]
 struct InputBurst {
-    typed_characters: usize,
+    last_key_at: Option<Instant>,
+    pasting: bool,
     pasted_line_break: bool,
 }
 
+#[derive(Debug, PartialEq)]
+enum BurstInput {
+    Key(KeyEvent),
+    Pasted(char),
+}
+
 impl InputBurst {
-    /// `more_input_pending` reports whether further events were already queued
-    /// behind this key. A typed Enter is the last thing in the queue; a pasted
-    /// line break has the rest of the clipboard behind it. Once a burst has
-    /// proven to be a paste, its trailing line break is a line break too.
+    /// How long to wait for more input before classifying `key`. Only a plain
+    /// Enter waits, so a chunk boundary right after a pasted line break is not
+    /// mistaken for the end of the paste.
+    fn lookahead(key: &KeyEvent) -> Duration {
+        if key.code == KeyCode::Enter && key.kind != KeyEventKind::Release && plain_key(key) {
+            PASTE_ENTER_LOOKAHEAD
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// `more_input` reports whether another event was ready within
+    /// `lookahead(&key)` of reading this key at `now`.
     ///
-    /// `draft_is_command` exempts a `/command` draft: submitting one never
-    /// launches a session, and scripted `/harness x⏎task` sequences are common.
+    /// `draft_is_command` exempts an Enter that would run a known dashboard
+    /// command: running one never launches a session, and scripted
+    /// `/harness x⏎task` sequences are common.
     fn classify(
         &mut self,
         key: KeyEvent,
-        more_input_pending: bool,
+        now: Instant,
+        more_input: bool,
         draft_is_command: bool,
-    ) -> KeyEvent {
+    ) -> BurstInput {
         if key.kind == KeyEventKind::Release {
-            return key;
+            return BurstInput::Key(key);
         }
-        let plain = !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
-        if key.code == KeyCode::Enter && plain && !draft_is_command {
-            let pasted = self.pasted_line_break
-                || (more_input_pending && self.typed_characters >= PASTE_BURST_CHARACTERS);
-            if pasted {
+        let continues = self
+            .last_key_at
+            .is_some_and(|last| now.saturating_duration_since(last) <= PASTE_BURST_GAP);
+        if !continues {
+            self.pasting = false;
+            self.pasted_line_break = false;
+        }
+        self.last_key_at = Some(now);
+        if !plain_key(&key) {
+            return BurstInput::Key(key);
+        }
+        let character = match key.code {
+            KeyCode::Enter => {
+                // A single-line paste that ends in Enter still submits, as
+                // typing it would; once a paste has shown a line break, its
+                // trailing line break is part of the text too.
+                if draft_is_command || !(more_input || self.pasted_line_break) {
+                    return BurstInput::Key(key);
+                }
                 self.pasted_line_break = true;
-                return KeyEvent {
-                    code: KeyCode::Char('j'),
-                    modifiers: KeyModifiers::CONTROL,
-                    kind: key.kind,
-                    state: key.state,
-                };
+                '\n'
             }
+            KeyCode::Tab => '\t',
+            KeyCode::Char(character) => character,
+            _ => return BurstInput::Key(key),
+        };
+        if more_input || self.pasting {
+            self.pasting = true;
+            BurstInput::Pasted(character)
+        } else {
+            BurstInput::Key(key)
         }
-        if matches!(key.code, KeyCode::Char(_)) && plain {
-            self.typed_characters += 1;
-        }
-        key
     }
+}
+
+fn plain_key(key: &KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
@@ -1829,6 +1886,8 @@ fn handle_action_legacy<T: DashboardTerminal, C: DashboardControl>(
 struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     active: bool,
+    // Gates every VT input mode, not only the Kitty keyboard flags: bracketed
+    // paste rides on it too, because the legacy Windows console rejects both.
     keyboard_enhancement: bool,
 }
 
@@ -2400,40 +2459,66 @@ mod tests {
         assert!(app.input.is_empty());
     }
 
-    /// Feed one queued burst of raw input the way a legacy terminal delivers a
-    /// paste: every byte is already buffered, so each key except the last has
-    /// more input pending behind it.
-    fn feed_burst(app: &mut App, burst: &mut InputBurst, text: &str) -> usize {
-        let characters: Vec<char> = text.chars().collect();
-        let mut launches = 0;
-        for (index, character) in characters.iter().enumerate() {
-            let code = if *character == '\r' {
-                KeyCode::Enter
-            } else {
-                KeyCode::Char(*character)
-            };
-            let more_pending = index + 1 < characters.len();
-            let command = app.input.starts_with('/');
-            let key = burst.classify(key(code), more_pending, command);
-            if matches!(handle_key(app, key), AppAction::Launch { .. }) {
-                launches += 1;
+    /// Raw keystrokes as a terminal without bracketed paste delivers them,
+    /// each with the millisecond at which it becomes readable. `\r` is Enter
+    /// and `\t` is Tab.
+    fn keystrokes(text: &str, start_ms: u64, step_ms: u64) -> Vec<(KeyEvent, u64)> {
+        text.chars()
+            .enumerate()
+            .map(|(index, character)| {
+                let code = match character {
+                    '\r' => KeyCode::Enter,
+                    '\t' => KeyCode::Tab,
+                    other => KeyCode::Char(other),
+                };
+                (key(code), start_ms + index as u64 * step_ms)
+            })
+            .collect()
+    }
+
+    /// Replay timed keystrokes through the same classify-then-dispatch steps
+    /// as the dashboard loop. A key sees more input when the next keystroke is
+    /// readable within its lookahead; processing itself takes no time.
+    fn replay(app: &mut App, events: &[(KeyEvent, u64)]) -> Vec<AppAction> {
+        let origin = Instant::now();
+        let mut burst = InputBurst::default();
+        let mut actions = Vec::new();
+        for (index, (key, at)) in events.iter().enumerate() {
+            let lookahead = InputBurst::lookahead(key).as_millis() as u64;
+            let more_input = events
+                .get(index + 1)
+                .is_some_and(|(_, next_at)| *next_at <= at + lookahead);
+            let now = origin + Duration::from_millis(*at);
+            match burst.classify(*key, now, more_input, app.draft_is_dashboard_command()) {
+                BurstInput::Pasted(character) => app.paste_input(&character.to_string()),
+                BurstInput::Key(key) => {
+                    let action = handle_key(app, key);
+                    if action != AppAction::None {
+                        actions.push(action);
+                    }
+                }
             }
         }
-        launches
+        actions
+    }
+
+    fn launches(actions: &[AppAction]) -> usize {
+        actions
+            .iter()
+            .filter(|action| matches!(action, AppAction::Launch { .. }))
+            .count()
     }
 
     #[test]
     fn a_pasted_burst_with_trailing_newline_is_one_draft_not_three_launches() {
         let mut app = app();
-        let mut burst = InputBurst::default();
 
-        let launches = feed_burst(
+        let actions = replay(
             &mut app,
-            &mut burst,
-            "first line\rsecond line\rthird line\r",
+            &keystrokes("first line\rsecond line\rthird line\r", 0, 0),
         );
 
-        assert_eq!(launches, 0);
+        assert_eq!(actions, vec![]);
         assert_eq!(
             app.overlay,
             Overlay::Composer(crate::app::ComposerMode::NewSession)
@@ -2442,22 +2527,88 @@ mod tests {
     }
 
     #[test]
-    fn typed_text_followed_by_enter_in_one_burst_still_submits() {
+    fn short_pasted_lines_are_one_draft_regardless_of_their_length() {
         let mut app = app();
-        let mut burst = InputBurst::default();
 
-        let launches = feed_burst(&mut app, &mut burst, "ship\r");
+        let actions = replay(&mut app, &keystrokes("a\rb\rc\rd", 0, 0));
 
-        assert_eq!(launches, 1);
-        assert_eq!(app.overlay, Overlay::None);
-        assert!(app.input.is_empty());
+        assert_eq!(actions, vec![]);
+        assert_eq!(app.input, "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn a_paste_split_into_chunks_does_not_submit_at_a_chunk_boundary() {
+        // ssh and tmux can hand a paste over in pieces a few milliseconds
+        // apart, so the input queue drains in the middle of the paste.
+        for (first, second) in [
+            ("first line\r", "second line"),
+            ("first line", "\rsecond line"),
+        ] {
+            let mut chunked = app();
+            let mut events = keystrokes(first, 0, 0);
+            events.extend(keystrokes(second, 5, 0));
+
+            let actions = replay(&mut chunked, &events);
+
+            assert_eq!(actions, vec![], "{first:?} | {second:?}");
+            assert_eq!(chunked.input, "first line\nsecond line");
+        }
+    }
+
+    #[test]
+    fn typed_enter_submits_at_human_speed_and_after_a_settled_paste() {
+        let mut typed = app();
+        let actions = replay(&mut typed, &keystrokes("ship\r", 0, 90));
+        assert_eq!(
+            actions,
+            vec![AppAction::Launch {
+                provider: Provider::Claude,
+                model: None,
+                prompt: "ship".into()
+            }]
+        );
+
+        // Key rollover can bring a typed Enter within the burst gap of the
+        // last character; with nothing behind it, it still submits.
+        let mut events = keystrokes("ship", 0, 90);
+        events.push((key(KeyCode::Enter), 3 * 90 + 12));
+        assert_eq!(launches(&replay(&mut app(), &events)), 1);
+
+        // A scripted single line that ends in Enter still submits.
+        assert_eq!(
+            launches(&replay(&mut app(), &keystrokes("ship\r", 0, 0))),
+            1
+        );
+
+        // Enter typed after a multi-line paste settles submits the draft.
+        let mut events = keystrokes("one\rtwo\r", 0, 0);
+        events.push((key(KeyCode::Enter), 200));
+        assert_eq!(
+            replay(&mut app(), &events),
+            vec![AppAction::Launch {
+                provider: Provider::Claude,
+                model: None,
+                prompt: "one\ntwo".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_pasted_first_line_that_starts_with_a_slash_is_still_a_paste() {
+        let mut app = app();
+
+        let actions = replay(
+            &mut app,
+            &keystrokes("/Users/me/notes.txt\rsecond line\rthird", 0, 0),
+        );
+
+        assert_eq!(actions, vec![]);
+        assert_eq!(app.input, "/Users/me/notes.txt\nsecond line\nthird");
     }
 
     #[test]
     fn a_slash_command_followed_by_a_task_in_one_burst_runs_the_command() {
-        let mut app = app();
-        let mut burst = InputBurst::default();
-
+        let app = app();
         let mut app = App::with_launch_targets(
             app.snapshot.clone(),
             true,
@@ -2474,66 +2625,101 @@ mod tests {
             ],
         );
 
-        let launches = feed_burst(&mut app, &mut burst, "/harness codex\rnext task");
+        let actions = replay(&mut app, &keystrokes("/harness codex\rnext task", 0, 0));
 
-        assert_eq!(launches, 0);
+        assert_eq!(actions, vec![]);
         assert_eq!(app.launch_provider, Provider::Codex);
         assert_eq!(app.input, "next task");
     }
 
     #[test]
-    fn typed_enter_still_submits_after_the_queue_drains() {
-        let mut app = app();
-        let mut burst = InputBurst::default();
-        feed_burst(&mut app, &mut burst, "ship");
-        burst = InputBurst::default();
-
-        let enter = burst.classify(key(KeyCode::Enter), false, false);
-        assert_eq!(enter.code, KeyCode::Enter);
+    fn pasted_characters_never_trigger_dashboard_or_peek_shortcuts() {
+        let mut dashboard = app();
+        let actions = replay(&mut dashboard, &keystrokes(" ?q\tdone", 0, 0));
+        assert_eq!(actions, vec![]);
+        assert!(!dashboard.should_quit);
         assert_eq!(
-            handle_key(&mut app, enter),
-            AppAction::Launch {
-                provider: Provider::Claude,
-                model: None,
-                prompt: "ship".into()
-            }
+            dashboard.overlay,
+            Overlay::Composer(crate::app::ComposerMode::NewSession)
+        );
+        assert_eq!(dashboard.input, " ?q\tdone");
+
+        let mut peek = app();
+        peek.snapshot.sessions[0].state = SessionState::NeedsInput;
+        peek.snapshot.sessions[0]
+            .capabilities
+            .extend([Capability::Approve, Capability::Decline]);
+        peek.toggle_peek();
+        let actions = replay(&mut peek, &keystrokes("yes\rno\r", 0, 0));
+        assert_eq!(actions, vec![]);
+        assert_eq!(peek.overlay, Overlay::Peek);
+
+        // The same keys typed one at a time keep their shortcuts.
+        assert_eq!(
+            replay(&mut peek, &keystrokes("y", 0, 0)),
+            vec![AppAction::ResolveApproval {
+                session_id: "worker".into(),
+                accept: true
+            }]
         );
     }
 
     #[test]
-    fn short_bursts_and_modified_keys_do_not_change_enter() {
+    fn a_pasted_line_break_in_the_model_picker_becomes_a_space() {
+        let mut app = app();
+        app.start_new_session(None);
+        app.open_model_picker();
+
+        let actions = replay(&mut app, &keystrokes("sonnet\ropus", 0, 0));
+
+        assert_eq!(actions, vec![]);
+        assert_eq!(app.overlay, Overlay::ModelPicker);
+        assert_eq!(app.model_filter, "sonnet opus");
+    }
+
+    #[test]
+    fn a_burst_ends_after_a_gap_and_modified_keys_pass_through() {
+        let origin = Instant::now();
+        let at = |ms| origin + Duration::from_millis(ms);
         let mut burst = InputBurst::default();
-        for character in "ok".chars() {
-            burst.classify(key(KeyCode::Char(character)), true, false);
-        }
         assert_eq!(
-            burst.classify(key(KeyCode::Enter), true, false).code,
-            KeyCode::Enter
+            burst.classify(key(KeyCode::Char('a')), at(0), true, false),
+            BurstInput::Pasted('a')
+        );
+        assert_eq!(
+            burst.classify(key(KeyCode::Char('b')), at(20), false, false),
+            BurstInput::Pasted('b')
+        );
+        assert_eq!(
+            burst.classify(key(KeyCode::Char('c')), at(100), false, false),
+            BurstInput::Key(key(KeyCode::Char('c')))
         );
 
         let mut burst = InputBurst::default();
-        for character in "abc".chars() {
-            burst.classify(control_key(character), true, false);
-        }
-        assert_eq!(
-            burst.classify(key(KeyCode::Enter), true, false).code,
-            KeyCode::Enter
-        );
-
-        let mut burst = InputBurst::default();
-        for character in "abc".chars() {
-            burst.classify(
-                KeyEvent {
-                    kind: KeyEventKind::Release,
-                    ..key(KeyCode::Char(character))
-                },
-                true,
-                false,
+        for (index, event) in [
+            control_key('j'),
+            modified_key(KeyCode::Enter, KeyModifiers::ALT),
+            KeyEvent {
+                kind: KeyEventKind::Release,
+                ..key(KeyCode::Char('x'))
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                burst.classify(event, at(index as u64), true, false),
+                BurstInput::Key(event)
             );
         }
+
         assert_eq!(
-            burst.classify(key(KeyCode::Enter), true, false).code,
-            KeyCode::Enter
+            InputBurst::lookahead(&key(KeyCode::Enter)),
+            PASTE_ENTER_LOOKAHEAD
+        );
+        assert_eq!(
+            InputBurst::lookahead(&key(KeyCode::Char('a'))),
+            Duration::ZERO
         );
     }
 

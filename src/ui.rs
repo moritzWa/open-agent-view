@@ -542,7 +542,8 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         let prefix_width = (line_index == 0)
             .then(|| display_width(prefix))
             .unwrap_or(0);
-        let cursor_x = area.x + prefix_width as u16 + display_width(last_line) as u16;
+        let cursor_x =
+            area.x + prefix_width as u16 + display_width(&expand_input_tabs(last_line)) as u16;
         frame.set_cursor(
             cursor_x.min(area.right().saturating_sub(1)),
             area.y + 1 + line_index,
@@ -615,7 +616,7 @@ fn render_peek(frame: &mut Frame<'_>, app: &App, area: Rect) {
         let last_line = app.input.rsplit('\n').next().unwrap_or_default();
         let prefix_width = if app.input.contains('\n') { 0 } else { 2 };
         frame.set_cursor(
-            (area.x + 1 + prefix_width + display_width(last_line) as u16)
+            (area.x + 1 + prefix_width + display_width(&expand_input_tabs(last_line)) as u16)
                 .min(area.right().saturating_sub(2)),
             area.bottom().saturating_sub(2),
         );
@@ -650,10 +651,17 @@ fn input_lines(input: &str) -> Vec<String> {
     lines
         .iter()
         .skip(lines.len().saturating_sub(5))
-        .copied()
-        .map(ToOwned::to_owned)
+        .map(|line| expand_input_tabs(line))
         .collect()
 }
+
+/// Ratatui skips zero-width characters, so a pasted tab would vanish from the
+/// draft on screen. Show it as spaces; the prompt itself keeps the tab.
+fn expand_input_tabs(line: &str) -> String {
+    line.replace('\t', INPUT_TAB)
+}
+
+const INPUT_TAB: &str = "    ";
 
 fn input_line_count(input: &str) -> u16 {
     input.split('\n').count().min(5) as u16
@@ -1759,6 +1767,29 @@ mod tests {
         assert!(rendered.contains("Completed"));
         assert!(rendered.contains("describe a task · /help for commands"));
         assert!(rendered.contains("1 awaiting input · 2 working · 1 completed"));
+    }
+
+    #[test]
+    fn pasted_tabs_render_as_spaces_and_keep_the_cursor_after_them() {
+        let mut app = App::new(SessionSnapshot::default());
+        app.paste_input("col\tvalue");
+        assert_eq!(app.input, "col\tvalue");
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = buffer_text(terminal.backend().buffer());
+        assert!(rendered.contains("col    value"), "{rendered}");
+        let (cursor_x, cursor_y) = terminal.get_cursor().unwrap();
+        let row = rendered.lines().nth(cursor_y as usize).unwrap();
+        let text_end = row.find("value").unwrap() + "value".len();
+        assert_eq!(
+            row.chars()
+                .take(cursor_x as usize)
+                .collect::<String>()
+                .len(),
+            text_end
+        );
     }
 
     #[test]

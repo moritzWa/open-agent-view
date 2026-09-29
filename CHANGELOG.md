@@ -35,8 +35,13 @@ and future released versions are intended to follow Semantic Versioning.
   Without bracketed paste, each line break in a clipboard arrived as Enter, so
   a large paste could start hundreds of coding-agent sessions at once. The
   dashboard now enables bracketed paste and inserts the clipboard as one
-  multi-line draft. On terminals without bracketed paste, an Enter that arrives
-  in the middle of a burst of queued input is treated as a pasted line break.
+  multi-line draft. On terminals without bracketed paste (including the legacy
+  Windows console), keys that arrive within milliseconds of each other are
+  treated as one paste: an Enter followed at once by more input is a pasted
+  line break even when ssh or tmux splits the paste into chunks, and the
+  pasted characters are inserted as text instead of triggering dashboard or
+  peek shortcuts such as space, `?`, `q`, `y`, and `n`. Only a known dashboard
+  command such as `/harness codex` still runs when its Enter is pasted.
 - Returning from a provider's full-screen interface to the dashboard no longer
   freezes that process. A Cursor turn (and any other native CLI opened from a
   row) keeps running on its own terminal, so several agents can work at once.
@@ -48,11 +53,19 @@ and future released versions are intended to follow Semantic Versioning.
   input" during long thinking or tool calls. Its state now comes from Cursor's
   own `ctrl+c to stop` hint on the chat's screen instead of how recently the
   chat store was written.
+- Pasted line breaks and tabs become spaces in the model picker, session
+  filter, local rename, and migration name, which are single-line fields.
+- Pasted tabs are visible in the composer; they render as spaces and stay tabs
+  in the submitted prompt.
 
 ### Tests
 
 - Added renderer, key-handling, and real-PTY coverage for legacy CR pastes,
-  bracketed pastes, typed Enter after a paste, and `/command⏎task` bursts.
+  bracketed pastes, typed Enter after a paste, and `/command⏎task` bursts,
+  plus timed-keystroke coverage for chunked pastes, short pasted lines,
+  absolute-path first lines, pasted shortcut keys, and single-line fields, and
+  real-PTY checks that bracketed paste is off on exit and during a foreground
+  handoff.
 
 ## [0.1.53] - 2026-09-04
 
