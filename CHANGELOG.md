@@ -39,6 +39,10 @@ and future released versions are intended to follow Semantic Versioning.
 - Hiding, deleting, or losing the selected row keeps the cursor on the row
   that followed it (or the one before it at the end of the list) instead of
   jumping back to the first row.
+- A Cursor chat left running behind the dashboard no longer flips to "needs
+  input" during long thinking or tool calls. Its state now comes from Cursor's
+  own `ctrl+c to stop` hint on the chat's screen instead of how recently the
+  chat store was written.
 
 ### Tests
 

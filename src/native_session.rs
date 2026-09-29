@@ -37,6 +37,7 @@ const MAX_INITIAL_INPUT_BYTES: usize = 256 * 1024;
 const FALLBACK_TERMINAL_ROWS: u16 = 24;
 #[cfg(unix)]
 const FALLBACK_TERMINAL_COLUMNS: u16 = 80;
+const SCREEN_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(unix)]
 #[derive(Debug)]
 pub enum NativeSessionExit {
@@ -72,6 +73,7 @@ struct DetachedSession {
 struct PtyDrain {
     stop: Arc<AtomicBool>,
     done: thread::JoinHandle<(std::fs::File, vt100::Parser)>,
+    contents: Arc<Mutex<String>>,
 }
 
 #[cfg(unix)]
@@ -249,6 +251,23 @@ pub fn detached_session_keys() -> Vec<String> {
     }
     #[cfg(not(unix))]
     Vec::new()
+}
+
+/// The latest visible text of a frontend running behind the dashboard, at
+/// most [`SCREEN_PUBLISH_INTERVAL`] old. `None` when this process does not
+/// hold that frontend in the background.
+pub fn background_screen_contents(session_key: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let registry = DETACHED.get()?.lock().ok()?;
+        let drain = registry.get(session_key)?.drain.as_ref()?;
+        return drain.contents.lock().ok().map(|contents| contents.clone());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session_key;
+        None
+    }
 }
 
 /// Whether this process currently retains the exact provider frontend.
@@ -803,13 +822,29 @@ fn start_output_drain(mut master: std::fs::File, mut screen: vt100::Parser) -> R
     set_nonblocking(master.as_raw_fd(), true)?;
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
+    let contents = Arc::new(Mutex::new(screen.screen().contents()));
+    let published = Arc::clone(&contents);
     let done = thread::Builder::new()
         .name("native-pty-drain".into())
         .spawn(move || {
+            let publish = |screen: &vt100::Parser| {
+                if let Ok(mut slot) = published.lock() {
+                    *slot = screen.screen().contents();
+                }
+            };
             let mut bytes = [0_u8; 8192];
-            loop {
+            let mut changed = false;
+            let mut last_publish = Instant::now();
+            'drain: loop {
                 if flag.load(Ordering::Relaxed) {
                     break;
+                }
+                // Publish the settled screen for dashboard status without
+                // re-rendering it on every byte of a streaming reply.
+                if changed && last_publish.elapsed() >= SCREEN_PUBLISH_INTERVAL {
+                    publish(&screen);
+                    changed = false;
+                    last_publish = Instant::now();
                 }
                 let mut descriptor = libc::pollfd {
                     fd: master.as_raw_fd(),
@@ -827,15 +862,13 @@ fn start_output_drain(mut master: std::fs::File, mut screen: vt100::Parser) -> R
                 if descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
                     continue;
                 }
+                changed = true;
                 loop {
                     match master.read(&mut bytes) {
-                        Ok(0) => return (master, screen),
+                        Ok(0) => break 'drain,
                         Ok(count) => screen.process(&bytes[..count]),
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(error) if error.raw_os_error() == Some(libc::EIO) => {
-                            return (master, screen);
-                        }
-                        Err(_) => return (master, screen),
+                        Err(_) => break 'drain,
                     }
                 }
             }
@@ -847,10 +880,15 @@ fn start_output_drain(mut master: std::fs::File, mut screen: vt100::Parser) -> R
                     Err(_) => break,
                 }
             }
+            publish(&screen);
             (master, screen)
         })
         .context("failed to keep the provider terminal running")?;
-    Ok(PtyDrain { stop, done })
+    Ok(PtyDrain {
+        stop,
+        done,
+        contents,
+    })
 }
 
 #[cfg(unix)]
@@ -1465,7 +1503,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[test]
     fn provider_output_keeps_arriving_while_the_dashboard_is_detached() {
         let mut command = Command::new("sh");
         command.args([
@@ -1484,6 +1521,9 @@ mod tests {
             !state.trim().starts_with('T'),
             "provider process was stopped: {state:?}"
         );
+        thread::sleep(Duration::from_millis(1_000) + SCREEN_PUBLISH_INTERVAL * 2);
+        let published = drain.contents.lock().unwrap().clone();
+        assert!(published.contains("tick-19"), "{published}");
         drain.stop.store(true, Ordering::Relaxed);
         let (_master, screen) = drain.done.join().unwrap();
         let contents = screen.screen().contents();
@@ -1493,6 +1533,7 @@ mod tests {
         let _ = child.wait();
     }
 
+    #[test]
     fn empty_left_margin_prompt_keeps_return_window_across_provider_redraw() {
         let mut screen = vt100::Parser::new(6, 40, 0);
         screen.process(b"\x1b[1;3H> \x1b[?25h");

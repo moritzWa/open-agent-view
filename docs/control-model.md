@@ -335,10 +335,15 @@ recorded prompts, not the assistant's replies.
 Liveness comes from the process, not the files. Cursor drops a PID marker in
 `~/.local/share/cursor-agent/versions/<version>/.running/` for each CLI it
 starts; OAV verifies each PID is alive, then asks which chat's `store.db` that
-process holds open (`/proc/<pid>/fd` on Linux, `lsof -p` elsewhere). A chat
-with a live holder is *working* while its store or metadata changed within the
-last 20 seconds and *waiting at prompt* otherwise; chats without a holder are
-*closed* history. Because these rows are observe/native-open only, a stale
+process holds open (`/proc/<pid>/fd` on Linux, `lsof -p` elsewhere). Chats
+without a holder are *closed* history. When the holder is a CLI this dashboard
+opened and is keeping in the background, its state is read from that
+terminal's screen: Cursor shows `ctrl+c to stop` beside the composer exactly
+while a turn is processing, so the row is *working* with the hint and *waiting
+at prompt* without it. That covers long thinking and tool calls, which write
+nothing to disk. For chats held by a CLI in some other terminal the screen is
+not visible, so a live chat is *working* while its store or metadata changed
+within the last 20 seconds and *waiting at prompt* otherwise. Because these rows are observe/native-open only, a stale
 marker or a misread PID can at worst mislabel a row's state; nothing is ever
 signalled based on it.
 

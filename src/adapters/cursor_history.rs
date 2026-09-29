@@ -102,7 +102,14 @@ impl SessionSource for CursorHistorySource {
         let mut completed = 0usize;
         for chat in chats {
             let pid = live.get(&chat.dir).copied();
-            let (state, raw_state) = chat_state(&chat, pid, now);
+            let screen = crate::native_session::background_screen_contents(&format!(
+                "cursor:host:{}",
+                chat.id
+            ));
+            let (state, raw_state) = match (pid, screen.as_deref()) {
+                (Some(_), Some(screen)) => screen_state(screen),
+                _ => chat_state(&chat, pid, now),
+            };
             if state == SessionState::Completed {
                 if !request.include_completed || completed >= request.history_limit.max(1) {
                     continue;
@@ -296,6 +303,22 @@ fn latest_prompt(chat_dir: &Path) -> Option<String> {
         .find(|prompt| !prompt.trim().is_empty())
 }
 
+/// Cursor's composer shows this right-hand hint exactly while a turn is being
+/// processed (`isProcessing` in the CLI), including long thinking and tool
+/// calls that write nothing to the chat store.
+const PROCESSING_HINT: &str = "ctrl+c to stop";
+
+/// State of a chat whose terminal this dashboard holds in the background.
+/// The screen is authoritative, unlike file timestamps.
+fn screen_state(screen: &str) -> (SessionState, &'static str) {
+    if screen.contains(PROCESSING_HINT) {
+        (SessionState::Working, "running turn")
+    } else {
+        (SessionState::NeedsInput, "waiting at prompt")
+    }
+}
+
+/// Fallback for chats running in some other terminal: the store's write time.
 fn chat_state(
     chat: &CursorChat,
     pid: Option<u32>,
@@ -540,6 +563,20 @@ mod tests {
             history_limit: 100,
             history_oldest_first: false,
         }
+    }
+
+    #[test]
+    fn background_screen_decides_between_working_and_waiting() {
+        let thinking = "  ⬡ Thinking  1234 tokens\n\n → Add a follow-up    ctrl+c to stop\n";
+        assert_eq!(
+            screen_state(thinking),
+            (SessionState::Working, "running turn")
+        );
+        let idle = "  Done.\n\n → Add a follow-up\n  Auto · 12% context\n";
+        assert_eq!(
+            screen_state(idle),
+            (SessionState::NeedsInput, "waiting at prompt")
+        );
     }
 
     #[test]
