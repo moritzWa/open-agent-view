@@ -10,6 +10,8 @@ and future released versions are intended to follow Semantic Versioning.
 
 ### Added
 
+- Cursor is a launch harness on every platform. Choosing it from the harness
+  list creates a chat and opens it in Cursor's interface.
 - `ctrl+t` (Claude Code's pin key) or `ctrl+p` pins the selected session to a
   Pinned group at the top of the list and unpins it again. The pin is
   remembered locally.
