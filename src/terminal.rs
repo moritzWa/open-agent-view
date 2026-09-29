@@ -121,6 +121,7 @@ pub fn run_dashboard(
     refresh_interval: Duration,
     control: &ControlHub,
     hidden_sessions: HiddenSessions,
+    pinned_sessions: crate::pins::PinnedSessions,
     session_aliases: SessionAliases,
     migrations: MigrationServices,
     theme_preference: ThemePreference,
@@ -195,6 +196,7 @@ pub fn run_dashboard(
         control.launch_targets(),
     );
     app.set_yolo(control.yolo_enabled(), control.yolo_supported_providers());
+    app.set_pins(pinned_sessions.pins());
     app.color_scheme = color_scheme;
     let scheme_watcher = SchemeWatcher::spawn(theme_preference);
     let mut terminal = TerminalSession::enter()?;
@@ -526,6 +528,12 @@ pub fn run_dashboard(
                             action = AppAction::None;
                         }
                         let mut effect = match action {
+                            AppAction::SetPin { session_id, pinned } => {
+                                if let Err(error) = pinned_sessions.set(&session_id, pinned) {
+                                    app.set_notice(format!("failed to save pin: {error:#}"));
+                                }
+                                ActionEffect::default()
+                            }
                             AppAction::BrowseHidden => {
                                 app.open_hidden_picker(hidden_sessions.list());
                                 ActionEffect::default()
@@ -1109,6 +1117,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
                 app.start_filter();
                 AppAction::None
             }
+            KeyCode::Char('p')
+                if matches!(app.overlay, Overlay::None | Overlay::Peek) =>
+            {
+                app.toggle_pin()
+            }
             KeyCode::Char('g') if app.overlay == Overlay::None => AppAction::BrowseHidden,
             KeyCode::Char('g') if app.overlay == Overlay::HiddenPicker => app.escape(),
             KeyCode::Char('l') if app.overlay == Overlay::None => AppAction::Refresh,
@@ -1137,6 +1150,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
         };
     }
 
+    if key.modifiers.contains(KeyModifiers::SUPER)
+        && key.code == KeyCode::Char('p')
+        && matches!(app.overlay, Overlay::None | Overlay::Peek)
+    {
+        return app.toggle_pin();
+    }
     if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Backspace {
         app.delete_to_line_start();
         return AppAction::None;
@@ -1549,6 +1568,7 @@ fn dispatch_action<T: DashboardTerminal, C: DashboardControl>(
                 }
             }
         }
+        AppAction::SetPin { .. } => ActionEffect::default(),
         AppAction::Hide { session_ids } => ActionEffect {
             hide_session_ids: session_ids,
             ..ActionEffect::default()
@@ -1625,6 +1645,7 @@ fn handle_action_legacy<T: DashboardTerminal, C: DashboardControl>(
         | AppAction::SetupLaunchOption { .. }
         | AppAction::Migrate { .. }
         | AppAction::Hide { .. }
+        | AppAction::SetPin { .. }
         | AppAction::BrowseHidden
         | AppAction::Unhide { .. } => false,
         AppAction::Refresh => {
@@ -2112,6 +2133,28 @@ mod tests {
         app.start_new_session(None);
         handle_key(&mut app, control_key('s'));
         assert_eq!(app.view_mode, crate::app::ViewMode::Directory);
+    }
+
+    #[test]
+    fn control_p_pins_the_selected_session_and_super_p_does_the_same() {
+        let mut app = app();
+        assert_eq!(
+            handle_key(&mut app, control_key('p')),
+            AppAction::SetPin {
+                session_id: "worker".into(),
+                pinned: true,
+            }
+        );
+        assert_eq!(app.groups()[0].label, "Pinned");
+        assert_eq!(
+            handle_key(&mut app, modified_key(KeyCode::Char('p'), KeyModifiers::SUPER)),
+            AppAction::SetPin {
+                session_id: "worker".into(),
+                pinned: false,
+            }
+        );
+        app.start_new_session(None);
+        assert_eq!(handle_key(&mut app, control_key('p')), AppAction::None);
     }
 
     #[test]

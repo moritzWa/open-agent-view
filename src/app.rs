@@ -132,6 +132,11 @@ pub enum AppAction {
     Hide {
         session_ids: Vec<String>,
     },
+    /// Remember or forget a local pin. The row order is already updated.
+    SetPin {
+        session_id: String,
+        pinned: bool,
+    },
     /// Load the locally hidden registry into the restore picker.
     BrowseHidden,
     /// Remove one ID from the local hidden registry and reveal its row.
@@ -167,6 +172,7 @@ pub struct App {
     pub model_selection: usize,
     pub migration_targets: Vec<Provider>,
     pub migration_selection: usize,
+    pub pinned: BTreeMap<String, u64>,
     pub hidden_candidates: Vec<HiddenSessionRecord>,
     pub hidden_filter: String,
     pub hidden_selection: usize,
@@ -243,6 +249,7 @@ impl App {
             model_selection: 0,
             migration_targets: Vec::new(),
             migration_selection: 0,
+            pinned: BTreeMap::new(),
             hidden_candidates: Vec::new(),
             hidden_filter: String::new(),
             hidden_selection: 0,
@@ -1180,6 +1187,43 @@ impl App {
         self.reconcile_picker_selection();
     }
 
+    pub fn set_pins(&mut self, pins: BTreeMap<String, u64>) {
+        self.pinned = pins;
+        self.rebuild_group_cache();
+    }
+
+    /// Pin or unpin the selected session and move it into or out of the
+    /// leading Pinned group. Persistence is the caller's job.
+    pub fn toggle_pin(&mut self) -> AppAction {
+        let Some(session) = self.selected_session() else {
+            self.set_notice("select a session to pin");
+            return AppAction::None;
+        };
+        let session_id = session.id.clone();
+        let name = session.name.clone();
+        let pinned = if self.pinned.contains_key(&session_id) {
+            self.pinned.remove(&session_id);
+            false
+        } else {
+            let pinned_at = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.pinned.insert(session_id.clone(), pinned_at);
+            true
+        };
+        self.rebuild_group_cache();
+        self.set_notice(if pinned {
+            format!("pinned {name}")
+        } else {
+            format!("unpinned {name}")
+        });
+        AppAction::SetPin {
+            session_id,
+            pinned,
+        }
+    }
+
     pub fn set_notice(&mut self, notice: impl Into<String>) {
         self.notice = Some(notice.into());
     }
@@ -1203,44 +1247,84 @@ impl App {
 
     fn status_groups(&self) -> Vec<Group> {
         let needle = self.filter.to_ascii_lowercase();
+        let mut pinned = Vec::new();
         let mut grouped: BTreeMap<SessionState, Vec<usize>> = BTreeMap::new();
         for (index, session) in self.snapshot.sessions.iter().enumerate() {
-            if needle.is_empty() || matches_filter(session, &needle) {
+            if !(needle.is_empty() || matches_filter(session, &needle)) {
+                continue;
+            }
+            if self.pinned.contains_key(&session.id) {
+                pinned.push(index);
+            } else {
                 grouped.entry(session.state).or_default().push(index);
             }
         }
-        SessionState::DISPLAY_ORDER
-            .iter()
-            .filter_map(|state| {
-                let sessions = grouped.remove(state).unwrap_or_default();
-                (!sessions.is_empty()).then(|| Group {
-                    key: format!("state:{state:?}"),
-                    label: state.heading().into(),
-                    sessions,
-                })
+        let mut groups = Vec::new();
+        if let Some(group) = self.pinned_group(pinned) {
+            groups.push(group);
+        }
+        groups.extend(SessionState::DISPLAY_ORDER.iter().filter_map(|state| {
+            let sessions = grouped.remove(state).unwrap_or_default();
+            (!sessions.is_empty()).then(|| Group {
+                key: format!("state:{state:?}"),
+                label: state.heading().into(),
+                sessions,
             })
-            .collect()
+        }));
+        groups
+    }
+
+    fn pinned_group(&self, mut sessions: Vec<usize>) -> Option<Group> {
+        if sessions.is_empty() {
+            return None;
+        }
+        sessions.sort_by(|left, right| {
+            let left_at = self
+                .pinned
+                .get(&self.snapshot.sessions[*left].id)
+                .copied()
+                .unwrap_or(0);
+            let right_at = self
+                .pinned
+                .get(&self.snapshot.sessions[*right].id)
+                .copied()
+                .unwrap_or(0);
+            right_at.cmp(&left_at).then(left.cmp(right))
+        });
+        Some(Group {
+            key: "pinned".into(),
+            label: "Pinned".into(),
+            sessions,
+        })
     }
 
     fn directory_groups(&self) -> Vec<Group> {
         let needle = self.filter.to_ascii_lowercase();
+        let mut pinned = Vec::new();
         let mut groups: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
         for (index, session) in self.snapshot.sessions.iter().enumerate() {
-            if needle.is_empty() || matches_filter(session, &needle) {
+            if !(needle.is_empty() || matches_filter(session, &needle)) {
+                continue;
+            }
+            if self.pinned.contains_key(&session.id) {
+                pinned.push(index);
+            } else {
                 groups
                     .entry(project_group_path(&session.cwd))
                     .or_default()
                     .push(index);
             }
         }
-        groups
-            .into_iter()
-            .map(|(path, sessions)| Group {
-                key: format!("cwd:{}", path.display()),
-                label: abbreviate_home(&path),
-                sessions,
-            })
-            .collect()
+        let mut ordered = Vec::new();
+        if let Some(group) = self.pinned_group(pinned) {
+            ordered.push(group);
+        }
+        ordered.extend(groups.into_iter().map(|(path, sessions)| Group {
+            key: format!("cwd:{}", path.display()),
+            label: abbreviate_home(&path),
+            sessions,
+        }));
+        ordered
     }
 
     fn rebuild_snapshot_cache(&mut self) {
@@ -2397,6 +2481,62 @@ mod tests {
         app.set_filter("summary working");
         assert_eq!(app.groups().len(), 1);
         assert_eq!(app.groups()[0].sessions, vec![1]);
+    }
+
+    #[test]
+    fn pinning_lifts_a_session_into_a_leading_group_and_unpinning_restores_it() {
+        let mut app = app_with(vec![
+            session("needs", SessionState::NeedsInput),
+            session("working", SessionState::Working),
+            session("done", SessionState::Completed),
+        ]);
+        app.selection = Some(SelectionKey::Session("done".into()));
+        assert_eq!(
+            app.toggle_pin(),
+            AppAction::SetPin {
+                session_id: "done".into(),
+                pinned: true,
+            }
+        );
+        assert_eq!(app.groups()[0].label, "Pinned");
+        assert_eq!(
+            app.groups()[0]
+                .sessions
+                .iter()
+                .map(|index| app.snapshot.sessions[*index].id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["done"]
+        );
+        assert!(app.groups()[1..]
+            .iter()
+            .all(|group| group.label != "Completed"));
+
+        app.selection = Some(SelectionKey::Session("working".into()));
+        app.toggle_pin();
+        assert_eq!(
+            app.groups()[0]
+                .sessions
+                .iter()
+                .map(|index| app.snapshot.sessions[*index].id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["working", "done"]
+        );
+
+        app.selection = Some(SelectionKey::Session("done".into()));
+        assert_eq!(
+            app.toggle_pin(),
+            AppAction::SetPin {
+                session_id: "done".into(),
+                pinned: false,
+            }
+        );
+        assert_eq!(
+            app.groups()
+                .iter()
+                .map(|group| group.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Pinned", "Needs input", "Completed"]
+        );
     }
 
     #[test]

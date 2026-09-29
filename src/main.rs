@@ -26,6 +26,7 @@ use open_agent_view::control::{ControlHub, ControlHubConfig};
 use open_agent_view::doctor::{diagnose, render_text};
 use open_agent_view::domain::Provider;
 use open_agent_view::hidden::{HiddenSessionRecord, HiddenSessions};
+use open_agent_view::pins::PinnedSessions;
 use open_agent_view::maintenance::{
     execute_completed_archive, plan_completed_archive, BulkArchiveReport,
 };
@@ -1016,6 +1017,7 @@ fn main() -> Result<()> {
         Duration::from_millis(cli.refresh_ms),
         &control,
         hidden_sessions,
+        PinnedSessions::load_default()?,
         session_aliases,
         MigrationServices::new(migration_client, migration_registry),
         cli.theme,
