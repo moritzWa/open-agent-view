@@ -119,6 +119,21 @@ impl MigrationServices {
     }
 }
 
+/// Persist a pin the screen already shows, then show what the registry
+/// actually holds, so a failed save puts the row back where it was.
+fn save_pin(
+    app: &mut App,
+    pinned_sessions: &crate::pins::PinnedSessions,
+    session_id: &str,
+    pinned: bool,
+) {
+    if let Err(error) = pinned_sessions.set(session_id, pinned) {
+        app.set_notice(format!("failed to save pin: {error:#}"));
+    }
+    app.set_pins(pinned_sessions.pins());
+    app.select_and_reveal_session(session_id);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_dashboard(
     engine: &DiscoveryEngine,
@@ -533,9 +548,7 @@ pub fn run_dashboard(
                         }
                         let mut effect = match action {
                             AppAction::SetPin { session_id, pinned } => {
-                                if let Err(error) = pinned_sessions.set(&session_id, pinned) {
-                                    app.set_notice(format!("failed to save pin: {error:#}"));
-                                }
+                                save_pin(&mut app, &pinned_sessions, &session_id, pinned);
                                 ActionEffect::default()
                             }
                             AppAction::BrowseHidden => {
@@ -2060,6 +2073,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_pin_that_fails_to_save_is_taken_back_off_the_screen() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("open-agent-view/pinned-sessions.json");
+        let pins = crate::pins::PinnedSessions::load(path.clone()).unwrap();
+        let mut app = app();
+        app.selection = Some(SelectionKey::Session("worker".into()));
+        let AppAction::SetPin { session_id, pinned } = app.toggle_pin() else {
+            panic!("expected a pin action");
+        };
+        assert_eq!(app.groups()[0].label, "Pinned");
+
+        // A directory where the registry file belongs makes the save fail.
+        std::fs::create_dir(&path).unwrap();
+        save_pin(&mut app, &pins, &session_id, pinned);
+
+        assert!(app.groups().iter().all(|group| group.label != "Pinned"));
+        assert_eq!(app.selection, Some(SelectionKey::Session("worker".into())));
+        assert!(app
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("failed to save pin"));
+    }
+
+    #[test]
     fn keyboard_enhancement_is_omitted_for_the_legacy_windows_event_api() {
         assert!(!use_keyboard_enhancement(true));
         assert!(use_keyboard_enhancement(false));
@@ -2250,7 +2288,10 @@ mod tests {
         );
         assert_eq!(app.groups()[0].label, "Pinned");
         assert_eq!(
-            handle_key(&mut app, modified_key(KeyCode::Char('p'), KeyModifiers::SUPER)),
+            handle_key(
+                &mut app,
+                modified_key(KeyCode::Char('p'), KeyModifiers::SUPER)
+            ),
             AppAction::SetPin {
                 session_id: "worker".into(),
                 pinned: false,

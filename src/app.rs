@@ -1301,15 +1301,15 @@ impl App {
             true
         };
         self.rebuild_group_cache();
+        // The row moved groups; keep it selected and on screen even when its
+        // new group is collapsed or paged.
+        self.select_and_reveal_session(&session_id);
         self.set_notice(if pinned {
             format!("pinned {name}")
         } else {
             format!("unpinned {name}")
         });
-        AppAction::SetPin {
-            session_id,
-            pinned,
-        }
+        AppAction::SetPin { session_id, pinned }
     }
 
     pub fn set_notice(&mut self, notice: impl Into<String>) {
@@ -2759,6 +2759,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Pinned", "Needs input", "Completed"]
         );
+    }
+
+    #[test]
+    fn unpinning_reveals_the_row_in_a_collapsed_or_paged_group() {
+        let mut app = app_with(vec![
+            session("done-a", SessionState::Completed),
+            session("done-b", SessionState::Completed),
+            session("done-c", SessionState::Completed),
+        ]);
+        app.selection = Some(SelectionKey::Session("done-c".into()));
+        app.toggle_pin();
+        app.set_session_page_size(1);
+        app.collapsed.insert("state:Completed".into());
+        app.selection = Some(SelectionKey::Session("done-c".into()));
+
+        app.toggle_pin();
+
+        assert_eq!(app.selection, Some(SelectionKey::Session("done-c".into())));
+        assert!(app
+            .selectable_keys()
+            .contains(&SelectionKey::Session("done-c".into())));
     }
 
     #[test]
