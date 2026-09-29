@@ -58,8 +58,9 @@ and future released versions are intended to follow Semantic Versioning.
   jumping back to the first row.
 - A Cursor chat left running behind the dashboard no longer flips to "needs
   input" during long thinking or tool calls. Its state now comes from Cursor's
-  own `ctrl+c to stop` hint on the chat's screen instead of how recently the
-  chat store was written.
+  own `ctrl+c to stop` hint and idle composer on the chat's screen instead of
+  how recently the chat store was written. A screen that shows neither, such
+  as a follow-up typed mid-turn, still falls back to the store.
 - Pasted line breaks and tabs become spaces in the model picker, session
   filter, local rename, and migration name, which are single-line fields.
 - Pasted tabs are visible in the composer; they render as spaces and stay tabs

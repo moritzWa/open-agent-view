@@ -256,15 +256,30 @@ pub fn detached_session_keys() -> Vec<String> {
     Vec::new()
 }
 
-/// The latest visible text of a frontend running behind the dashboard, at
-/// most [`SCREEN_PUBLISH_INTERVAL`] old. `None` when this process does not
-/// hold that frontend in the background.
-pub fn background_screen_contents(session_key: &str) -> Option<String> {
+/// The provider process ID and latest visible text of a frontend running
+/// behind the dashboard, the text at most [`SCREEN_PUBLISH_INTERVAL`] old.
+/// `None` when this process does not hold that frontend in the background or
+/// its process has exited; an exited entry is dropped so its last screen is
+/// never reported again.
+pub fn background_screen_contents(session_key: &str) -> Option<(u32, String)> {
     #[cfg(unix)]
     {
-        let registry = DETACHED.get()?.lock().ok()?;
-        let drain = registry.get(session_key)?.drain.as_ref()?;
-        return drain.contents.lock().ok().map(|contents| contents.clone());
+        let mut registry = DETACHED.get()?.lock().ok()?;
+        let session = registry.get_mut(session_key)?;
+        let pid = session
+            .child
+            .as_mut()
+            .and_then(|child| matches!(child.try_wait(), Ok(None)).then(|| child.id()));
+        let Some(pid) = pid else {
+            let dead = registry.remove(session_key);
+            // Dropping a session joins its drain thread; never do that while
+            // other dashboard calls wait on the registry.
+            drop(registry);
+            drop(dead);
+            return None;
+        };
+        let contents = session.drain.as_ref()?.contents.lock().ok()?.clone();
+        Some((pid, contents))
     }
     #[cfg(not(unix))]
     {
@@ -1657,9 +1672,15 @@ mod tests {
             !state.trim().starts_with('T'),
             "provider process was stopped: {state:?}"
         );
-        thread::sleep(Duration::from_millis(1_000) + SCREEN_PUBLISH_INTERVAL * 2);
-        let published = drain.contents.lock().unwrap().clone();
-        assert!(published.contains("tick-19"), "{published}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let published = drain.contents.lock().unwrap().clone();
+            if published.contains("tick-19") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{published}");
+            thread::sleep(Duration::from_millis(20));
+        }
         drain.stop.store(true, Ordering::Relaxed);
         let (_master, screen) = drain.done.join().unwrap();
         let contents = screen.screen().contents();
@@ -1718,6 +1739,43 @@ mod tests {
             },
         );
         pid
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn background_screen_names_the_live_child_and_forgets_it_once_it_exits() {
+        let marker = std::env::temp_dir().join(format!(
+            "oav-background-screen-{}-{}",
+            std::process::id(),
+            new_session_id().unwrap()
+        ));
+        let key = "provider:host:background-screen";
+        let script = format!(
+            "printf 'working  ctrl+c to stop'; while [ ! -e '{}' ]; do sleep 0.02; done",
+            marker.display()
+        );
+        let pid = detach_for_test(key, &script);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let screen = background_screen_contents(key);
+            if let Some((child, contents)) = &screen {
+                assert_eq!(*child, pid);
+                if contents.contains("ctrl+c to stop") {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "{screen:?}");
+            thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::write(&marker, b"").unwrap();
+        // The last screen of an exited provider is never reported as live.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while background_screen_contents(key).is_some() {
+            assert!(Instant::now() < deadline, "exited provider still reported");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_file(&marker);
+        assert!(!detached_session_keys().iter().any(|item| item == key));
     }
 
     #[test]

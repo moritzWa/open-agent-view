@@ -116,14 +116,14 @@ impl SessionSource for CursorHistorySource {
         let mut completed = 0usize;
         for chat in chats {
             let pid = live.get(&chat.dir).copied();
-            let screen = crate::native_session::background_screen_contents(&format!(
-                "cursor:host:{}",
-                chat.id
-            ));
-            let (state, raw_state) = match (pid, screen.as_deref()) {
-                (Some(_), Some(screen)) => screen_state(screen),
-                _ => chat_state(&chat, pid, now),
-            };
+            let background = pid.and_then(|_| {
+                crate::native_session::background_screen_contents(&format!(
+                    "cursor:host:{}",
+                    chat.id
+                ))
+            });
+            let (state, raw_state) =
+                background_state(pid, background).unwrap_or_else(|| chat_state(&chat, pid, now));
             if state == SessionState::Completed {
                 if !request.include_completed || completed >= request.history_limit.max(1) {
                     continue;
@@ -356,19 +356,59 @@ fn latest_prompt(chat_dir: &Path) -> Option<String> {
         .find(|prompt| !prompt.trim().is_empty())
 }
 
-/// Cursor's composer shows this right-hand hint exactly while a turn is being
-/// processed (`isProcessing` in the CLI), including long thinking and tool
-/// calls that write nothing to the chat store.
+/// Cursor's composer shows this right-hand hint while a turn is being
+/// processed (`isProcessing` in the CLI) and the composer input is empty,
+/// including long thinking and tool calls that write nothing to the chat
+/// store. Typing a queued follow-up mid-turn hides it.
 const PROCESSING_HINT: &str = "ctrl+c to stop";
+/// Placeholders of the empty composer (agent, plan, and shell modes). They
+/// show while idle and while processing alike, so they only prove that the
+/// composer is on screen and empty.
+const COMPOSER_PLACEHOLDERS: &[&str] = &[
+    "Add a follow-up",
+    "Plan, search, build anything",
+    "Run a command",
+];
+/// The composer and its status lines sit in the last few non-empty rows,
+/// below the transcript.
+const COMPOSER_ROWS: usize = 6;
 
-/// State of a chat whose terminal this dashboard holds in the background.
-/// The screen is authoritative, unlike file timestamps.
-fn screen_state(screen: &str) -> (SessionState, &'static str) {
-    if screen.contains(PROCESSING_HINT) {
-        (SessionState::Working, "running turn")
-    } else {
-        (SessionState::NeedsInput, "waiting at prompt")
+/// State from the screen this dashboard holds in the background for a chat,
+/// given the pid holding the chat's store. Only our own live child's screen
+/// speaks for the chat: one resumed elsewhere after ours exited is held by
+/// another pid.
+fn background_state(
+    holder: Option<u32>,
+    background: Option<(u32, String)>,
+) -> Option<(SessionState, &'static str)> {
+    let (child, screen) = background?;
+    if holder != Some(child) {
+        return None;
     }
+    screen_state(&screen)
+}
+
+/// State of a chat whose terminal this dashboard holds in the background, or
+/// `None` when the screen does not settle it. The hint's absence alone is not
+/// evidence of waiting: typed input, a startup or login screen, or a renamed
+/// hint all hide it, so waiting needs the empty idle composer itself.
+fn screen_state(screen: &str) -> Option<(SessionState, &'static str)> {
+    let composer = screen
+        .lines()
+        .rev()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .take(COMPOSER_ROWS)
+        .collect::<Vec<_>>();
+    if composer.iter().any(|line| line.ends_with(PROCESSING_HINT)) {
+        return Some((SessionState::Working, "running turn"));
+    }
+    let idle = composer.iter().any(|line| {
+        COMPOSER_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| line.contains(placeholder))
+    });
+    idle.then_some((SessionState::NeedsInput, "waiting at prompt"))
 }
 
 /// Fallback for chats running in some other terminal: the store's write time.
@@ -629,16 +669,64 @@ mod tests {
 
     #[test]
     fn background_screen_decides_between_working_and_waiting() {
-        let thinking = "  ⬡ Thinking  1234 tokens\n\n → Add a follow-up    ctrl+c to stop\n";
+        let thinking = "  ⬡ Thinking  1234 tokens\n\n → Add a follow-up    ctrl+c to stop \n";
         assert_eq!(
             screen_state(thinking),
-            (SessionState::Working, "running turn")
+            Some((SessionState::Working, "running turn"))
         );
         let idle = "  Done.\n\n → Add a follow-up\n  Auto · 12% context\n";
         assert_eq!(
             screen_state(idle),
-            (SessionState::NeedsInput, "waiting at prompt")
+            Some((SessionState::NeedsInput, "waiting at prompt"))
         );
+        let plan = " → Plan, search, build anything\n\n\n";
+        assert_eq!(
+            screen_state(plan),
+            Some((SessionState::NeedsInput, "waiting at prompt"))
+        );
+    }
+
+    #[test]
+    fn background_screen_without_hint_or_idle_composer_is_not_evidence() {
+        // A queued follow-up typed mid-turn hides both the hint and the
+        // placeholder; the turn is still running.
+        let typed = "  ⬡ Thinking  1234 tokens\n\n → also check the tests\n  Auto · 12% context\n";
+        assert_eq!(screen_state(typed), None);
+        // Blank startup, a login prompt, or a renamed hint are not waiting.
+        assert_eq!(screen_state(""), None);
+        assert_eq!(screen_state("\n\n   \n"), None);
+        assert_eq!(screen_state("Press any key to sign in...\n"), None);
+        assert_eq!(screen_state(" → Nachfrage    Strg+C zum Stoppen\n"), None);
+    }
+
+    #[test]
+    fn only_our_own_live_child_screen_decides_the_state() {
+        let working = || Some((42, " → Add a follow-up    ctrl+c to stop\n".to_owned()));
+        assert_eq!(
+            background_state(Some(42), working()),
+            Some((SessionState::Working, "running turn"))
+        );
+        // Our child crashed and the chat was resumed by another process.
+        assert_eq!(background_state(Some(7), working()), None);
+        assert_eq!(background_state(None, working()), None);
+        // An exited child reports no screen at all.
+        assert_eq!(background_state(Some(42), None), None);
+    }
+
+    #[test]
+    fn processing_hint_counts_only_at_the_end_of_a_composer_row() {
+        // The hint quoted in the transcript, above the composer, is not ours.
+        let quoted = format!(
+            "  Cursor shows ctrl+c to stop while busy\n  press ctrl+c to stop\n{}\n → Add a follow-up\n  Auto\n",
+            "  transcript\n".repeat(COMPOSER_ROWS)
+        );
+        assert_eq!(
+            screen_state(&quoted),
+            Some((SessionState::NeedsInput, "waiting at prompt"))
+        );
+        // Inside the composer rows but mid-line, it is not the hint either.
+        let mid_line = " → why does ctrl+c to stop not work here\n  Auto\n";
+        assert_eq!(screen_state(mid_line), None);
     }
 
     #[test]
