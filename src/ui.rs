@@ -1192,7 +1192,7 @@ fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         (app.hidden_selection / visible_rows) * visible_rows
     };
     let mut lines = vec![Line::from(vec![
-        Span::styled(" search  ", Style::default().fg(DIM)),
+        Span::styled(" search  ", Style::default().fg(palette().dim)),
         Span::styled(
             if app.hidden_filter.is_empty() {
                 "type a name, harness, or ID".into()
@@ -1200,16 +1200,16 @@ fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 sanitize_inline(&app.hidden_filter)
             },
             if app.hidden_filter.is_empty() {
-                Style::default().fg(DIM)
+                Style::default().fg(palette().dim)
             } else {
-                Style::default().fg(FG)
+                Style::default().fg(palette().fg)
             },
         ),
     ])];
     if choices.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No hidden sessions match",
-            Style::default().fg(DIM),
+            Style::default().fg(palette().dim),
         )));
     } else {
         let now = SystemTime::now();
@@ -1243,11 +1243,11 @@ fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     ))
                     .style(if selected {
                         Style::default()
-                            .bg(SELECTED_BG)
-                            .fg(Color::White)
+                            .bg(palette().selected_bg)
+                            .fg(palette().selected_fg)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().bg(BG).fg(FG)
+                        Style::default().bg(palette().bg).fg(palette().fg)
                     })
                 }),
         );
@@ -1258,7 +1258,7 @@ fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         } else {
             " ↑/↓ · enter restore · esc"
         })
-        .style(Style::default().fg(DIM)),
+        .style(Style::default().fg(palette().dim)),
     );
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -1271,9 +1271,9 @@ fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         app.hidden_candidates.len()
                     ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(ACCENT)),
+                    .border_style(Style::default().fg(palette().accent)),
             )
-            .style(Style::default().bg(BG).fg(FG)),
+            .style(Style::default().bg(palette().bg).fg(palette().fg)),
         popup,
     );
 }
