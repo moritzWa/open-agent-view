@@ -57,17 +57,19 @@ impl Palette {
     }
 
     /// Neutral white with the greys and blue of VS Code's default light theme,
-    /// so the dashboard matches a light editor instead of tinting warm.
+    /// so the dashboard matches a light editor instead of tinting warm. Every
+    /// foreground keeps WCAG AA contrast (4.5:1) on both backgrounds, since
+    /// dim, accent, and state spans also sit on the selected row.
     pub const fn light() -> Self {
         Self {
             bg: Color::Rgb(255, 255, 255),
             fg: Color::Rgb(59, 59, 59),
-            dim: Color::Rgb(110, 110, 110),
+            dim: Color::Rgb(102, 102, 102),
             selected_bg: Color::Rgb(232, 232, 232),
             selected_fg: Color::Rgb(30, 30, 30),
             accent: Color::Rgb(0, 95, 184),
-            attention: Color::Rgb(191, 136, 3),
-            complete: Color::Rgb(56, 138, 52),
+            attention: Color::Rgb(135, 90, 0),
+            complete: Color::Rgb(36, 112, 36),
         }
     }
 
@@ -525,5 +527,49 @@ mod tests {
         assert_eq!(Palette::dark().selected_fg, Color::White);
         assert_eq!(light.bg, Color::Rgb(255, 255, 255));
         assert_eq!(scheme_from_rgb(255, 255, 255), ColorScheme::Light);
+    }
+
+    fn relative_luminance(color: Color) -> f64 {
+        let Color::Rgb(red, green, blue) = color else {
+            panic!("light palette colors are RGB: {color:?}");
+        };
+        let channel = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+    }
+
+    fn contrast_ratio(first: Color, second: Color) -> f64 {
+        let (first, second) = (relative_luminance(first), relative_luminance(second));
+        (first.max(second) + 0.05) / (first.min(second) + 0.05)
+    }
+
+    #[test]
+    fn light_palette_text_meets_wcag_aa_on_both_backgrounds() {
+        let light = Palette::light();
+        let foregrounds = [
+            ("fg", light.fg),
+            ("dim", light.dim),
+            ("selected_fg", light.selected_fg),
+            ("accent", light.accent),
+            ("attention", light.attention),
+            ("complete", light.complete),
+        ];
+        for (name, foreground) in foregrounds {
+            for (background_name, background) in
+                [("bg", light.bg), ("selected_bg", light.selected_bg)]
+            {
+                let ratio = contrast_ratio(foreground, background);
+                assert!(
+                    ratio >= 4.5,
+                    "{name} on {background_name} is {ratio:.2}:1, below 4.5:1"
+                );
+            }
+        }
     }
 }
