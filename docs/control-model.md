@@ -328,9 +328,9 @@ Cursor's picker is TTY-only, but the CLI persists every chat on disk under
 `~/.cursor/chats/<hash of cwd>/<chat id>/` with a small `meta.json` (title,
 cwd, timestamps) and a `prompt_history.json` of the user's prompts. Open Agent
 View lists those chats on every platform when `--include-external
---include-interactive` are set. The store's SQLite transcript is left alone:
-rows carry the title, cwd, and the latest prompt, and Inspect shows the
-recorded prompts, not the assistant's replies.
+--include-interactive` are set. The store's SQLite transcript (`store.db`) is
+not parsed: rows carry the title, cwd, and the latest prompt, and Inspect shows
+the recorded prompts, not the assistant's replies.
 
 Liveness comes from the process, not the files. Cursor drops a PID marker in
 `~/.local/share/cursor-agent/versions/<version>/.running/` for each CLI it
@@ -340,7 +340,8 @@ with a live holder is *working* while its store or metadata changed within the
 last 20 seconds and *waiting at prompt* otherwise; chats without a holder are
 *closed* history. Because these rows are observe/native-open only, a stale
 marker or a misread PID can at worst mislabel a row's state; nothing is ever
-signalled based on it.
+signalled based on it. Running-state detection is implemented on macOS and
+Linux only; on other platforms every chat is listed as closed history.
 
 Managed control is separate. Foreground launch on Linux creates an exact Cursor
 chat, records it, and immediately resumes that ID in Cursor's interactive

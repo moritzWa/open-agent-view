@@ -8,15 +8,15 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use open_agent_view::adapters::{
-    default_cursor_chats_dir, default_cursor_versions_dir, default_managed_docker_registry_path,
-    default_pi_session_dir, generate_managed_instance_id, AntigravityController,
-    AntigravityOwnership, AntigravitySource, ClaudeSource, CodexSource, CopilotController,
-    CopilotOwnedSource, CopilotSource, CopilotSupervisor, CursorController, CursorHistorySource,
-    DiscoveryEngine, DiscoveryRequest, DockerTarget, FixtureSource, KimiController, KimiOwnership,
-    KimiSource, ManagedDockerCreateSpec, ManagedDockerService, ManagedDockerStatus,
-    MistralVibeController, MistralVibeOwnership, MistralVibeSource, MuseController, MuseOwnership,
-    MuseSource, OpenCodeController, OpenCodeSource, PiController, PiSource, QwenController,
-    QwenOwnership, QwenSource, SessionMigrateNativeController, SessionMigrateNativeOwnership,
+    default_cursor_versions_dir, default_managed_docker_registry_path, default_pi_session_dir,
+    generate_managed_instance_id, AntigravityController, AntigravityOwnership, AntigravitySource,
+    ClaudeSource, CodexSource, CopilotController, CopilotOwnedSource, CopilotSource,
+    CopilotSupervisor, CursorController, CursorHistorySource, DiscoveryEngine, DiscoveryRequest,
+    DockerTarget, FixtureSource, KimiController, KimiOwnership, KimiSource,
+    ManagedDockerCreateSpec, ManagedDockerService, ManagedDockerStatus, MistralVibeController,
+    MistralVibeOwnership, MistralVibeSource, MuseController, MuseOwnership, MuseSource,
+    OpenCodeController, OpenCodeSource, PiController, PiSource, QwenController, QwenOwnership,
+    QwenSource, SessionMigrateNativeController, SessionMigrateNativeOwnership,
     SessionMigrateNativeSource, TerminalHarness,
 };
 #[cfg(target_os = "linux")]
@@ -889,16 +889,15 @@ fn main() -> Result<()> {
             // Cursor's CLI writes every chat under ~/.cursor/chats. Listing that
             // store is what makes external Cursor sessions visible, on every
             // platform. Rows are observe/native-open only.
-            let chats_root = match &cli.cursor_chats_dir {
-                Some(chats_dir) => chats_dir.clone(),
-                None => default_cursor_chats_dir()?,
+            let source = match &cli.cursor_chats_dir {
+                Some(chats_dir) => {
+                    CursorHistorySource::host(chats_dir.clone(), default_cursor_versions_dir().ok())
+                }
+                None => CursorHistorySource::host_default(),
             };
-            let source = CursorHistorySource::host(chats_root, default_cursor_versions_dir().ok());
             #[cfg(target_os = "linux")]
             let source = match cursor_supervisor {
-                Some(supervisor) => source.skipping(Arc::new(move |chat_id: &str| {
-                    supervisor.owns_chat_id(chat_id)
-                })),
+                Some(supervisor) => source.skipping(Arc::new(move || supervisor.owned_chat_ids())),
                 None => source,
             };
             engine.add_source(source);
