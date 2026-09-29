@@ -32,6 +32,13 @@ use crate::ui;
 const MAX_READY_EVENTS_PER_TICK: usize = 256;
 const LAUNCH_DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const LAUNCH_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const REVEAL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A session the user just unhid; select its row as soon as a refresh lists it.
+struct PendingReveal {
+    session_id: String,
+    deadline: Instant,
+}
 const LAUNCH_ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
 const LIVE_SESSION_ANIMATION_INTERVAL: Duration = Duration::from_millis(550);
 const LAUNCH_SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
@@ -188,6 +195,7 @@ pub fn run_dashboard(
     let mut refresh_after_current = false;
     let mut pending_launch: Option<PendingLaunch> = None;
     let mut pending_launch_retry_at: Option<Instant> = None;
+    let mut pending_reveal: Option<PendingReveal> = None;
     let mut latest_launch_sequence = 0u64;
     let mut launching_provider: Option<Provider> = None;
     let mut latest_migration_sequence = 0u64;
@@ -236,6 +244,21 @@ pub fn run_dashboard(
                     }
                     let changed = snapshot != app.snapshot;
                     app.replace_snapshot(snapshot);
+                    if let Some(reveal) = pending_reveal.as_ref() {
+                        if app.select_and_reveal_session(&reveal.session_id) {
+                            let name = app
+                                .selected_session()
+                                .map(|session| session.name.clone())
+                                .unwrap_or_else(|| reveal.session_id.clone());
+                            app.set_notice(format!("restored {name}"));
+                            pending_reveal = None;
+                        } else if complete && Instant::now() >= reveal.deadline {
+                            app.set_notice(
+                                "unhidden, but discovery does not list that session right now",
+                            );
+                            pending_reveal = None;
+                        }
+                    }
                     if let Some(session_id) =
                         select_pending_launch(&mut app, pending_launch.as_ref())
                     {
@@ -478,6 +501,35 @@ pub fn run_dashboard(
                             action = AppAction::None;
                         }
                         let mut effect = match action {
+                            AppAction::BrowseHidden => {
+                                app.open_hidden_picker(hidden_sessions.list());
+                                ActionEffect::default()
+                            }
+                            AppAction::Unhide { session_id } => {
+                                match hidden_sessions.unhide(&session_id) {
+                                    Ok(Some(record)) => {
+                                        let name = record
+                                            .name
+                                            .clone()
+                                            .unwrap_or_else(|| record.id.clone());
+                                        app.set_notice(format!(
+                                            "restoring {name}; it returns as soon as discovery lists it"
+                                        ));
+                                        pending_reveal = Some(PendingReveal {
+                                            session_id,
+                                            deadline: Instant::now() + REVEAL_DISCOVERY_TIMEOUT,
+                                        });
+                                    }
+                                    Ok(None) => app.set_notice("that session was no longer hidden"),
+                                    Err(error) => app.set_notice(format!(
+                                        "failed to restore session: {error:#}"
+                                    )),
+                                }
+                                ActionEffect {
+                                    refresh: true,
+                                    ..ActionEffect::default()
+                                }
+                            }
                             AppAction::Migrate {
                                 session_id,
                                 target,
@@ -978,6 +1030,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
                 app.start_filter();
                 AppAction::None
             }
+            KeyCode::Char('g') if app.overlay == Overlay::None => AppAction::BrowseHidden,
+            KeyCode::Char('g') if app.overlay == Overlay::HiddenPicker => app.escape(),
             KeyCode::Char('l') if app.overlay == Overlay::None => AppAction::Refresh,
             KeyCode::Char('x') => match app.overlay.clone() {
                 Overlay::Confirm(_) => app.activate(),
@@ -1049,6 +1103,22 @@ fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
         }
         KeyCode::PageDown if app.overlay == Overlay::ModelPicker => {
             app.move_model_page(1);
+            AppAction::None
+        }
+        KeyCode::Up | KeyCode::BackTab if app.overlay == Overlay::HiddenPicker => {
+            app.move_hidden_selection(-1);
+            AppAction::None
+        }
+        KeyCode::Down | KeyCode::Tab if app.overlay == Overlay::HiddenPicker => {
+            app.move_hidden_selection(1);
+            AppAction::None
+        }
+        KeyCode::PageUp if app.overlay == Overlay::HiddenPicker => {
+            app.move_hidden_page(-1);
+            AppAction::None
+        }
+        KeyCode::PageDown if app.overlay == Overlay::HiddenPicker => {
+            app.move_hidden_page(1);
             AppAction::None
         }
         KeyCode::Up | KeyCode::Left
@@ -1475,7 +1545,9 @@ fn handle_action_legacy<T: DashboardTerminal, C: DashboardControl>(
         | AppAction::SetupProvider { .. }
         | AppAction::SetupLaunchOption { .. }
         | AppAction::Migrate { .. }
-        | AppAction::Hide { .. } => false,
+        | AppAction::Hide { .. }
+        | AppAction::BrowseHidden
+        | AppAction::Unhide { .. } => false,
         AppAction::Refresh => {
             app.set_notice("refreshing provider sessions…");
             true
@@ -1951,6 +2023,44 @@ mod tests {
         app.start_new_session(None);
         handle_key(&mut app, control_key('s'));
         assert_eq!(app.view_mode, crate::app::ViewMode::Directory);
+    }
+
+    #[test]
+    fn control_g_opens_the_hidden_picker_from_the_list_and_toggles_it_closed() {
+        let mut app = app();
+        assert_eq!(
+            handle_key(&mut app, control_key('g')),
+            AppAction::BrowseHidden
+        );
+        app.open_hidden_picker(vec![crate::hidden::HiddenSessionRecord {
+            id: "cursor:host:abc".into(),
+            provider: Some(Provider::Cursor),
+            name: Some("Agent Comparison".into()),
+            hidden_at_ms: 1,
+        }]);
+        assert_eq!(app.overlay, Overlay::HiddenPicker);
+        handle_key(&mut app, key(KeyCode::Char('q')));
+        assert_eq!(
+            app.hidden_filter, "q",
+            "typing searches instead of quitting"
+        );
+        handle_key(&mut app, key(KeyCode::Backspace));
+        assert_eq!(
+            handle_key(&mut app, key(KeyCode::Enter)),
+            AppAction::Unhide {
+                session_id: "cursor:host:abc".into()
+            }
+        );
+        app.open_hidden_picker(vec![crate::hidden::HiddenSessionRecord {
+            id: "x".into(),
+            provider: None,
+            name: None,
+            hidden_at_ms: 1,
+        }]);
+        assert_eq!(handle_key(&mut app, control_key('g')), AppAction::None);
+        assert_eq!(app.overlay, Overlay::None);
+        app.start_new_session(None);
+        assert_eq!(handle_key(&mut app, control_key('g')), AppAction::None);
     }
 
     #[test]

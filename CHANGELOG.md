@@ -8,6 +8,18 @@ and future released versions are intended to follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `ctrl+g` opens a searchable picker of sessions hidden with `ctrl+x`.
+  Enter unhides the chosen session and selects its row when discovery lists
+  it, without leaving the dashboard.
+
+### Fixed
+
+- Hiding, deleting, or losing the selected row keeps the cursor on the row
+  that followed it (or the one before it at the end of the list) instead of
+  jumping back to the first row.
+
 ## [0.1.53] - 2026-09-04
 
 ### Added

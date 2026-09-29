@@ -427,6 +427,7 @@ label.
 | Session list | `ctrl+s` | Toggle status and working-directory grouping. |
 | Session list | `ctrl+f` | Edit the case-insensitive name/summary/path/provider filter. |
 | Session list | `ctrl+l` | Request an immediate provider refresh. |
+| Session list | `ctrl+g` | Search sessions hidden with `ctrl+x` by name, harness, or ID. `enter` unhides the chosen one and selects its row as soon as discovery lists it; `esc` or `ctrl+g` closes the picker. |
 | Session list | `tab`, `/`, or printable text | Compose a new host task. `/` begins a dashboard command rather than a filter. |
 | New-task composer | `tab` | Open the visible harness picker. |
 | New-task composer | `shift+tab` | Open the selected harness's model picker—or Terminal shell picker—without changing the task draft. |
