@@ -427,7 +427,7 @@ label.
 | Session list | `ctrl+s` | Toggle status and working-directory grouping. |
 | Session list | `ctrl+f` | Edit the case-insensitive name/summary/path/provider filter. |
 | Session list | `ctrl+l` | Request an immediate provider refresh. |
-| Session list | `ctrl+t` or `ctrl+p` | Pin or unpin the selected session. Pinned rows stay in a group at the top. `ctrl+t` matches Claude Code's agent-view pin key; `cmd+p` also works when the terminal delivers it as the super modifier. |
+| Session list | `ctrl+t` or `ctrl+p` | Pin or unpin the selected session. Pinned rows stay in a group at the top. `ctrl+t` matches Claude Code's agent-view pin key; `cmd+p` also works when the terminal delivers it as the super modifier. Both also work in Peek. A pin is kept while the session is hidden with `ctrl+x` and applies again once it is restored. |
 | Session list | `tab`, `/`, or printable text | Compose a new host task. `/` begins a dashboard command rather than a filter. |
 | New-task composer | `tab` | Open the visible harness picker. |
 | New-task composer | `shift+tab` | Open the selected harness's model picker—or Terminal shell picker—without changing the task draft. |
@@ -549,6 +549,7 @@ when `XDG_STATE_HOME` is unset, the current implementation stores:
 | `cursor/` | Linux ownership registry, process identities, locks, and bounded logs for OAV-owned Cursor runs. |
 | `copilot/` | Exact OAV-created Copilot IDs, workspaces, titles, latest bounded summaries, provider timestamps, and registry lock. No credentials or full transcripts. |
 | `hidden-sessions.json` | Reversible local suppression records; provider history and live processes are not changed. |
+| `pinned-sessions.json` | Local pin records (session ID and pin time) for the dashboard's Pinned group. Pins never change the provider session. |
 | `managed-docker/owners.json` | Exact external proof for managed-container lifecycle. |
 
 These files contain authority metadata and should not be shared between users.

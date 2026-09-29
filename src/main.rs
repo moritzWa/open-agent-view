@@ -25,7 +25,6 @@ use open_agent_view::control::{ControlHub, ControlHubConfig};
 use open_agent_view::doctor::{diagnose, render_text};
 use open_agent_view::domain::Provider;
 use open_agent_view::hidden::{HiddenSessionRecord, HiddenSessions};
-use open_agent_view::pins::PinnedSessions;
 use open_agent_view::maintenance::{
     execute_completed_archive, plan_completed_archive, BulkArchiveReport,
 };
@@ -35,6 +34,7 @@ use open_agent_view::opencode_supervisor::OpenCodeSupervisor;
 use open_agent_view::pi_supervisor::run_pi_supervisor_daemon;
 #[cfg(target_os = "linux")]
 use open_agent_view::pi_supervisor::PiSupervisor;
+use open_agent_view::pins::PinnedSessions;
 use open_agent_view::terminal::{run_dashboard, MigrationServices};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

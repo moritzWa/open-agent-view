@@ -11,8 +11,9 @@ and future released versions are intended to follow Semantic Versioning.
 ### Added
 
 - `ctrl+t` (Claude Code's pin key) or `ctrl+p` pins the selected session to a
-  Pinned group at the top of the list and unpins it again. The pin is
-  remembered locally.
+  Pinned group at the top of the list and unpins it again, also from Peek. The
+  row stays selected in its new group. The pin is remembered locally, kept
+  while the session is hidden, and taken back if it cannot be saved.
 
 ## [0.1.53] - 2026-09-04
 

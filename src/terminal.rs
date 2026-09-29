@@ -116,6 +116,7 @@ fn save_pin(
     app.select_and_reveal_session(session_id);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_dashboard(
     engine: &DiscoveryEngine,
     request: &DiscoveryRequest,
