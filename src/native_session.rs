@@ -3,9 +3,11 @@
 //! Interactive provider clients run behind a private pseudo-terminal.
 //! Plain Left and Right remain available to edit the provider's input line. At
 //! a cursor boundary, the first arrow is still forwarded and opens a short,
-//! visible return window; pressing the same arrow again backgrounds the
-//! frontend. Shift+Left and Shift+Right are immediate equivalents. Selecting
-//! the same row resumes the exact stopped frontend and screen.
+//! visible return window; pressing the same arrow again returns to the
+//! dashboard. Shift+Left and Shift+Right are immediate equivalents. The
+//! provider process keeps running on its own pseudo-terminal, and a drain
+//! thread holds the screen it produces. Selecting the same row attaches that
+//! live screen again.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
@@ -16,7 +18,9 @@ use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{Mutex, OnceLock};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(unix)]
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,8 +38,6 @@ const FALLBACK_TERMINAL_ROWS: u16 = 24;
 #[cfg(unix)]
 const FALLBACK_TERMINAL_COLUMNS: u16 = 80;
 #[cfg(unix)]
-const STOP_GRACE: Duration = Duration::from_millis(250);
-
 #[derive(Debug)]
 pub enum NativeSessionExit {
     Backgrounded,
@@ -59,10 +61,17 @@ pub fn new_session_id() -> Result<String> {
 
 #[cfg(unix)]
 struct DetachedSession {
-    child: std::process::Child,
-    master: std::fs::File,
-    screen: vt100::Parser,
+    child: Option<std::process::Child>,
     warning: Option<String>,
+    drain: Option<PtyDrain>,
+}
+
+/// Reads the provider's pseudo-terminal while the dashboard is in front, so a
+/// long turn is not frozen and does not stall once the kernel buffer fills.
+#[cfg(unix)]
+struct PtyDrain {
+    stop: Arc<AtomicBool>,
+    done: thread::JoinHandle<(std::fs::File, vt100::Parser)>,
 }
 
 #[cfg(unix)]
@@ -217,15 +226,8 @@ pub fn resume(session_key: &str) -> Result<NativeSessionExit> {
         }
         let detached =
             take_detached(session_key)?.context("the background terminal is no longer running")?;
-        bridge_session(
-            detached.child,
-            detached.master,
-            detached.screen,
-            session_key,
-            false,
-            None,
-            detached.warning,
-        )
+        let (child, master, screen, warning) = detached.into_frontend()?;
+        bridge_session(child, master, screen, session_key, false, None, warning)
     }
     #[cfg(not(unix))]
     bail!("background terminal resume is unavailable on this platform")
@@ -261,8 +263,8 @@ pub fn is_backgrounded(session_key: &str) -> bool {
         };
         let alive = registry
             .get_mut(session_key)
-            .map(|session| matches!(session.child.try_wait(), Ok(None)))
-            .unwrap_or(false);
+            .and_then(|session| session.child.as_mut())
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
         if !alive {
             registry.remove(session_key);
         }
@@ -368,13 +370,10 @@ fn run_pty(
 ) -> Result<NativeSessionExit> {
     let detached = take_detached(session_key)?;
     let (child, master, screen, fresh, warning) = match detached {
-        Some(detached) => (
-            detached.child,
-            detached.master,
-            detached.screen,
-            false,
-            detached.warning,
-        ),
+        Some(detached) => {
+            let (child, master, screen, warning) = detached.into_frontend()?;
+            (child, master, screen, false, warning)
+        }
         None => {
             clear_physical_screen()?;
             let (child, master) = spawn_pty(&mut command)?;
@@ -466,7 +465,11 @@ fn take_detached(session_key: &str) -> Result<Option<DetachedSession>> {
         .remove(session_key);
     match detached {
         Some(mut detached) => {
-            if detached.child.try_wait()?.is_none() {
+            let alive = detached
+                .child
+                .as_mut()
+                .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+            if alive {
                 Ok(Some(detached))
             } else {
                 Ok(None)
@@ -478,23 +481,26 @@ fn take_detached(session_key: &str) -> Result<Option<DetachedSession>> {
 
 #[cfg(unix)]
 fn terminate_detached(session: &mut DetachedSession) {
-    signal_group(session.child.id(), libc::SIGCONT);
-    signal_group(session.child.id(), libc::SIGTERM);
+    let Some(child) = session.child.as_mut() else {
+        return;
+    };
+    signal_group(child.id(), libc::SIGCONT);
+    signal_group(child.id(), libc::SIGTERM);
     let deadline = Instant::now() + Duration::from_millis(300);
     loop {
-        match session.child.try_wait() {
+        match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(None) | Err(_) => {
-                signal_group(session.child.id(), libc::SIGKILL);
+                signal_group(child.id(), libc::SIGKILL);
                 // Never turn dashboard shutdown into an unbounded wait. The
                 // exact child has received an uncatchable signal above; reap
                 // it opportunistically while keeping cleanup latency bounded.
                 let reap_deadline = Instant::now() + Duration::from_secs(1);
                 while Instant::now() < reap_deadline {
-                    if matches!(session.child.try_wait(), Ok(Some(_))) {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
                         break;
                     }
                     thread::sleep(Duration::from_millis(10));
@@ -684,7 +690,11 @@ fn bridge_session(
                         }
                     }
                     if detach {
-                        stop_frontend(&mut child, &mut master, &mut stdout, &mut screen)?;
+                        // The provider keeps its controlling terminal, which is
+                        // the private pseudo-terminal, not the dashboard's.
+                        // Stopping it here aborts an in-flight model request.
+                        restore_dashboard_terminal_modes(&mut stdout)?;
+                        let drain = start_output_drain(master, screen)?;
                         detached_registry()
                             .lock()
                             .map_err(|_| {
@@ -693,10 +703,9 @@ fn bridge_session(
                             .insert(
                                 session_key.to_owned(),
                                 DetachedSession {
-                                    child,
-                                    master,
-                                    screen,
+                                    child: Some(child),
                                     warning,
+                                    drain: Some(drain),
                                 },
                             );
                         return Ok(NativeSessionExit::Backgrounded);
@@ -783,38 +792,102 @@ fn forward_ready_initial_input(
 }
 
 #[cfg(unix)]
-fn stop_frontend(
-    child: &mut std::process::Child,
-    master: &mut std::fs::File,
-    stdout: &mut impl Write,
-    screen: &mut vt100::Parser,
-) -> Result<()> {
-    signal_group(child.id(), libc::SIGTSTP);
-    let deadline = Instant::now() + STOP_GRACE;
-    let mut stopped = false;
-    while Instant::now() < deadline {
-        copy_available(master, stdout, screen)?;
-        let mut status = 0;
-        let waited = unsafe {
-            libc::waitpid(
-                child.id() as libc::pid_t,
-                &mut status,
-                libc::WNOHANG | libc::WUNTRACED,
-            )
-        };
-        if waited == child.id() as libc::pid_t && libc::WIFSTOPPED(status) {
-            stopped = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    if !stopped {
-        signal_group(child.id(), libc::SIGSTOP);
-    }
-    copy_available(master, stdout, screen)?;
+fn restore_dashboard_terminal_modes(stdout: &mut impl Write) -> Result<()> {
     stdout.write_all(b"\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[<u\x1b[?25h")?;
     stdout.flush()?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn start_output_drain(mut master: std::fs::File, mut screen: vt100::Parser) -> Result<PtyDrain> {
+    set_nonblocking(master.as_raw_fd(), true)?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let done = thread::Builder::new()
+        .name("native-pty-drain".into())
+        .spawn(move || {
+            let mut bytes = [0_u8; 8192];
+            loop {
+                if flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let mut descriptor = libc::pollfd {
+                    fd: master.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let polled = unsafe { libc::poll(&mut descriptor, 1, 50) };
+                if polled < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+                    continue;
+                }
+                loop {
+                    match master.read(&mut bytes) {
+                        Ok(0) => return (master, screen),
+                        Ok(count) => screen.process(&bytes[..count]),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                            return (master, screen);
+                        }
+                        Err(_) => return (master, screen),
+                    }
+                }
+            }
+            loop {
+                match master.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(count) => screen.process(&bytes[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+            (master, screen)
+        })
+        .context("failed to keep the provider terminal running")?;
+    Ok(PtyDrain { stop, done })
+}
+
+#[cfg(unix)]
+impl DetachedSession {
+    fn into_frontend(
+        mut self,
+    ) -> Result<(
+        std::process::Child,
+        std::fs::File,
+        vt100::Parser,
+        Option<String>,
+    )> {
+        let child = self
+            .child
+            .take()
+            .context("detached provider terminal has no process")?;
+        let drain = self
+            .drain
+            .take()
+            .context("detached provider terminal has no output drain")?;
+        drain.stop.store(true, Ordering::Relaxed);
+        let (master, screen) = drain
+            .done
+            .join()
+            .map_err(|_| anyhow!("provider terminal drain stopped unexpectedly"))?;
+        Ok((child, master, screen, self.warning.take()))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DetachedSession {
+    fn drop(&mut self) {
+        if let Some(drain) = self.drain.take() {
+            drain.stop.store(true, Ordering::Relaxed);
+            let _ = drain.done.join();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1391,6 +1464,35 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    #[test]
+    fn provider_output_keeps_arriving_while_the_dashboard_is_detached() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "i=0; while [ \"$i\" -lt 20 ]; do echo tick-$i; i=$((i+1)); sleep 0.05; done",
+        ]);
+        let (mut child, master) = spawn_pty(&mut command).unwrap();
+        let drain = start_output_drain(master, vt100::Parser::new(24, 80, 0)).unwrap();
+        thread::sleep(Duration::from_millis(400));
+        let state = Command::new("ps")
+            .args(["-o", "state=", "-p", &child.id().to_string()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&state.stdout);
+        assert!(
+            !state.trim().starts_with('T'),
+            "provider process was stopped: {state:?}"
+        );
+        drain.stop.store(true, Ordering::Relaxed);
+        let (_master, screen) = drain.done.join().unwrap();
+        let contents = screen.screen().contents();
+        assert!(contents.contains("tick-0"), "{contents}");
+        assert!(contents.contains("tick-5"), "{contents}");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     fn empty_left_margin_prompt_keeps_return_window_across_provider_redraw() {
         let mut screen = vt100::Parser::new(6, 40, 0);
         screen.process(b"\x1b[1;3H> \x1b[?25h");
