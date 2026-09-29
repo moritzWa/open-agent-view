@@ -1160,9 +1160,9 @@ fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .min(area.height.saturating_sub(7).max(1) as usize)
         .max(1);
     let result_rows = choices.len().clamp(1, visible_rows);
-    let popup_height = (result_rows as u16 + 5)
+    let popup_height = (result_rows as u16 + 4)
         .min(area.height.saturating_sub(2))
-        .max(6);
+        .max(5);
     let popup = Rect::new(
         area.x + area.width.saturating_sub(popup_width) / 2,
         area.y + area.height.saturating_sub(popup_height) / 2,
