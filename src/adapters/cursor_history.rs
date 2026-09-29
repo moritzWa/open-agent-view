@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use super::native_owned::sanitize;
+use super::native_owned::{sanitize, NativeOwnership};
 use super::{DiscoveryRequest, SessionSource};
 use crate::domain::{AgentSession, Capability, Provider, Runtime, SessionKind, SessionState};
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -41,6 +41,45 @@ const PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 /// skips this tick's listing rather than risk a duplicate row.
 pub type OwnedChatIds = Arc<dyn Fn() -> Result<BTreeSet<String>> + Send + Sync>;
 
+/// Chats this dashboard created itself where no managed supervisor records
+/// them (every platform but Linux). The history source lists these even
+/// without `--include-external`, like other native-only harnesses' own rows.
+pub struct CursorOwnership {
+    inner: NativeOwnership,
+}
+
+impl CursorOwnership {
+    pub fn load_default() -> Result<Arc<Self>> {
+        Self::load(default_cursor_ownership_path()?)
+    }
+
+    pub fn load(path: PathBuf) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            inner: NativeOwnership::load(path, "Cursor")?,
+        }))
+    }
+
+    pub fn record(&self, chat_id: &str, cwd: &Path, prompt: &str) -> Result<()> {
+        self.inner.record(chat_id, cwd, prompt, None, "Cursor")
+    }
+
+    pub fn chat_ids(&self) -> BTreeSet<String> {
+        self.inner
+            .records()
+            .into_iter()
+            .map(|record| record.session_id)
+            .collect()
+    }
+}
+
+pub fn default_cursor_ownership_path() -> Result<PathBuf> {
+    if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(state_home).join("open-agent-view/cursor-owned.json"));
+    }
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".local/state/open-agent-view/cursor-owned.json"))
+}
+
 pub struct CursorHistorySource {
     /// `None` resolves the default store at discovery time, so a missing home
     /// directory fails this source alone instead of startup.
@@ -48,6 +87,7 @@ pub struct CursorHistorySource {
     versions_root: Option<PathBuf>,
     runner: Arc<dyn CommandRunner>,
     skip: Option<OwnedChatIds>,
+    owned: Option<Arc<CursorOwnership>>,
 }
 
 impl CursorHistorySource {
@@ -57,6 +97,7 @@ impl CursorHistorySource {
             versions_root,
             runner: Arc::new(ProcessRunner),
             skip: None,
+            owned: None,
         }
     }
 
@@ -67,12 +108,20 @@ impl CursorHistorySource {
             versions_root: default_cursor_versions_dir().ok(),
             runner: Arc::new(ProcessRunner),
             skip: None,
+            owned: None,
         }
     }
 
     /// Leave out the chat IDs `skip` returns.
     pub fn skipping(mut self, skip: OwnedChatIds) -> Self {
         self.skip = Some(skip);
+        self
+    }
+
+    /// Also list the chats `owned` records when external chats are not
+    /// requested.
+    pub fn owned(mut self, owned: Arc<CursorOwnership>) -> Self {
+        self.owned = Some(owned);
         self
     }
 
@@ -89,8 +138,15 @@ impl SessionSource for CursorHistorySource {
     }
 
     fn discover(&self, request: &DiscoveryRequest) -> Result<Vec<AgentSession>> {
-        if !request.include_interactive {
-            // Every chat in this store is a foreground TUI session.
+        // Every chat in this store is a foreground TUI session, so external
+        // ones need both flags. Chats this dashboard created are its own.
+        let external = request.include_external && request.include_interactive;
+        let owned = match (&self.owned, external) {
+            (Some(owned), false) => Some(owned.chat_ids()),
+            (None, false) => return Ok(Vec::new()),
+            (_, true) => None,
+        };
+        if owned.as_ref().is_some_and(BTreeSet::is_empty) {
             return Ok(Vec::new());
         }
         let chats_root = match &self.chats_root {
@@ -98,6 +154,9 @@ impl SessionSource for CursorHistorySource {
             None => default_cursor_chats_dir()?,
         };
         let mut chats = read_cursor_chats(&chats_root)?;
+        if let Some(owned) = &owned {
+            chats.retain(|chat| owned.contains(&chat.id));
+        }
         if let Some(skip) = &self.skip {
             let owned = skip().context("failed to read the managed Cursor registry")?;
             chats.retain(|chat| !owned.contains(&chat.id));
@@ -828,6 +887,37 @@ mod tests {
         let sessions = source.discover(&request()).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].provider_session_id, CHAT_B);
+    }
+
+    #[test]
+    fn owned_chats_are_listed_without_external_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        write_chat(temp.path(), "8550e5f0", CHAT_A, "A", "/Users/m", 2_000_000);
+        write_chat(temp.path(), "8550e5f0", CHAT_B, "B", "/Users/m", 1_000_000);
+        let state = tempfile::tempdir().unwrap();
+        let registry = state.path().join("open-agent-view/cursor-owned.json");
+        let ownership = CursorOwnership::load(registry.clone()).unwrap();
+        let source =
+            CursorHistorySource::host(temp.path().to_owned(), None).owned(ownership.clone());
+        // The default dashboard asks for neither external nor interactive
+        // sessions.
+        let mut own_only = request();
+        own_only.include_external = false;
+        own_only.include_interactive = false;
+        assert!(source.discover(&own_only).unwrap().is_empty());
+
+        ownership
+            .record(CHAT_B, Path::new("/Users/m"), "fix the tests")
+            .unwrap();
+        let sessions = source.discover(&own_only).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].provider_session_id, CHAT_B);
+        // Reloading the registry from disk keeps the chat listed.
+        let reloaded = CursorHistorySource::host(temp.path().to_owned(), None)
+            .owned(CursorOwnership::load(registry).unwrap());
+        assert_eq!(reloaded.discover(&own_only).unwrap().len(), 1);
+        // With external discovery on, every chat is listed once.
+        assert_eq!(source.discover(&request()).unwrap().len(), 2);
     }
 
     #[test]

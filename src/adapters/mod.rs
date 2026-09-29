@@ -47,8 +47,8 @@ pub use cursor::{
     CursorInvocation, CursorStreamEvent,
 };
 pub use cursor_history::{
-    default_cursor_chats_dir, default_cursor_versions_dir, inspect_cursor_history,
-    parse_lsof_store_files, CursorHistorySource,
+    default_cursor_chats_dir, default_cursor_ownership_path, default_cursor_versions_dir,
+    inspect_cursor_history, parse_lsof_store_files, CursorHistorySource, CursorOwnership,
 };
 #[cfg(target_os = "linux")]
 pub use cursor_managed::{default_cursor_state_dir, CursorSource, CursorSupervisor};
