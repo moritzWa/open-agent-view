@@ -6,8 +6,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{
-    is_active_session_state, project_group_path, App, ComposerMode, ConfirmTarget, Overlay,
-    SelectionKey, ViewMode, HIDDEN_PICKER_PAGE_SIZE, MIGRATION_PICKER_PAGE_SIZE,
+    hidden_picker_rows_for_height, is_active_session_state, project_group_path, App, ComposerMode,
+    ConfirmTarget, Overlay, SelectionKey, ViewMode, MIGRATION_PICKER_PAGE_SIZE,
     MODEL_PICKER_PAGE_SIZE,
 };
 use crate::domain::{AgentSession, Capability, Provider, SessionState};
@@ -910,7 +910,7 @@ fn help_actions(app: &App) -> Vec<String> {
         actions.push("ctrl+m to migrate session".into());
     }
     actions.push("ctrl+f to filter".into());
-    actions.push("ctrl+g to search and restore hidden sessions".into());
+    actions.push("ctrl+g or /hidden to search and restore hidden sessions".into());
     actions.push("/filter text to filter sessions".into());
     actions.push("ctrl+j for newline".into());
     actions.push("tab for new task/harness picker".into());
@@ -1153,12 +1153,12 @@ fn render_migration_target_picker(frame: &mut Frame<'_>, app: &App, area: Rect) 
     );
 }
 
+const HIDDEN_PICKER_MIN_NAME_WIDTH: usize = 8;
+
 fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let choices = app.hidden_choices();
     let popup_width = area.width.saturating_sub(2).min(84).max(30);
-    let visible_rows = HIDDEN_PICKER_PAGE_SIZE
-        .min(area.height.saturating_sub(7).max(1) as usize)
-        .max(1);
+    let visible_rows = hidden_picker_rows_for_height(area.height);
     let result_rows = choices.len().clamp(1, visible_rows);
     let popup_height = (result_rows as u16 + 4)
         .min(area.height.saturating_sub(2))
@@ -1196,7 +1196,8 @@ fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         )));
     } else {
         let now = SystemTime::now();
-        let inner_width = popup_width.saturating_sub(4) as usize;
+        // Inside the borders, each row is " › " + name + tail.
+        let inner_width = popup_width.saturating_sub(2) as usize;
         lines.extend(
             choices
                 .iter()
@@ -1217,9 +1218,14 @@ fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                         .ok();
                     let age = format!("hidden {} ago", format_age(hidden_for));
                     let name = sanitize_inline(record.name.as_deref().unwrap_or(&record.id));
-                    let tail = format!("  {provider} · {age}");
+                    let mut tail = format!("  {provider} · {age}");
+                    if inner_width < display_width(&tail) + 3 + HIDDEN_PICKER_MIN_NAME_WIDTH {
+                        // Narrow popup: keep the age and drop the harness
+                        // rather than pushing the suffix past the border.
+                        tail = format!("  {age}");
+                    }
                     let name_width = inner_width.saturating_sub(display_width(&tail) + 3);
-                    let name = truncate(&name, name_width.max(8));
+                    let name = truncate(&name, name_width.max(1));
                     Line::from(format!(
                         " {} {name}{tail}",
                         if selected { "›" } else { " " }
@@ -1994,6 +2000,33 @@ mod tests {
 
         assert!(rendered.contains("tab harness · shift+tab model"));
         assert!(!rendered.contains("warning: history is bounded"));
+    }
+
+    #[test]
+    fn narrow_hidden_picker_keeps_the_age_suffix_inside_the_border() {
+        let mut app = App::new(SessionSnapshot::default());
+        let hidden_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        app.open_hidden_picker(vec![crate::hidden::HiddenSessionRecord {
+            id: "claude:host:abc".into(),
+            provider: Some(Provider::Claude),
+            name: Some("a very long hidden session name that cannot fit".into()),
+            hidden_at_ms,
+        }]);
+        let backend = TestBackend::new(32, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let rendered = buffer_text(terminal.backend().buffer());
+        let row = rendered
+            .lines()
+            .find(|line| line.contains('›'))
+            .expect("selected picker row");
+        assert!(row.contains("hidden"), "{row}");
+        assert!(row.contains(" ago"), "{row}");
+        assert!(row.trim_end().ends_with('│'), "{row}");
     }
 
     #[test]

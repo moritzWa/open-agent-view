@@ -24,6 +24,14 @@ pub const SESSION_PAGE_SIZE: usize = 25;
 pub const MODEL_PICKER_PAGE_SIZE: usize = 10;
 pub const MIGRATION_PICKER_PAGE_SIZE: usize = 10;
 pub const HIDDEN_PICKER_PAGE_SIZE: usize = 10;
+
+/// Result rows the hidden-session picker can show in a terminal of `height`
+/// rows. Rendering and PageUp/PageDown share it so a page is what fits.
+pub fn hidden_picker_rows_for_height(height: u16) -> usize {
+    HIDDEN_PICKER_PAGE_SIZE
+        .min(usize::from(height.saturating_sub(7).max(1)))
+        .max(1)
+}
 const MAX_SESSION_NAME_BYTES: usize = 240;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,6 +177,7 @@ pub struct App {
     pub hidden_candidates: Vec<HiddenSessionRecord>,
     pub hidden_filter: String,
     pub hidden_selection: usize,
+    hidden_picker_rows: usize,
     pub models_loading: bool,
     pub models_provider: Option<Provider>,
     pub models_error: Option<String>,
@@ -244,6 +253,7 @@ impl App {
             hidden_candidates: Vec::new(),
             hidden_filter: String::new(),
             hidden_selection: 0,
+            hidden_picker_rows: HIDDEN_PICKER_PAGE_SIZE,
             models_loading: false,
             models_provider: None,
             models_error: None,
@@ -274,7 +284,7 @@ impl App {
     }
 
     pub fn replace_snapshot(&mut self, snapshot: SessionSnapshot) {
-        let previous_keys = self.selectable_keys();
+        let previous_keys = self.ordered_keys();
         self.snapshot = snapshot;
         self.rebuild_snapshot_cache();
         self.refreshed_at = SystemTime::now();
@@ -312,6 +322,26 @@ impl App {
                 if visible < group.sessions.len() {
                     keys.push(SelectionKey::ShowMore(group.key.clone()));
                 }
+            }
+        }
+        keys
+    }
+
+    /// Every row in list order, including sessions beyond a group's current
+    /// page. Used to find the row that slides up into view after a removal,
+    /// which the paged `selectable_keys` would skip.
+    fn ordered_keys(&self) -> Vec<SelectionKey> {
+        let mut keys = Vec::new();
+        for group in self.groups() {
+            keys.push(SelectionKey::Group(group.key.clone()));
+            keys.extend(
+                group
+                    .sessions
+                    .iter()
+                    .map(|index| SelectionKey::Session(self.snapshot.sessions[*index].id.clone())),
+            );
+            if self.visible_session_count(group) < group.sessions.len() {
+                keys.push(SelectionKey::ShowMore(group.key.clone()));
             }
         }
         keys
@@ -406,6 +436,12 @@ impl App {
             .sessions
             .get(index)
             .filter(|session| &session.id == id)
+    }
+
+    /// Whether the latest snapshot contains `session_id`, even when the
+    /// current filter keeps it out of every group.
+    pub fn snapshot_contains(&self, session_id: &str) -> bool {
+        self.session_indices.contains_key(session_id)
     }
 
     pub fn select_and_reveal_session(&mut self, session_id: &str) -> bool {
@@ -1077,6 +1113,12 @@ impl App {
     }
 
     pub fn push_input(&mut self, character: char) {
+        let picker_filter = matches!(self.overlay, Overlay::ModelPicker | Overlay::HiddenPicker);
+        if picker_filter && matches!(character, '\n' | '\r') {
+            // Search fields are single-line; ctrl+j must not insert a newline
+            // that renders as an invisible, unmatchable filter character.
+            return;
+        }
         if self.overlay == Overlay::ModelPicker {
             self.model_filter.push(character);
             self.reconcile_model_selection();
@@ -1343,6 +1385,12 @@ impl App {
             (self.hidden_selection as isize + delta).rem_euclid(len as isize) as usize;
     }
 
+    /// Record how many result rows the picker renders for the current
+    /// terminal height, so paging moves by what is actually on screen.
+    pub fn set_hidden_picker_rows(&mut self, rows: usize) {
+        self.hidden_picker_rows = rows.clamp(1, HIDDEN_PICKER_PAGE_SIZE);
+    }
+
     pub fn move_hidden_page(&mut self, delta: isize) {
         let len = self.hidden_choices().len();
         if len == 0 {
@@ -1350,7 +1398,7 @@ impl App {
             return;
         }
         self.hidden_selection = (self.hidden_selection as isize
-            + delta * HIDDEN_PICKER_PAGE_SIZE as isize)
+            + delta * self.hidden_picker_rows as isize)
             .clamp(0, len.saturating_sub(1) as isize) as usize;
     }
 
@@ -1484,6 +1532,9 @@ impl App {
                 )),
             },
             "/completed" => return self.select_completed_visibility(argument),
+            // Alternative to ctrl+g, which multiplexers such as Zellij bind
+            // to their own lock mode before OAV can see it.
+            "/hidden" => return AppAction::BrowseHidden,
             "/filter" => {
                 self.set_filter(argument);
                 self.set_notice(if argument.is_empty() {
@@ -1951,6 +2002,25 @@ mod tests {
     }
 
     #[test]
+    fn hiding_the_last_paged_row_selects_the_row_that_slides_into_view() {
+        let mut sessions = (0..26)
+            .map(|index| session(&format!("work-{index:02}"), SessionState::Working))
+            .collect::<Vec<_>>();
+        sessions.push(session("done-a", SessionState::Completed));
+        let mut app = app_with(sessions);
+        assert_eq!(app.visible_session_count(&app.groups()[0].clone()), 25);
+
+        // work-24 is the last row on the page; work-25 sits behind Show more.
+        app.selection = Some(SelectionKey::Session("work-24".into()));
+        remove_session(&mut app, "work-24");
+        assert_eq!(
+            app.selection,
+            Some(SelectionKey::Session("work-25".into())),
+            "the next row in the same group, not the next group"
+        );
+    }
+
+    #[test]
     fn a_still_present_selection_survives_snapshot_replacement() {
         let mut app = app_with(vec![
             session("one", SessionState::Working),
@@ -2044,6 +2114,48 @@ mod tests {
             AppAction::None,
             "esc closes the picker without quitting"
         );
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn picker_filters_ignore_newlines() {
+        let mut app = app_with(vec![]);
+        app.open_hidden_picker(vec![hidden("a", "alpha", Provider::Claude, 1)]);
+        app.push_input('a');
+        app.push_input('\n');
+        app.push_input('\r');
+        assert_eq!(app.hidden_filter, "a");
+        assert_eq!(app.hidden_choices().len(), 1);
+    }
+
+    #[test]
+    fn hidden_picker_pages_by_the_rendered_row_count() {
+        let mut app = app_with(vec![]);
+        app.open_hidden_picker(
+            (0..12)
+                .map(|index| hidden(&format!("id-{index}"), "row", Provider::Claude, index))
+                .collect(),
+        );
+        // A 10-row terminal renders three result rows.
+        app.set_hidden_picker_rows(hidden_picker_rows_for_height(10));
+        app.move_hidden_page(1);
+        assert_eq!(app.hidden_selection, 3);
+        app.move_hidden_page(1);
+        assert_eq!(app.hidden_selection, 6);
+        app.move_hidden_page(-1);
+        assert_eq!(app.hidden_selection, 3);
+
+        app.set_hidden_picker_rows(hidden_picker_rows_for_height(60));
+        app.move_hidden_page(1);
+        assert_eq!(app.hidden_selection, 11, "clamped to the last choice");
+    }
+
+    #[test]
+    fn slash_hidden_opens_the_restore_picker_like_ctrl_g() {
+        let mut app = app_with(vec![]);
+        app.start_new_session(None);
+        app.input = "/hidden".into();
+        assert_eq!(app.activate(), AppAction::BrowseHidden);
         assert_eq!(app.overlay, Overlay::None);
     }
 
