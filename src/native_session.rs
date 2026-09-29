@@ -267,9 +267,15 @@ pub fn is_backgrounded(session_key: &str) -> bool {
             .get_mut(session_key)
             .and_then(|session| session.child.as_mut())
             .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
-        if !alive {
-            registry.remove(session_key);
-        }
+        let dead = if alive {
+            None
+        } else {
+            registry.remove(session_key)
+        };
+        // Dropping a session joins its drain thread; never do that while
+        // other dashboard calls wait on the registry.
+        drop(registry);
+        drop(dead);
         alive
     }
     #[cfg(not(unix))]
@@ -800,6 +806,12 @@ fn restore_dashboard_terminal_modes(stdout: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+/// Pause after an unexpected poll or read error before trying again. Giving
+/// up would leave nobody reading the pseudo-terminal, and the provider would
+/// block once the kernel buffer fills.
+#[cfg(unix)]
+const DRAIN_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
 #[cfg(unix)]
 fn start_output_drain(mut master: std::fs::File, mut screen: vt100::Parser) -> Result<PtyDrain> {
     set_nonblocking(master.as_raw_fd(), true)?;
@@ -809,6 +821,7 @@ fn start_output_drain(mut master: std::fs::File, mut screen: vt100::Parser) -> R
         .name("native-pty-drain".into())
         .spawn(move || {
             let mut bytes = [0_u8; 8192];
+            let mut queries = TerminalQueryScanner::default();
             loop {
                 if flag.load(Ordering::Relaxed) {
                     break;
@@ -821,23 +834,35 @@ fn start_output_drain(mut master: std::fs::File, mut screen: vt100::Parser) -> R
                 let polled = unsafe { libc::poll(&mut descriptor, 1, 50) };
                 if polled < 0 {
                     let error = std::io::Error::last_os_error();
-                    if error.kind() == std::io::ErrorKind::Interrupted {
-                        continue;
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        thread::sleep(DRAIN_ERROR_BACKOFF);
                     }
-                    break;
+                    continue;
                 }
-                if descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+                if descriptor.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
                     continue;
                 }
                 loop {
                     match master.read(&mut bytes) {
                         Ok(0) => return (master, screen),
-                        Ok(count) => screen.process(&bytes[..count]),
+                        Ok(count) => {
+                            process_detached_output(
+                                &bytes[..count],
+                                &mut screen,
+                                &mut queries,
+                                &mut master,
+                            );
+                        }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                        // EIO: every process holding the terminal has exited.
                         Err(error) if error.raw_os_error() == Some(libc::EIO) => {
                             return (master, screen);
                         }
-                        Err(_) => return (master, screen),
+                        Err(_) => {
+                            thread::sleep(DRAIN_ERROR_BACKOFF);
+                            break;
+                        }
                     }
                 }
             }
@@ -853,6 +878,111 @@ fn start_output_drain(mut master: std::fs::File, mut screen: vt100::Parser) -> R
         })
         .context("failed to keep the provider terminal running")?;
     Ok(PtyDrain { stop, done })
+}
+
+/// Feed detached output to the screen and answer the terminal queries a
+/// visible terminal would, so a provider that asks for its cursor position
+/// does not stall until its own timeout while the dashboard is in front.
+#[cfg(unix)]
+fn process_detached_output(
+    bytes: &[u8],
+    screen: &mut vt100::Parser,
+    queries: &mut TerminalQueryScanner,
+    reply: &mut impl Write,
+) {
+    let mut processed = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        let Some(query) = queries.feed(*byte) else {
+            continue;
+        };
+        // Answer from the screen exactly as it stood when the query arrived.
+        screen.process(&bytes[processed..=index]);
+        processed = index + 1;
+        let answer = match query {
+            TerminalQuery::CursorPosition => {
+                let (row, column) = screen.screen().cursor_position();
+                format!("\x1b[{};{}R", u32::from(row) + 1, u32::from(column) + 1)
+            }
+            TerminalQuery::PrimaryAttributes => "\x1b[?1;2c".to_owned(),
+        };
+        let _ = reply.write_all(answer.as_bytes());
+    }
+    screen.process(&bytes[processed..]);
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalQuery {
+    /// `CSI 6 n`
+    CursorPosition,
+    /// `CSI c` or `CSI 0 c`
+    PrimaryAttributes,
+}
+
+/// Incremental CSI scanner, so a query split across two reads is still seen.
+#[cfg(unix)]
+#[derive(Default)]
+struct TerminalQueryScanner {
+    state: QueryScanState,
+    parameters: Vec<u8>,
+}
+
+#[cfg(unix)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum QueryScanState {
+    #[default]
+    Ground,
+    Escape,
+    Csi,
+}
+
+#[cfg(unix)]
+impl TerminalQueryScanner {
+    const MAX_PARAMETERS: usize = 16;
+
+    fn feed(&mut self, byte: u8) -> Option<TerminalQuery> {
+        match self.state {
+            QueryScanState::Ground => {
+                if byte == 0x1b {
+                    self.state = QueryScanState::Escape;
+                }
+                None
+            }
+            QueryScanState::Escape => {
+                self.state = match byte {
+                    b'[' => {
+                        self.parameters.clear();
+                        QueryScanState::Csi
+                    }
+                    0x1b => QueryScanState::Escape,
+                    _ => QueryScanState::Ground,
+                };
+                None
+            }
+            QueryScanState::Csi => match byte {
+                0x30..=0x3f if self.parameters.len() < Self::MAX_PARAMETERS => {
+                    self.parameters.push(byte);
+                    None
+                }
+                0x40..=0x7e => {
+                    self.state = QueryScanState::Ground;
+                    match (byte, self.parameters.as_slice()) {
+                        (b'n', b"6") => Some(TerminalQuery::CursorPosition),
+                        (b'c', b"" | b"0") => Some(TerminalQuery::PrimaryAttributes),
+                        _ => None,
+                    }
+                }
+                0x1b => {
+                    self.state = QueryScanState::Escape;
+                    None
+                }
+                _ => {
+                    self.state = QueryScanState::Ground;
+                    None
+                }
+            },
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1492,6 +1622,108 @@ mod tests {
         assert!(contents.contains("tick-5"), "{contents}");
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn detached_output_answers_cursor_and_attribute_queries_across_reads() {
+        let mut screen = vt100::Parser::new(24, 80, 0);
+        let mut queries = TerminalQueryScanner::default();
+        let mut replies = Vec::new();
+        // The cursor query is split across two reads, and output after it in
+        // the same read must not move the reported position.
+        process_detached_output(
+            b"\x1b[3;5Habc\x1b[",
+            &mut screen,
+            &mut queries,
+            &mut replies,
+        );
+        assert!(replies.is_empty());
+        process_detached_output(b"6nlater", &mut screen, &mut queries, &mut replies);
+        assert_eq!(replies, b"\x1b[3;8R");
+        replies.clear();
+        process_detached_output(b"\x1b[c\x1b", &mut screen, &mut queries, &mut replies);
+        process_detached_output(b"[0c", &mut screen, &mut queries, &mut replies);
+        assert_eq!(replies, b"\x1b[?1;2c\x1b[?1;2c");
+        replies.clear();
+        // Private and secondary variants, and ordinary sequences, are not ours.
+        process_detached_output(
+            b"\x1b[?6n\x1b[>c\x1b[16n\x1b[2J",
+            &mut screen,
+            &mut queries,
+            &mut replies,
+        );
+        assert!(replies.is_empty());
+        assert!(screen.screen().contents().is_empty());
+    }
+
+    #[cfg(unix)]
+    fn detach_for_test(session_key: &str, script: &str) -> u32 {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        let (child, master) = spawn_pty(&mut command).unwrap();
+        let pid = child.id();
+        let drain = start_output_drain(master, vt100::Parser::new(24, 80, 0)).unwrap();
+        detached_registry().lock().unwrap().insert(
+            session_key.to_owned(),
+            DetachedSession {
+                child: Some(child),
+                warning: None,
+                drain: Some(drain),
+            },
+        );
+        pid
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn detached_provider_keeps_writing_past_the_terminal_buffer_and_resumes() {
+        let marker = std::env::temp_dir().join(format!(
+            "oav-detached-output-{}-{}",
+            std::process::id(),
+            new_session_id().unwrap()
+        ));
+        let key = "provider:host:detached-large-output";
+        // ~200 KB is far past any kernel pseudo-terminal buffer: without a
+        // reader the provider would block before touching the marker.
+        let script = format!(
+            "i=0; while [ \"$i\" -lt 2000 ]; do printf '%0100d\\n' \"$i\"; i=$((i+1)); done; \
+             printf 'LARGE_OUTPUT_DONE'; : > '{}'; exec sleep 30",
+            marker.display()
+        );
+        detach_for_test(key, &script);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "detached provider blocked on output"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(&marker);
+        assert!(is_backgrounded(key));
+        let detached = take_detached(key)
+            .unwrap()
+            .expect("provider is still running");
+        let (mut child, _master, screen, _warning) = detached.into_frontend().unwrap();
+        let contents = screen.screen().contents();
+        assert!(contents.contains("LARGE_OUTPUT_DONE"), "{contents}");
+        signal_group(child.id(), libc::SIGKILL);
+        let _ = child.wait();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn provider_that_exits_while_detached_is_not_resumed() {
+        let key = "provider:host:detached-exit";
+        detach_for_test(key, "printf bye; exit 0");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while is_backgrounded(key) {
+            assert!(Instant::now() < deadline, "exited provider still listed");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(take_detached(key).unwrap().is_none());
+        assert!(!detached_session_keys().iter().any(|item| item == key));
     }
 
     #[test]

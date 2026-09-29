@@ -14,6 +14,8 @@ and future released versions are intended to follow Semantic Versioning.
   freezes that process. A Cursor turn (and any other native CLI opened from a
   row) keeps running on its own terminal, so several agents can work at once.
   Enter on the same row shows the screen it has produced since.
+  While in the background it still answers cursor-position and device
+  attribute queries, so a provider that asks for them does not stall.
 
 ## [0.1.53] - 2026-09-04
 
