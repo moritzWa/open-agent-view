@@ -450,6 +450,9 @@ fn run_pty_outer(provider: &str, test_name: &str, marker: &str, ready: &[u8]) {
             break;
         }
         assert!(Instant::now() < deadline, "controller child did not exit");
+        // Keep reading: a macOS session leader cannot finish exiting while its
+        // controlling terminal still holds output nobody has read.
+        drain_available(&mut master, &mut output);
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -518,6 +521,16 @@ fn set_nonblocking(file: &File) {
         unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
         0
     );
+}
+
+fn drain_available(master: &mut File, output: &mut Vec<u8>) {
+    let mut bytes = [0_u8; 4096];
+    while let Ok(count) = master.read(&mut bytes) {
+        if count == 0 {
+            break;
+        }
+        output.extend_from_slice(&bytes[..count]);
+    }
 }
 
 fn read_until(master: &mut File, output: &mut Vec<u8>, needle: &[u8], timeout: Duration) {
