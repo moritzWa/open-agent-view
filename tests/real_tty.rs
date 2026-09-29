@@ -167,6 +167,8 @@ fn serialize_real_tty_test() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+const DA1_QUERY: &[u8] = b"\x1b[c";
+
 struct PtyApp {
     child: Child,
     master: File,
@@ -349,7 +351,14 @@ impl PtyApp {
                 Ok(0) => break,
                 Ok(count) => {
                     self.parser.process(&buffer[..count]);
+                    let scan_from = self.raw.len().saturating_sub(DA1_QUERY.len() - 1);
                     self.raw.extend_from_slice(&buffer[..count]);
+                    // Answer primary device attributes like every real
+                    // terminal does, so the startup background query ends on
+                    // the reply instead of its deadline.
+                    for _ in 0..count_bytes(&self.raw[scan_from..], DA1_QUERY) {
+                        self.send(b"\x1b[?1;2c");
+                    }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 // Linux PTY masters report EIO after the slave side closes.

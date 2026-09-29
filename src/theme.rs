@@ -115,6 +115,9 @@ pub struct SchemeWatcher {
 
 impl SchemeWatcher {
     const POLL_INTERVAL: Duration = Duration::from_secs(2);
+    /// A lookup that fails this many times in a row (no `defaults`, `reg`, or
+    /// desktop session) is not going to start working, so polling stops.
+    const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 
     /// Starts polling for `auto`; explicit preferences never change.
     pub fn spawn(preference: ThemePreference) -> Option<Self> {
@@ -127,15 +130,14 @@ impl SchemeWatcher {
         thread::Builder::new()
             .name("theme-watcher".into())
             .spawn(move || {
-                let mut previous = os_color_scheme();
-                while !stop_flag.load(Ordering::Relaxed) {
-                    thread::sleep(Self::POLL_INTERVAL);
-                    if let Some(scheme) = scheme_change(&mut previous, os_color_scheme()) {
-                        if tx.send(scheme).is_err() {
-                            break;
-                        }
-                    }
-                }
+                watch_appearance(
+                    os_color_scheme,
+                    || {
+                        thread::sleep(Self::POLL_INTERVAL);
+                        !stop_flag.load(Ordering::Relaxed)
+                    },
+                    |scheme| tx.send(scheme).is_ok(),
+                );
             })
             .ok()?;
         Some(Self { changes, stop })
@@ -154,6 +156,37 @@ impl SchemeWatcher {
 impl Drop for SchemeWatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Polls `lookup` after each `wait` until `wait` or `report` returns false,
+/// reporting real appearance changes, or until the lookup keeps failing.
+fn watch_appearance(
+    mut lookup: impl FnMut() -> Option<ColorScheme>,
+    mut wait: impl FnMut() -> bool,
+    mut report: impl FnMut(ColorScheme) -> bool,
+) {
+    let mut previous = None;
+    let mut failures = 0;
+    let mut observed = lookup();
+    loop {
+        if observed.is_none() {
+            failures += 1;
+            if failures >= SchemeWatcher::MAX_CONSECUTIVE_FAILURES {
+                return;
+            }
+        } else {
+            failures = 0;
+        }
+        if let Some(scheme) = scheme_change(&mut previous, observed) {
+            if !report(scheme) {
+                return;
+            }
+        }
+        if !wait() {
+            return;
+        }
+        observed = lookup();
     }
 }
 
@@ -242,6 +275,28 @@ pub(crate) fn scheme_from_gnome_color_scheme(value: &str) -> Option<ColorScheme>
     }
 }
 
+/// Without a desktop session (for example over ssh) GSettings falls back to
+/// its in-memory backend and prints the schema default, which says nothing
+/// about the user's appearance.
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+pub(crate) fn desktop_session_present(
+    wayland_display: Option<&std::ffi::OsStr>,
+    display: Option<&std::ffi::OsStr>,
+) -> bool {
+    [wayland_display, display]
+        .into_iter()
+        .any(|value| value.is_some_and(|value| !value.is_empty()))
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+pub(crate) fn scheme_from_gsettings(stdout: &str, stderr: &str) -> Option<ColorScheme> {
+    // GLib warns "Using the 'memory' GSettings backend" when it has no real store.
+    if stderr.to_ascii_lowercase().contains("memory") {
+        return None;
+    }
+    scheme_from_gnome_color_scheme(stdout)
+}
+
 fn os_color_scheme() -> Option<ColorScheme> {
     #[cfg(target_os = "macos")]
     {
@@ -267,13 +322,22 @@ fn os_color_scheme() -> Option<ColorScheme> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        if !desktop_session_present(
+            std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+            std::env::var_os("DISPLAY").as_deref(),
+        ) {
+            return None;
+        }
         let mut command = Command::new("gsettings");
         command.args(["get", "org.gnome.desktop.interface", "color-scheme"]);
         let output = command_output(command, Duration::from_millis(500))?;
         if !output.status.success() {
             return None;
         }
-        return scheme_from_gnome_color_scheme(&String::from_utf8_lossy(&output.stdout));
+        return scheme_from_gsettings(
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        );
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -335,22 +399,27 @@ fn query_terminal_background_unix() -> Option<(u8, u8, u8)> {
     }
     let _guard = TermiosGuard { fd, original };
 
+    // DA1 follows the OSC 11 query. Every terminal answers DA1, and answers in
+    // order, so its reply marks the end of anything the terminal will send
+    // back: a terminal without OSC 11 support costs one round trip, and a
+    // slow link (ssh, tmux, mosh) is waited out instead of leaking a late
+    // reply into the dashboard as keystrokes.
     let mut stdout = io::stdout().lock();
-    stdout.write_all(b"\x1b]11;?\x1b\\").ok()?;
+    stdout.write_all(b"\x1b]11;?\x1b\\\x1b[c").ok()?;
     stdout.flush().ok()?;
     drop(stdout);
 
-    let mut buffer = [0u8; 160];
+    let mut buffer = [0u8; 256];
     let mut filled = 0usize;
     let started = Instant::now();
-    let timeout = Duration::from_millis(100);
-    while started.elapsed() < timeout && filled < buffer.len() {
+    let deadline = Duration::from_millis(500);
+    while started.elapsed() < deadline && filled < buffer.len() {
         let mut pollfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
         };
-        let remaining = timeout.saturating_sub(started.elapsed()).as_millis() as i32;
+        let remaining = deadline.saturating_sub(started.elapsed()).as_millis() as i32;
         if unsafe { libc::poll(&mut pollfd, 1, remaining.max(1)) } <= 0 {
             break;
         }
@@ -365,7 +434,7 @@ fn query_terminal_background_unix() -> Option<(u8, u8, u8)> {
             break;
         }
         filled += read as usize;
-        if parse_osc11(&buffer[..filled]).is_some() {
+        if contains_da1_reply(&buffer[..filled]) {
             break;
         }
     }
@@ -381,24 +450,31 @@ struct TermiosGuard {
 #[cfg(unix)]
 impl Drop for TermiosGuard {
     fn drop(&mut self) {
+        // Discard any reply that arrives after the deadline so it never
+        // reaches the dashboard as input.
         unsafe {
+            libc::tcflush(self.fd, libc::TCIFLUSH);
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
         }
     }
 }
 
+/// Parses a complete `ESC ] 11 ; rgb:R/G/B` reply terminated by BEL or
+/// `ESC \`. Bytes around it (typed keys, the DA1 reply) are ignored; a reply
+/// without its terminator is rejected.
 pub(crate) fn parse_osc11(bytes: &[u8]) -> Option<(u8, u8, u8)> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    let rest = text.get(text.find("rgb:")? + 4..)?;
-    let payload_end = rest
-        .find(|character: char| {
-            character == '\u{7}'
-                || character == '\\'
-                || character == '\u{1b}'
-                || character.is_whitespace()
-        })
-        .unwrap_or(rest.len());
-    let mut channels = rest[..payload_end].split('/');
+    const PREFIX: &[u8] = b"\x1b]11;";
+    let start = bytes
+        .windows(PREFIX.len())
+        .position(|window| window == PREFIX)?
+        + PREFIX.len();
+    let rest = &bytes[start..];
+    let end = rest.iter().position(|&byte| byte == 0x07 || byte == 0x1b)?;
+    if rest[end] == 0x1b && rest.get(end + 1) != Some(&b'\\') {
+        return None;
+    }
+    let payload = std::str::from_utf8(&rest[..end]).ok()?;
+    let mut channels = payload.strip_prefix("rgb:")?.split('/');
     let red = scale_hex(channels.next()?)?;
     let green = scale_hex(channels.next()?)?;
     let blue = scale_hex(channels.next()?)?;
@@ -406,6 +482,17 @@ pub(crate) fn parse_osc11(bytes: &[u8]) -> Option<(u8, u8, u8)> {
         return None;
     }
     Some((red, green, blue))
+}
+
+/// Whether `bytes` holds a primary device attributes reply, `ESC [ ? … c`.
+pub(crate) fn contains_da1_reply(bytes: &[u8]) -> bool {
+    bytes.windows(3).enumerate().any(|(index, window)| {
+        window == b"\x1b[?"
+            && bytes[index + 3..]
+                .iter()
+                .find(|byte| !(byte.is_ascii_digit() || **byte == b';'))
+                == Some(&b'c')
+    })
 }
 
 fn scale_hex(hex: &str) -> Option<u8> {
@@ -471,6 +558,14 @@ mod tests {
         );
         assert_eq!(scheme_from_colorfgbg(Some("0;7")), Some(ColorScheme::Light));
         assert_eq!(scheme_from_colorfgbg(Some("default")), None);
+        assert_eq!(
+            scheme_from_colorfgbg(Some("15;default;0")),
+            Some(ColorScheme::Dark)
+        );
+        assert_eq!(
+            scheme_from_colorfgbg(Some("0;default;15")),
+            Some(ColorScheme::Light)
+        );
         assert_eq!(scheme_from_colorfgbg(None), None);
     }
 
@@ -486,6 +581,107 @@ mod tests {
         );
         assert_eq!(parse_osc11(b"\x1b]11;rgb:ff/00/00\x07"), Some((255, 0, 0)));
         assert_eq!(parse_osc11(b"not a color"), None);
+    }
+
+    #[test]
+    fn osc11_requires_the_reply_terminator() {
+        assert_eq!(parse_osc11(b"\x1b]11;rgb:ffff/ffff/ff"), None);
+        assert_eq!(parse_osc11(b"\x1b]11;rgb:ffff/ffff/ffff"), None);
+        assert_eq!(parse_osc11(b"\x1b]11;rgb:ffff/ffff/ffff\x1b"), None);
+        assert_eq!(parse_osc11(b"\x1b]11;rgb:ffff/ffff/ffff\x1b["), None);
+    }
+
+    #[test]
+    fn osc11_ignores_input_interleaved_with_the_reply() {
+        assert_eq!(
+            parse_osc11(b"ab\x1b]11;rgb:ffff/ffff/ffff\x07\x1b[?62;22c"),
+            Some((255, 255, 255))
+        );
+        assert_eq!(
+            parse_osc11(b"\x1b[A\xff\x1b]11;rgb:0000/0000/0000\x1b\\x\x1b[?1;2c"),
+            Some((0, 0, 0))
+        );
+        assert_eq!(parse_osc11(b"typed rgb:ffff/ffff/ffff\x07"), None);
+    }
+
+    #[test]
+    fn da1_reply_ends_the_background_query() {
+        assert!(contains_da1_reply(b"\x1b[?62;22c"));
+        assert!(contains_da1_reply(
+            b"\x1b]11;rgb:ffff/ffff/ffff\x07\x1b[?1;2c"
+        ));
+        assert!(contains_da1_reply(b"x\x1b[?6c"));
+        assert!(!contains_da1_reply(b"\x1b[?62;22"));
+        assert!(!contains_da1_reply(b"\x1b]11;rgb:ffff/ffff/ffff\x07"));
+        assert!(!contains_da1_reply(b"\x1b[?62;x c"));
+        assert!(!contains_da1_reply(b"\x1b[?"));
+    }
+
+    #[test]
+    fn watcher_stops_after_repeated_failed_lookups() {
+        let mut lookups = 0;
+        let mut waits = 0;
+        watch_appearance(
+            || {
+                lookups += 1;
+                None
+            },
+            || {
+                waits += 1;
+                waits < 100
+            },
+            |_| true,
+        );
+        assert_eq!(lookups, SchemeWatcher::MAX_CONSECUTIVE_FAILURES);
+    }
+
+    #[test]
+    fn watcher_reports_changes_and_tolerates_isolated_failures() {
+        let readings = [
+            Some(ColorScheme::Dark),
+            None,
+            None,
+            None,
+            None,
+            Some(ColorScheme::Light),
+            None,
+            Some(ColorScheme::Light),
+            Some(ColorScheme::Dark),
+        ];
+        let mut next = readings.iter().copied();
+        let mut reported = Vec::new();
+        watch_appearance(
+            || next.next().flatten(),
+            || true,
+            |scheme| {
+                reported.push(scheme);
+                true
+            },
+        );
+        assert_eq!(reported, vec![ColorScheme::Light, ColorScheme::Dark]);
+    }
+
+    #[test]
+    fn headless_gsettings_does_not_count_as_light() {
+        use std::ffi::OsStr;
+        assert!(!desktop_session_present(None, None));
+        assert!(!desktop_session_present(
+            Some(OsStr::new("")),
+            Some(OsStr::new(""))
+        ));
+        assert!(desktop_session_present(None, Some(OsStr::new(":0"))));
+        assert!(desktop_session_present(Some(OsStr::new("wayland-0")), None));
+        assert_eq!(
+            scheme_from_gsettings(
+                "'default'\n",
+                "(process:1): GLib-GIO-WARNING **: Using the 'memory' GSettings backend.\n"
+            ),
+            None
+        );
+        assert_eq!(
+            scheme_from_gsettings("'prefer-dark'\n", ""),
+            Some(ColorScheme::Dark)
+        );
     }
 
     #[test]
