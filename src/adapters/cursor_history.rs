@@ -143,8 +143,10 @@ pub fn inspect_cursor_history(chats_root: &Path, session: &AgentSession) -> Resu
         .find(|chat| chat.id == session.provider_session_id)
         .with_context(|| format!("Cursor chat {} was not found on disk", session.name))?;
     let prompts = read_prompt_history(&chat.dir)?;
+    // The peek panel shows the tail, so the newest prompt goes last.
     let mut lines = vec![
         format!("{} · {}", chat.title, chat.cwd.display()),
+        "Open the row to resume the chat in Cursor.".into(),
         String::new(),
     ];
     if prompts.is_empty() {
@@ -155,8 +157,6 @@ pub fn inspect_cursor_history(chats_root: &Path, session: &AgentSession) -> Resu
             lines.push(format!("❯ {}", sanitize(prompt, 400, "(empty prompt)")));
         }
     }
-    lines.push(String::new());
-    lines.push("Open the row to resume the chat in Cursor.".into());
     Ok(lines.join("\n"))
 }
 
@@ -752,6 +752,7 @@ mod tests {
         let newest = text.find("newest prompt here").unwrap();
         assert!(older < newest);
         assert!(text.contains("Open the row to resume"));
+        assert!(text.trim_end().ends_with("newest prompt here"));
     }
 
     fn filetime_old() -> SystemTime {
