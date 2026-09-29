@@ -23,6 +23,19 @@ pub const SESSION_PAGE_SIZE: usize = 25;
 pub const MODEL_PICKER_PAGE_SIZE: usize = 10;
 pub const MIGRATION_PICKER_PAGE_SIZE: usize = 10;
 const MAX_SESSION_NAME_BYTES: usize = 240;
+/// Slash commands the new-task composer runs instead of launching a session.
+/// Keep in sync with `App::submit_new_session`.
+const DASHBOARD_COMMANDS: &[&str] = &[
+    "/help",
+    "/harness",
+    "/provider",
+    "/model",
+    "/shell",
+    "/login",
+    "/setup",
+    "/completed",
+    "/filter",
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Overlay {
@@ -1078,13 +1091,46 @@ impl App {
         if self.overlay == Overlay::None {
             self.start_new_session(None);
         }
+        let single_line = self.input_is_single_line();
         for character in text.chars() {
-            if character == '\n' && self.overlay == Overlay::ModelPicker {
+            if single_line && matches!(character, '\n' | '\t') {
                 self.push_input(' ');
             } else {
                 self.push_input(character);
             }
         }
+    }
+
+    /// The model filter, session filter, local rename, and migration name are
+    /// one-line fields: a line break or tab can never match or be accepted
+    /// there, so a paste turns them into spaces.
+    fn input_is_single_line(&self) -> bool {
+        matches!(
+            self.overlay,
+            Overlay::ModelPicker
+                | Overlay::Composer(
+                    ComposerMode::Filter
+                        | ComposerMode::Rename { .. }
+                        | ComposerMode::MigrationName { .. }
+                )
+        )
+    }
+
+    /// Whether Enter would run a dashboard slash command rather than launch
+    /// the draft. Only the command names `submit_new_session` handles count,
+    /// so a pasted first line such as an absolute path is still a paste.
+    pub fn draft_is_dashboard_command(&self) -> bool {
+        if self.overlay != Overlay::Composer(ComposerMode::NewSession) {
+            return false;
+        }
+        let command = self
+            .input
+            .trim()
+            .split(char::is_whitespace)
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        DASHBOARD_COMMANDS.contains(&command.as_str())
     }
 
     pub fn pop_input(&mut self) {
@@ -1701,6 +1747,70 @@ mod tests {
 
         assert_eq!(app.overlay, Overlay::ModelPicker);
         assert_eq!(app.model_filter, "sonnet opus");
+    }
+
+    #[test]
+    fn pasting_into_single_line_fields_turns_line_breaks_and_tabs_into_spaces() {
+        let single_line_overlays = [
+            Overlay::ModelPicker,
+            Overlay::Composer(ComposerMode::Filter),
+            Overlay::Composer(ComposerMode::Rename {
+                session_id: "one".into(),
+            }),
+            Overlay::Composer(ComposerMode::MigrationName {
+                session_id: "one".into(),
+                target: Provider::Codex,
+            }),
+        ];
+        for overlay in single_line_overlays {
+            let mut app = App::new(SessionSnapshot {
+                sessions: vec![session("one", SessionState::Working)],
+                warnings: vec![],
+            });
+            app.overlay = overlay.clone();
+
+            app.paste_input("alpha\r\nbeta\tgamma\n");
+
+            let field = if overlay == Overlay::ModelPicker {
+                &app.model_filter
+            } else {
+                &app.input
+            };
+            assert_eq!(field, "alpha beta gamma ", "{overlay:?}");
+        }
+
+        let mut app = App::new(SessionSnapshot::default());
+        app.start_new_session(None);
+        app.paste_input("alpha\nbeta\tgamma");
+        assert_eq!(app.input, "alpha\nbeta\tgamma");
+    }
+
+    #[test]
+    fn only_known_dashboard_commands_count_as_commands() {
+        for command in DASHBOARD_COMMANDS {
+            let mut app = App::new(SessionSnapshot::default());
+            app.start_new_session(None);
+            app.input = format!("{} codex", command.to_ascii_uppercase());
+            assert!(app.draft_is_dashboard_command(), "{command}");
+
+            app.submit_new_session(command.to_string());
+            assert!(
+                !app.notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.starts_with("unknown dashboard command")),
+                "{command} is not handled by submit_new_session"
+            );
+        }
+
+        let mut app = App::new(SessionSnapshot::default());
+        app.start_new_session(None);
+        for draft in ["/Users/me/notes.txt", "/tmp", "/", "fix /help", ""] {
+            app.input = draft.into();
+            assert!(!app.draft_is_dashboard_command(), "{draft}");
+        }
+        app.input = "/help".into();
+        app.overlay = Overlay::Composer(ComposerMode::Filter);
+        assert!(!app.draft_is_dashboard_command());
     }
 
     #[test]

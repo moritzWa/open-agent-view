@@ -257,6 +257,13 @@ impl PtyApp {
     fn send(&mut self, bytes: &[u8]) {
         self.master.write_all(bytes).expect("write key to PTY");
         self.master.flush().expect("flush PTY input");
+        if bytes.last() == Some(&b'\r') {
+            // Without bracketed paste, the dashboard treats an Enter with more
+            // input right behind it as a pasted line break. Pause the way a
+            // person does after pressing Enter so the next scripted key does
+            // not arrive inside that paste window.
+            thread::sleep(Duration::from_millis(40));
+        }
     }
 
     fn screen(&mut self) -> String {
@@ -339,6 +346,12 @@ impl PtyApp {
         assert!(
             contains_bytes(&self.raw, b"\x1b[?25l") && contains_bytes(&self.raw, b"\x1b[?25h"),
             "dashboard did not restore cursor visibility"
+        );
+        let last_paste_enable = last_position(&self.raw, b"\x1b[?2004h");
+        assert!(
+            last_paste_enable.is_some_and(|enabled| last_position(&self.raw, b"\x1b[?2004l")
+                .is_some_and(|disabled| disabled > enabled)),
+            "dashboard did not disable bracketed paste on exit"
         );
     }
 
@@ -1391,6 +1404,7 @@ printf '%s\n' 'backgrounded · deadbeef'
     app.wait_for("empty Claude startup", |screen| {
         screen.contains("Open Agent View") && !screen.contains("loading provider sessions")
     });
+    let paste_disables_before = count_bytes(&app.raw, b"\x1b[?2004l");
     app.send(b"build the foreground feature");
     app.send(ENTER);
     app.wait_for("animated Claude bootstrap", |screen| {
@@ -1399,12 +1413,24 @@ printf '%s\n' 'backgrounded · deadbeef'
     app.wait_for("Claude native full-screen attach", |screen| {
         screen.contains("CLAUDE FULL SCREEN ATTACH")
     });
+    // The native harness owns the terminal while attached, so the dashboard
+    // must hand it over with bracketed paste off and re-enable it on return.
+    assert!(
+        count_bytes(&app.raw, b"\x1b[?2004l") > paste_disables_before,
+        "dashboard kept bracketed paste on while handing the terminal to Claude"
+    );
+    let paste_enables_before = count_bytes(&app.raw, b"\x1b[?2004h");
     let enters_before = count_bytes(&app.raw, b"\x1b[?1049h");
     app.send(SHIFT_LEFT);
     app.wait_for_byte_count(
         b"\x1b[?1049h",
         enters_before + 1,
         "dashboard restoration after Claude Left",
+    );
+    app.wait_for_byte_count(
+        b"\x1b[?2004h",
+        paste_enables_before + 1,
+        "bracketed paste re-enabled after Claude Left",
     );
     let returned = app.wait_for("new Claude row selected after backgrounding", |screen| {
         screen.contains("Open Agent View")
@@ -2978,6 +3004,12 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+fn last_position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
 }
 
 fn count_bytes(haystack: &[u8], needle: &[u8]) -> usize {
