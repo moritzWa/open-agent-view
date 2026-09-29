@@ -54,16 +54,18 @@ impl Palette {
         }
     }
 
+    /// Neutral white with the greys and blue of VS Code's default light theme,
+    /// so the dashboard matches a light editor instead of tinting warm.
     pub const fn light() -> Self {
         Self {
-            bg: Color::Rgb(250, 250, 247),
-            fg: Color::Rgb(36, 39, 41),
-            dim: Color::Rgb(96, 100, 104),
-            selected_bg: Color::Rgb(214, 230, 232),
-            selected_fg: Color::Rgb(24, 28, 30),
-            accent: Color::Rgb(12, 122, 132),
-            attention: Color::Rgb(154, 106, 0),
-            complete: Color::Rgb(24, 128, 64),
+            bg: Color::Rgb(255, 255, 255),
+            fg: Color::Rgb(59, 59, 59),
+            dim: Color::Rgb(110, 110, 110),
+            selected_bg: Color::Rgb(232, 232, 232),
+            selected_fg: Color::Rgb(30, 30, 30),
+            accent: Color::Rgb(0, 95, 184),
+            attention: Color::Rgb(191, 136, 3),
+            complete: Color::Rgb(56, 138, 52),
         }
     }
 
@@ -350,7 +352,7 @@ mod tests {
     #[test]
     fn luminance_splits_the_built_in_backgrounds() {
         assert_eq!(scheme_from_rgb(24, 26, 27), ColorScheme::Dark);
-        assert_eq!(scheme_from_rgb(250, 250, 247), ColorScheme::Light);
+        assert_eq!(scheme_from_rgb(255, 255, 255), ColorScheme::Light);
         assert_eq!(scheme_from_rgb(127, 127, 127), ColorScheme::Dark);
         assert_eq!(scheme_from_rgb(128, 128, 128), ColorScheme::Light);
     }
@@ -418,6 +420,7 @@ mod tests {
         assert_ne!(light.bg, Palette::dark().bg);
         assert_ne!(light.selected_fg, Color::White);
         assert_eq!(Palette::dark().selected_fg, Color::White);
-        assert_eq!(scheme_from_rgb(250, 250, 247), ColorScheme::Light);
+        assert_eq!(light.bg, Color::Rgb(255, 255, 255));
+        assert_eq!(scheme_from_rgb(255, 255, 255), ColorScheme::Light);
     }
 }
