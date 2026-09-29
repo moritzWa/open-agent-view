@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(unix)]
+use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 #[cfg(unix)]
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,7 +39,7 @@ const MAX_INITIAL_INPUT_BYTES: usize = 256 * 1024;
 const FALLBACK_TERMINAL_ROWS: u16 = 24;
 #[cfg(unix)]
 const FALLBACK_TERMINAL_COLUMNS: u16 = 80;
-#[cfg(unix)]
+
 #[derive(Debug)]
 pub enum NativeSessionExit {
     Backgrounded,
