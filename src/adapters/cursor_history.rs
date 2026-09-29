@@ -22,7 +22,9 @@ use serde::Deserialize;
 use super::native_owned::sanitize;
 use super::{DiscoveryRequest, SessionSource};
 use crate::domain::{AgentSession, Capability, Provider, Runtime, SessionKind, SessionState};
-use crate::process::{CommandRequest, CommandRunner, ProcessRunner};
+#[cfg(all(unix, not(target_os = "linux")))]
+use crate::process::CommandRequest;
+use crate::process::{CommandRunner, ProcessRunner};
 
 const MAX_META_BYTES: u64 = 64 * 1024;
 const MAX_PROMPT_HISTORY_BYTES: u64 = 4 * 1024 * 1024;
@@ -31,38 +33,45 @@ const MAX_CHATS_PER_DIR: usize = 4_096;
 /// A chat whose store changed this recently while its process is alive is
 /// treated as mid-turn rather than idle at the prompt.
 const ACTIVE_WINDOW: Duration = Duration::from_secs(20);
+#[cfg(all(unix, not(target_os = "linux")))]
 const PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// Filter for chats another source already reports, such as the managed
-/// registry on Linux, so one chat does not appear twice.
-pub type ChatFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+/// Chat IDs another source already reports, such as the managed registry on
+/// Linux, read once per discovery so one chat does not appear twice. An error
+/// skips this tick's listing rather than risk a duplicate row.
+pub type OwnedChatIds = Arc<dyn Fn() -> Result<BTreeSet<String>> + Send + Sync>;
 
 pub struct CursorHistorySource {
-    chats_root: PathBuf,
+    /// `None` resolves the default store at discovery time, so a missing home
+    /// directory fails this source alone instead of startup.
+    chats_root: Option<PathBuf>,
     versions_root: Option<PathBuf>,
     runner: Arc<dyn CommandRunner>,
-    skip: Option<ChatFilter>,
+    skip: Option<OwnedChatIds>,
 }
 
 impl CursorHistorySource {
     pub fn host(chats_root: PathBuf, versions_root: Option<PathBuf>) -> Self {
         Self {
-            chats_root,
+            chats_root: Some(chats_root),
             versions_root,
             runner: Arc::new(ProcessRunner),
             skip: None,
         }
     }
 
-    pub fn host_default() -> Result<Self> {
-        Ok(Self::host(
-            default_cursor_chats_dir()?,
-            default_cursor_versions_dir().ok(),
-        ))
+    /// The CLI's default store under the user's home directory.
+    pub fn host_default() -> Self {
+        Self {
+            chats_root: None,
+            versions_root: default_cursor_versions_dir().ok(),
+            runner: Arc::new(ProcessRunner),
+            skip: None,
+        }
     }
 
-    /// Leave out chats for which `skip` returns true.
-    pub fn skipping(mut self, skip: ChatFilter) -> Self {
+    /// Leave out the chat IDs `skip` returns.
+    pub fn skipping(mut self, skip: OwnedChatIds) -> Self {
         self.skip = Some(skip);
         self
     }
@@ -84,16 +93,21 @@ impl SessionSource for CursorHistorySource {
             // Every chat in this store is a foreground TUI session.
             return Ok(Vec::new());
         }
-        let mut chats = read_cursor_chats(&self.chats_root)?;
+        let chats_root = match &self.chats_root {
+            Some(chats_root) => chats_root.clone(),
+            None => default_cursor_chats_dir()?,
+        };
+        let mut chats = read_cursor_chats(&chats_root)?;
         if let Some(skip) = &self.skip {
-            chats.retain(|chat| !skip(&chat.id));
+            let owned = skip().context("failed to read the managed Cursor registry")?;
+            chats.retain(|chat| !owned.contains(&chat.id));
         }
         if chats.is_empty() {
             return Ok(Vec::new());
         }
         let live = live_chats(
             self.versions_root.as_deref(),
-            &self.chats_root,
+            &chats_root,
             self.runner.as_ref(),
         );
         let now = SystemTime::now();
@@ -142,12 +156,10 @@ impl SessionSource for CursorHistorySource {
 }
 
 /// A bounded transcript of the user's own prompts, newest last. Cursor keeps
-/// the assistant side in an encrypted blob store that this dashboard does not
-/// open, so the prompts are what an operator can review.
+/// the assistant side in a SQLite blob store that this dashboard does not
+/// parse, so the prompts are what an operator can review.
 pub fn inspect_cursor_history(chats_root: &Path, session: &AgentSession) -> Result<String> {
-    let chat = read_cursor_chats(chats_root)?
-        .into_iter()
-        .find(|chat| chat.id == session.provider_session_id)
+    let chat = find_chat(chats_root, &session.provider_session_id)?
         .with_context(|| format!("Cursor chat {} was not found on disk", session.name))?;
     let prompts = read_prompt_history(&chat.dir)?;
     // The peek panel shows the tail, so the newest prompt goes last.
@@ -168,15 +180,27 @@ pub fn inspect_cursor_history(chats_root: &Path, session: &AgentSession) -> Resu
 }
 
 pub fn default_cursor_chats_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".cursor/chats"))
+    Ok(home_dir()?.join(".cursor").join("chats"))
 }
 
 /// Where the CLI installer keeps versioned builds. Each build records live
 /// process IDs under `.running/`, which bounds the process probe.
 pub fn default_cursor_versions_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local/share/cursor-agent/versions"))
+    Ok(home_dir()?.join(".local/share/cursor-agent/versions"))
+}
+
+/// `HOME`, or `USERPROFILE` where `HOME` is normally unset (Windows).
+fn home_dir() -> Result<PathBuf> {
+    home_from(|name| std::env::var_os(name))
+}
+
+fn home_from(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Result<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(var)
+        .find(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .context("neither HOME nor USERPROFILE is set")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,10 +242,12 @@ fn read_cursor_chats(chats_root: &Path) -> Result<Vec<CursorChat>> {
         .into_iter()
         .take(MAX_HASH_DIRS)
     {
-        for chat_dir in real_subdirectories(&hash_dir)?
-            .into_iter()
-            .take(MAX_CHATS_PER_DIR)
-        {
+        // A workspace directory created, removed, or unreadable mid-scan must
+        // not hide every other chat.
+        let Ok(chat_dirs) = real_subdirectories(&hash_dir) else {
+            continue;
+        };
+        for chat_dir in chat_dirs.into_iter().take(MAX_CHATS_PER_DIR) {
             let Some(id) = chat_dir.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
@@ -241,8 +267,12 @@ fn read_cursor_chats(chats_root: &Path) -> Result<Vec<CursorChat>> {
 fn real_subdirectories(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
@@ -250,6 +280,29 @@ fn real_subdirectories(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     paths.sort();
     Ok(paths)
+}
+
+/// One chat by ID. Chats live under `<hash of cwd>/<id>`, so probing each
+/// workspace directory for that ID reads a single `meta.json` instead of
+/// every chat in the store.
+fn find_chat(chats_root: &Path, id: &str) -> Result<Option<CursorChat>> {
+    if !is_chat_id(id) {
+        return Ok(None);
+    }
+    for hash_dir in real_subdirectories(chats_root)?
+        .into_iter()
+        .take(MAX_HASH_DIRS)
+    {
+        let chat_dir = hash_dir.join(id);
+        match fs::symlink_metadata(&chat_dir) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            _ => continue,
+        }
+        if let Ok(Some(chat)) = read_chat(&chat_dir, id) {
+            return Ok(Some(chat));
+        }
+    }
+    Ok(None)
 }
 
 fn read_chat(chat_dir: &Path, id: &str) -> Result<Option<CursorChat>> {
@@ -470,8 +523,17 @@ fn open_store_files(pids: &[u32], runner: &dyn CommandRunner) -> Vec<(u32, PathB
             .map(|pid| pid.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let mut request =
-            CommandRequest::new("lsof", vec!["-F".into(), "pn".into(), "-p".into(), list]);
+        let mut request = CommandRequest::new(
+            "lsof",
+            vec![
+                "-n".into(),
+                "-P".into(),
+                "-F".into(),
+                "pn".into(),
+                "-p".into(),
+                list,
+            ],
+        );
         request.timeout = PROCESS_PROBE_TIMEOUT;
         // lsof exits non-zero when any listed PID has gone away; the output it
         // did produce is still valid, so only an unreadable stream is fatal.
@@ -513,7 +575,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::process::CommandOutput;
+    use crate::process::{CommandOutput, CommandRequest};
 
     const CHAT_A: &str = "2a243dcb-b43b-47be-8dfc-73f656a3f5ea";
     const CHAT_B: &str = "499e4a32-b12d-4fc1-b0a0-01ee8c58601d";
@@ -674,10 +736,80 @@ mod tests {
         write_chat(temp.path(), "8550e5f0", CHAT_A, "A", "/Users/m", 2_000_000);
         write_chat(temp.path(), "8550e5f0", CHAT_B, "B", "/Users/m", 1_000_000);
         let source = CursorHistorySource::host(temp.path().to_owned(), None)
-            .skipping(Arc::new(|id: &str| id == CHAT_A));
+            .skipping(Arc::new(|| Ok(BTreeSet::from([CHAT_A.to_owned()]))));
         let sessions = source.discover(&request()).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].provider_session_id, CHAT_B);
+    }
+
+    #[test]
+    fn an_unreadable_owner_registry_skips_the_listing_instead_of_duplicating() {
+        let temp = tempfile::tempdir().unwrap();
+        write_chat(temp.path(), "8550e5f0", CHAT_A, "A", "/Users/m", 2_000_000);
+        let source = CursorHistorySource::host(temp.path().to_owned(), None)
+            .skipping(Arc::new(|| bail!("registry is locked")));
+        let error = source.discover(&request()).unwrap_err();
+        assert!(format!("{error:#}").contains("registry is locked"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_workspace_directory_does_not_hide_other_chats() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        write_chat(temp.path(), "8550e5f0", CHAT_A, "A", "/Users/m", 2_000_000);
+        write_chat(temp.path(), "d3643a72", CHAT_B, "B", "/Users/m", 1_000_000);
+        let locked = temp.path().join("d3643a72");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&locked).is_ok();
+        let source = CursorHistorySource::host(temp.path().to_owned(), None);
+        let result = source.discover(&request());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let sessions = result.unwrap();
+        if readable {
+            // Running as root: permissions are not enforced, both are listed.
+            assert_eq!(sessions.len(), 2);
+        } else {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].provider_session_id, CHAT_A);
+        }
+    }
+
+    #[test]
+    fn find_chat_probes_workspace_directories_for_the_id() {
+        let temp = tempfile::tempdir().unwrap();
+        write_chat(temp.path(), "8550e5f0", CHAT_A, "A", "/Users/m", 2_000_000);
+        write_chat(temp.path(), "d3643a72", CHAT_B, "B", "/Users/m", 1_000_000);
+        // A damaged chat elsewhere is never read on the way to the target.
+        let broken = temp.path().join("0000aaaa").join(CHAT_EMPTY);
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join("meta.json"), "{ not json").unwrap();
+        let chat = find_chat(temp.path(), CHAT_B).unwrap().unwrap();
+        assert_eq!(chat.dir, temp.path().join("d3643a72").join(CHAT_B));
+        assert!(find_chat(temp.path(), CHAT_EMPTY).unwrap().is_none());
+        assert!(find_chat(temp.path(), "../d3643a72").unwrap().is_none());
+    }
+
+    #[test]
+    fn home_falls_back_to_userprofile() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| std::ffi::OsString::from(value))
+            }
+        };
+        assert_eq!(
+            home_from(env(&[("HOME", "/home/a"), ("USERPROFILE", "C:\\Users\\a")])).unwrap(),
+            PathBuf::from("/home/a")
+        );
+        assert_eq!(
+            home_from(env(&[("HOME", ""), ("USERPROFILE", "C:\\Users\\a")])).unwrap(),
+            PathBuf::from("C:\\Users\\a")
+        );
+        assert!(home_from(env(&[])).is_err());
     }
 
     #[test]
@@ -739,7 +871,12 @@ mod tests {
             let requests = runner.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].program, "lsof");
-            assert_eq!(requests[0].args[3], me.to_string(), "dead PIDs are pruned");
+            assert_eq!(
+                requests[0].args[..2],
+                ["-n", "-P"],
+                "no DNS or port lookups"
+            );
+            assert_eq!(requests[0].args[5], me.to_string(), "dead PIDs are pruned");
             assert_eq!(by_id[CHAT_A].state, SessionState::Working);
             assert_eq!(by_id[CHAT_A].pid, Some(me));
             assert_eq!(by_id[CHAT_B].state, SessionState::NeedsInput);

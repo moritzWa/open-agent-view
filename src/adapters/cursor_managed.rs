@@ -398,9 +398,9 @@ impl CursorSupervisor {
             && self.lookup(&session.provider_session_id).is_ok()
     }
 
-    /// Whether this supervisor created the chat with the given Cursor chat ID.
-    pub fn owns_chat_id(&self, chat_id: &str) -> bool {
-        self.lookup(chat_id).is_ok()
+    /// Every Cursor chat ID this supervisor created, read under one lock.
+    pub fn owned_chat_ids(&self) -> Result<BTreeSet<String>> {
+        self.with_locked_registry(|registry| Ok(registry.sessions.keys().cloned().collect()))
     }
 
     pub fn yolo_if_owned(&self, session: &AgentSession) -> bool {

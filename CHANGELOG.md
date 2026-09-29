@@ -23,8 +23,10 @@ and future released versions are intended to follow Semantic Versioning.
   chat store (`~/.cursor/chats`), with `--include-external
   --include-interactive`. Rows show the chat title, workspace, and latest
   prompt; state comes from verifying the CLI process that holds the chat open.
-  Enter/Right resumes the chat natively and Inspect lists the recorded prompts.
-  `--cursor-chats-dir` overrides the store location.
+  Enter/Right resumes the chat natively (refused while another `cursor-agent`
+  still holds it) and Inspect lists the recorded prompts.
+  `--cursor-chats-dir` overrides the store location. Running-state detection
+  works on macOS and Linux; elsewhere every chat is listed as closed history.
 - `ctrl+g` opens a searchable picker of sessions hidden with `ctrl+x`.
   Enter unhides the chosen session and selects its row when discovery lists
   it, without leaving the dashboard.
