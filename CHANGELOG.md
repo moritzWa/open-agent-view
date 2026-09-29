@@ -8,6 +8,12 @@ and future released versions are intended to follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- A light dashboard palette. `--theme auto` (the default) follows the terminal
+  background, then the operating system appearance. `--theme dark` and
+  `--theme light` force a palette.
+
 ### Fixed
 
 - Pasting multi-line text into the composer no longer submits once per line.

@@ -88,8 +88,8 @@ and narrow 60×20. At minimum verify:
 - every state is present in reference order and the selected row is apparent;
 - 60×20 retains a discoverable `?` help affordance and usable composer;
 - no stale glyphs remain after changing view, filter, overlay, or selection;
-- colors remain distinguishable on the reference dark theme and still convey
-  state through text/symbols when color is unavailable.
+- colors remain distinguishable on the reference dark theme and the light
+  theme, and still convey state through text/symbols when color is unavailable.
 
 ### Exhaustive safe key route
 

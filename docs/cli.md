@@ -33,6 +33,7 @@ Open Agent View is already up to date.
 | Option | Meaning |
 | --- | --- |
 | `--json` | Print a normalized snapshot and do not enter the TUI. |
+| `--theme auto\|dark\|light` | Dashboard colors. `auto` (the default) reads the terminal background with OSC 11, then `COLORFGBG`, then the operating system appearance (macOS `AppleInterfaceStyle`, Windows `AppsUseLightTheme`, GNOME `color-scheme`). Unknown terminals stay on the dark palette. `dark` and `light` force a palette. |
 | `--yolo` | **Dangerous, explicit opt-in.** Launch new sessions with a verified provider-native permission-bypass mode. Unsupported harnesses fail closed. Existing sessions are not changed. |
 | `--all` | Compatibility flag that explicitly includes completed sessions; completed is already the default. |
 | `--hide-completed` / `--active-only` | Hide completed sessions at startup. `/completed show` restores them without restarting. |
