@@ -373,11 +373,11 @@ never signals a PID merely because it appears in the registry.
 | Discover | Private registry plus bounded stream-JSON logs | `~/.cursor/chats` metadata plus live-process check (all platforms) |
 | Inspect | Bounded assistant transcript from the owned log | Recorded user prompts from `prompt_history.json` |
 | Open | Refused while an owned print worker is active; native resume otherwise | Refused while another live `cursor-agent` holds the chat; native resume (`cursor-agent --resume <id> --workspace <cwd>`) otherwise |
-| Launch/reply | Create a chat and open it in the foreground; inline reply only after the prior process/native frontend exits | Disabled |
+| Launch/reply | Create a chat and open it in the foreground; inline reply only after the prior process/native frontend exits | Create a chat and open it in Cursor's interface. Inline reply stays disabled |
 | Interrupt | `SIGINT` only after exact live-process verification | Disabled |
 | Permission/archive/delete | Disabled | Disabled |
 
-Managed Cursor launch and rediscovery currently require Linux. A chat OAV
+Managed Cursor reply, interrupt, and rediscovery currently require Linux. Starting a new chat from the harness list works on every platform: OAV runs `create-chat` and opens that id in Cursor's interface. A chat OAV
 launched itself is listed once, by the managed source; the history source skips
 IDs the supervisor owns. Open Agent View does not scrape the provider's picker
 or infer ownership from a chat ID.

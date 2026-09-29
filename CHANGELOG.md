@@ -10,6 +10,8 @@ and future released versions are intended to follow Semantic Versioning.
 
 ### Added
 
+- Cursor is a launch harness on every platform. Choosing it from the harness
+  list creates a chat and opens it in Cursor's interface.
 - External Cursor chats are now discovered on every platform from Cursor's own
   chat store (`~/.cursor/chats`), with `--include-external
   --include-interactive`. Rows show the chat title, workspace, and latest

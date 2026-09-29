@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -14,6 +15,7 @@ use crate::control::{
     ProviderController,
 };
 use crate::domain::{AgentSession, Provider, Runtime, SessionSnapshot};
+use crate::process::{CommandRequest, CommandRunner, ProcessRunner};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CursorCommandSpec {
@@ -274,10 +276,11 @@ pub fn parse_cursor_chat_id(output: &str) -> Result<String> {
     Ok(id.to_owned())
 }
 
-/// Observe-only controller for sessions discovered outside Open Agent View.
+/// Host controller for Cursor chats.
 ///
-/// Cursor has no documented machine-readable global list or live-control API,
-/// so this controller intentionally offers native resume only.
+/// On every platform it can create a chat and open it in Cursor's interface.
+/// Inline reply, interrupt, and the durable registry stay on the Linux
+/// supervisor.
 pub struct CursorController {
     invocation: CursorInvocation,
     chats_root: Option<PathBuf>,
@@ -319,17 +322,17 @@ impl ProviderController for CursorController {
     }
 
     fn launch_mode(&self) -> LaunchMode {
-        #[cfg(target_os = "linux")]
-        if self.supervisor.is_some() {
-            return LaunchMode::SelectableModel;
-        }
-        LaunchMode::Unavailable
+        LaunchMode::SelectableModel
     }
 
     fn launch_presentation(&self) -> LaunchPresentation {
-        // Account/model preflight and create-chat run on the dashboard worker.
-        // Once the exact returned row appears, the terminal opens it natively.
-        LaunchPresentation::DeferredForeground
+        // Linux managed launch records the chat first, then opens it once the
+        // row appears. Everywhere else the composer opens Cursor directly.
+        #[cfg(target_os = "linux")]
+        if self.supervisor.is_some() {
+            return LaunchPresentation::DeferredForeground;
+        }
+        LaunchPresentation::Foreground
     }
 
     fn supports_yolo(&self) -> bool {
@@ -345,11 +348,10 @@ impl ProviderController for CursorController {
 
     fn available_models(&self) -> Result<Vec<String>> {
         #[cfg(target_os = "linux")]
-        {
-            self.managed_supervisor()?.available_models()
+        if self.supervisor.is_some() {
+            return self.managed_supervisor()?.available_models();
         }
-        #[cfg(not(target_os = "linux"))]
-        bail!("managed Cursor model discovery is unavailable on this platform")
+        host_available_models(&self.invocation.executable)
     }
 
     fn supports_authentication(&self) -> bool {
@@ -373,10 +375,20 @@ impl ProviderController for CursorController {
         if request.provider != Provider::Cursor {
             bail!("the Cursor controller cannot launch another provider");
         }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let session_id = create_host_chat(
+                &self.invocation,
+                &request.cwd,
+                request.model.as_deref(),
+            )?;
+            return Ok(ControlOutcome {
+                message: format!("created Cursor chat {session_id}"),
+                provider_session_hint: Some(session_id),
+            });
+        }
         #[cfg(target_os = "linux")]
         let supervisor = self.managed_supervisor()?;
-        #[cfg(not(target_os = "linux"))]
-        bail!("managed Cursor launch is unavailable on this platform");
         #[cfg(target_os = "linux")]
         let session_id = supervisor.allocate_chat_with_model(
             &request.prompt,
@@ -413,10 +425,12 @@ impl ProviderController for CursorController {
         if request.provider != Provider::Cursor {
             bail!("the Cursor controller cannot launch another provider");
         }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return self.open_new_chat(request);
+        }
         #[cfg(target_os = "linux")]
         let supervisor = self.managed_supervisor()?;
-        #[cfg(not(target_os = "linux"))]
-        bail!("managed Cursor launch is unavailable on this platform");
         #[cfg(target_os = "linux")]
         let session_id = supervisor.allocate_chat_with_model(
             &request.prompt,
@@ -664,6 +678,121 @@ fn require_absolute_cwd(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+impl CursorController {
+    fn open_new_chat(&self, request: &LaunchRequest) -> Result<ControlOutcome> {
+        let session_id = create_host_chat(
+            &self.invocation,
+            &request.cwd,
+            request.model.as_deref(),
+        )?;
+        let spec = self.invocation.resume_with_prompt(
+            &session_id,
+            &request.cwd,
+            &request.prompt,
+            request.model.as_deref(),
+        )?;
+        let key = format!("cursor:host:{session_id}");
+        match crate::native_session::run(spec.command(), &key)? {
+            crate::native_session::NativeSessionExit::Backgrounded => Ok(ControlOutcome {
+                message: format!(
+                    "backgrounded Cursor session {session_id}; Enter/Right resumes it"
+                ),
+                provider_session_hint: Some(session_id),
+            }),
+            crate::native_session::NativeSessionExit::Exited(status) if status.success() => {
+                Ok(ControlOutcome {
+                    message: format!("returned from Cursor session {session_id}"),
+                    provider_session_hint: Some(session_id),
+                })
+            }
+            crate::native_session::NativeSessionExit::Exited(status) => {
+                bail!("Cursor session exited with status {status}")
+            }
+        }
+    }
+}
+
+fn parse_cursor_model_ids(output: &str) -> Vec<String> {
+    let mut models = std::collections::BTreeSet::new();
+    for line in output.lines() {
+        let line = line.trim().trim_start_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '-' | '*' | '•' | '›' | '>' | '✓')
+        });
+        let Some(candidate) = line.split_whitespace().next() else {
+            continue;
+        };
+        let candidate = candidate.trim_matches(|character: char| matches!(character, ':' | ','));
+        if candidate.eq_ignore_ascii_case("auto") {
+            models.insert("auto".to_owned());
+            continue;
+        }
+        if candidate.len() > 128
+            || !candidate.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '-' | '_' | '.' | ':' | '/' | '@')
+            })
+        {
+            continue;
+        }
+        let lower = candidate.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "loading" | "models" | "model" | "available" | "no" | "name" | "id" | "tip"
+        ) {
+            continue;
+        }
+        models.insert(candidate.to_owned());
+    }
+    models.into_iter().collect()
+}
+
+fn host_available_models(executable: &str) -> Result<Vec<String>> {
+    let mut request = CommandRequest::new(executable, vec!["models".into()]);
+    request.timeout = Duration::from_secs(4);
+    let output = ProcessRunner.run(&request).with_context(|| {
+        format!("Cursor model catalog did not respond (configured executable: {executable})")
+    })?;
+    let stdout = output.stdout_text()?;
+    let stderr = output.stderr_lossy();
+    if output.status != 0 {
+        let detail = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+        if detail.contains("auth") || detail.contains("login") || detail.contains("no models") {
+            bail!(
+                "Cursor is not authenticated or this account has no models; press Enter to sign in"
+            );
+        }
+        bail!("Cursor model catalog failed with status {}: {stderr}", output.status);
+    }
+    let models = parse_cursor_model_ids(stdout);
+    if models.is_empty() {
+        bail!("Cursor returned no account models; press Enter to sign in or check plan access");
+    }
+    Ok(models)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_host_chat(
+    invocation: &CursorInvocation,
+    cwd: &Path,
+    model: Option<&str>,
+) -> Result<String> {
+    let spec = invocation.create_chat_with_model(cwd, model)?;
+    let mut request = CommandRequest::new(spec.program, spec.args);
+    request.current_dir = Some(spec.current_dir);
+    request.timeout = Duration::from_secs(20);
+    let output = ProcessRunner.run(&request).context("Cursor create-chat did not respond")?;
+    let stdout = output.stdout_text()?;
+    if output.status != 0 {
+        bail!(
+            "Cursor create-chat failed with status {}: {}",
+            output.status,
+            output.stderr_lossy()
+        );
+    }
+    parse_cursor_chat_id(stdout)
+}
+
 fn require_model(model: &str) -> Result<()> {
     if model.is_empty()
         || model.len() > 128
@@ -679,6 +808,26 @@ fn require_model(model: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::ProviderController;
+
+    #[test]
+    fn model_catalog_keeps_auto_and_named_ids() {
+        let models = parse_cursor_model_ids(
+            "Available models\n\nauto - Auto (default)\ncomposer-2.5 - Composer\nTip: use --model\n",
+        );
+        assert_eq!(models, vec!["auto".to_owned(), "composer-2.5".to_owned()]);
+    }
+
+    #[test]
+    fn host_cursor_is_a_selectable_harness() {
+        let controller = CursorController::host("cursor-agent");
+        assert_eq!(controller.launch_mode(), LaunchMode::SelectableModel);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            controller.launch_presentation(),
+            LaunchPresentation::Foreground
+        );
+    }
 
     #[cfg(unix)]
     #[test]
