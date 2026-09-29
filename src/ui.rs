@@ -234,6 +234,7 @@ fn render_session_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 area.width,
                 is_selected,
                 app.live_animation_visible(),
+                app.pinned.contains_key(&session.id),
             ));
         }
         let hidden = app.hidden_session_count(group);
@@ -343,6 +344,7 @@ fn render_session_row(
     width: u16,
     selected: bool,
     live_animation_visible: bool,
+    pinned: bool,
 ) -> Line<'static> {
     let symbol = state_symbol(session.state, live_animation_visible);
     let symbol_style = Style::default().fg(state_color(session.state));
@@ -382,7 +384,12 @@ fn render_session_row(
     let fixed = 5 + name_width + provider_width + display_width(&right);
     let summary_width = (width as usize).saturating_sub(fixed).max(1);
     let summary = truncate(&format!("{state_prefix}{}", session.summary), summary_width);
-    let name = pad_to_width(truncate(&session.name, name_width), name_width);
+    let name_text = if pinned {
+        format!("📌 {}", session.name)
+    } else {
+        session.name.clone()
+    };
+    let name = pad_to_width(truncate(&name_text, name_width), name_width);
     let summary = pad_to_width(summary, summary_width);
     let spans = vec![
         Span::styled(format!(" {symbol} "), symbol_style),
@@ -893,6 +900,9 @@ fn help_actions(app: &App) -> Vec<String> {
     }
     actions.push("ctrl+s to switch views".into());
     actions.push("ctrl+l to refresh".into());
+    if app.selected_session().is_some() {
+        actions.push("ctrl+p to pin the session to the top".into());
+    }
     if app.selected_session().is_some_and(|session| {
         session.runtime == crate::domain::Runtime::Host
             && crate::migration::provider_format(&session.provider).is_some()
@@ -1768,7 +1778,7 @@ mod tests {
         for (provider, expected) in providers {
             let mut item = session("recognizable-session", SessionState::Working);
             item.provider = provider;
-            let row = render_session_row(&item, ViewMode::Status, 120, false, true);
+            let row = render_session_row(&item, ViewMode::Status, 120, false, true, false);
             let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
 
             assert!(
@@ -1786,7 +1796,7 @@ mod tests {
             SessionState::Working,
         );
         item.provider = Provider::Antigravity;
-        let row = render_session_row(&item, ViewMode::Status, 120, false, true);
+        let row = render_session_row(&item, ViewMode::Status, 120, false, true, false);
         let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
 
         assert!(
@@ -1803,7 +1813,7 @@ mod tests {
         item.updated_at = Some(SystemTime::now() - Duration::from_secs(86_400));
 
         for width in [80, 120, 160] {
-            let row = render_session_row(&item, ViewMode::Status, width, false, true);
+            let row = render_session_row(&item, ViewMode::Status, width, false, true, false);
             let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
 
             assert_eq!(display_width(&text), width as usize);
@@ -1821,14 +1831,23 @@ mod tests {
     #[test]
     fn working_marker_blinks_without_changing_other_session_states() {
         let working = session("worker", SessionState::Working);
-        let visible = render_session_row(&working, ViewMode::Status, 120, false, true);
-        let dimmed = render_session_row(&working, ViewMode::Status, 120, false, false);
+        let visible = render_session_row(&working, ViewMode::Status, 120, false, true, false);
+        let dimmed = render_session_row(&working, ViewMode::Status, 120, false, false, false);
         assert_eq!(visible.spans[0].content, " ✳ ");
         assert_eq!(dimmed.spans[0].content, " · ");
 
         let completed = session("done", SessionState::Completed);
-        let completed = render_session_row(&completed, ViewMode::Status, 120, false, false);
+        let completed = render_session_row(&completed, ViewMode::Status, 120, false, false, false);
         assert_eq!(completed.spans[0].content, " • ");
+    }
+
+    #[test]
+    fn a_pinned_row_marks_the_name_and_keeps_the_line_width() {
+        let item = session("worker", SessionState::Working);
+        let row = render_session_row(&item, ViewMode::Status, 120, false, true, true);
+        let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(text.contains("📌 worker"), "{text}");
+        assert_eq!(display_width(&text), 120);
     }
 
     #[test]
@@ -2001,6 +2020,7 @@ mod tests {
 
         assert!(rendered.contains("shortcuts"));
         assert!(rendered.contains("ctrl+r to rename"));
+        assert!(rendered.contains("ctrl+p to pin the session to the top"));
         assert!(rendered.contains("ctrl+m to migrate session"));
         assert!(rendered.contains("ctrl+s to switch views"));
         assert!(rendered.contains("/harness [name] switches harness"));

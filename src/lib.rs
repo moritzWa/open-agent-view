@@ -13,6 +13,7 @@ pub mod hidden;
 pub mod maintenance;
 pub mod migration;
 pub mod native_session;
+pub mod pins;
 pub mod opencode_supervisor;
 pub mod pi_supervisor;
 pub mod process;

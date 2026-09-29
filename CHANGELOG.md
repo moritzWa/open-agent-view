@@ -8,6 +8,11 @@ and future released versions are intended to follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `ctrl+p` pins the selected session to a Pinned group at the top of the list
+  and unpins it again. The pin is remembered locally.
+
 ## [0.1.53] - 2026-09-04
 
 ### Added
