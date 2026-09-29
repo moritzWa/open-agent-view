@@ -337,14 +337,19 @@ Liveness comes from the process, not the files. Cursor drops a PID marker in
 `~/.local/share/cursor-agent/versions/<version>/.running/` for each CLI it
 starts; OAV verifies each PID is alive, then asks which chat's `store.db` that
 process holds open (`/proc/<pid>/fd` on Linux, `lsof -p` elsewhere). Chats
-without a holder are *closed* history. When the holder is a CLI this dashboard
-opened and is keeping in the background, its state is read from that
-terminal's screen: Cursor shows `ctrl+c to stop` beside the composer exactly
-while a turn is processing, so the row is *working* with the hint and *waiting
-at prompt* without it. That covers long thinking and tool calls, which write
-nothing to disk. For chats held by a CLI in some other terminal the screen is
-not visible, so a live chat is *working* while its store or metadata changed
-within the last 20 seconds and *waiting at prompt* otherwise. Because these rows are observe/native-open only, a stale
+without a holder are *closed* history. When the holder is the very CLI process
+this dashboard opened and is keeping in the background, its state is read from
+that terminal's screen. Cursor shows `ctrl+c to stop` at the right end of the
+composer while a turn is processing and the composer input is empty, so a
+composer row ending in the hint means *working*, including long thinking and
+tool calls that write nothing to disk. The empty idle composer, its
+`Add a follow-up` or `Plan, search, build anything` placeholder without the
+hint, means *waiting at prompt*. Anything else, such as a follow-up typed mid-turn, a
+startup or login screen, or a hint Cursor has since renamed, is not taken as
+evidence either way. Those rows, and chats held by a CLI in some other terminal
+whose screen is not visible, fall back to the store: a live chat is *working*
+while its store or metadata changed within the last 20 seconds and *waiting at
+prompt* otherwise. Because these rows are observe/native-open only, a stale
 marker or a misread PID can at worst mislabel a row's state; nothing is ever
 signalled based on it. Running-state detection is implemented on macOS and
 Linux only; on other platforms every chat is listed as closed history.
