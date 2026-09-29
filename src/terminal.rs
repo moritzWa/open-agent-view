@@ -115,6 +115,7 @@ impl MigrationServices {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_dashboard(
     engine: &DiscoveryEngine,
     request: &DiscoveryRequest,
