@@ -50,10 +50,11 @@ The screen is cleared first, so a Codex or other provider transcript starts at
 the top instead of appending below the previous shell contents. Enter or Right
 opens the selected row directly. Plain Left/Right arrows first reach the
 provider. If the cursor does not move, OAV displays a 1.6-second return hint;
-repeat the same arrow to stop and retain only that frontend, restore the
-dashboard, and leave the managed backend alive. Shift+Left/Right performs the
-same return immediately. Enter or Right on the same dashboard row resumes the
-exact retained frontend and replays its terminal screen. Left also returns from
+repeat the same arrow to restore the dashboard and leave the managed backend
+alive. The provider frontend is not stopped: it keeps running on its private
+pseudo-terminal until an explicit Ctrl+X or dashboard exit. Shift+Left/Right
+performs the same return immediately. Enter or Right on the same dashboard row
+reattaches that exact frontend and shows the screen it has produced since. Left also returns from
 OAV's inline Peek without starting a provider CLI.
 
 Authentication is a terminal handoff, not an OAV credential store. The model

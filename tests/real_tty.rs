@@ -105,10 +105,18 @@ fn sqlite_harnesses_launch_foreground_detach_rename_and_resume_together() {
         app.wait_for("renamed row", |s| {
             s.contains(&format!("{provider}-renamed")) && !s.contains("rename session")
         });
+        // Leaving the alternate screen brings back the provider's last frame
+        // before the bridge owns the terminal again, so the visible screen can
+        // match too early. Wait for the bridge's own repaint bytes instead;
+        // typing earlier lands while the terminal is briefly out of raw mode.
+        let reply = format!("NATIVE {provider} reply:");
+        let repaints = count_bytes(&app.raw, reply.as_bytes());
         app.send(ENTER);
-        app.wait_for("reattached native foreground", |s| {
-            s.contains(&format!("NATIVE {provider} reply:"))
-        });
+        app.wait_for_byte_count(
+            reply.as_bytes(),
+            repaints + 1,
+            "reattached native foreground",
+        );
         app.send(b"continued conversation\r");
         app.wait_for("continued native reply", |s| {
             s.contains("continued conversation")
