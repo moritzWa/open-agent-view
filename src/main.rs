@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+#[cfg(not(target_os = "linux"))]
+use open_agent_view::adapters::OpenCodeOwnership;
 use open_agent_view::adapters::{
     default_cursor_versions_dir, default_managed_docker_registry_path, default_pi_session_dir,
     generate_managed_instance_id, AntigravityController, AntigravityOwnership, AntigravitySource,
@@ -15,8 +17,8 @@ use open_agent_view::adapters::{
     DockerTarget, FixtureSource, KimiController, KimiOwnership, KimiSource,
     ManagedDockerCreateSpec, ManagedDockerService, ManagedDockerStatus, MistralVibeController,
     MistralVibeOwnership, MistralVibeSource, MuseController, MuseOwnership, MuseSource,
-    OpenCodeController, OpenCodeOwnership, OpenCodeSource, PiController, PiSource, QwenController,
-    QwenOwnership, QwenSource, SessionMigrateNativeController, SessionMigrateNativeOwnership,
+    OpenCodeController, OpenCodeSource, PiController, PiSource, QwenController, QwenOwnership,
+    QwenSource, SessionMigrateNativeController, SessionMigrateNativeOwnership,
     SessionMigrateNativeSource, TerminalHarness,
 };
 #[cfg(target_os = "linux")]
