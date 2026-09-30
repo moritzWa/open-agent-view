@@ -353,7 +353,11 @@ fn render_session_row(
 ) -> Line<'static> {
     let symbol = state_symbol(session.state, live_animation_visible);
     let symbol_style = Style::default().fg(state_color(session.state));
-    let name_width = if width >= 100 {
+    let name_width = if width >= 140 {
+        36
+    } else if width >= 120 {
+        30
+    } else if width >= 100 {
         26
     } else if width >= 70 {
         20
@@ -386,13 +390,17 @@ fn render_session_row(
     } else {
         format!("{prs:>7} {age:>5}")
     };
-    let fixed = 5 + name_width + provider_width + display_width(&right);
+    let name_gap = if width >= 70 { "   " } else { " " };
+    let fixed = 4 + name_gap.len() + name_width + provider_width + display_width(&right);
     let summary_width = (width as usize).saturating_sub(fixed).max(1);
     let name = pad_to_width(truncate(&session.name, name_width), name_width);
     let mut spans = vec![
         Span::styled(format!(" {symbol} "), symbol_style),
         Span::raw(name),
-        Span::styled(format!(" {provider} "), Style::default().fg(palette().dim)),
+        Span::styled(
+            format!("{name_gap}{provider} "),
+            Style::default().fg(palette().dim),
+        ),
     ];
     let label = truncate(state_label, summary_width);
     let label_width = display_width(&label);
@@ -1977,7 +1985,7 @@ mod tests {
         let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
 
         assert!(
-            text.contains("… Antigravity"),
+            text.contains("…   Antigravity"),
             "provider column touched name: {text:?}"
         );
     }
