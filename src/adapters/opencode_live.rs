@@ -12,6 +12,9 @@
 //!    process holds, and only when that message was written after the process
 //!    started.
 //! 3. Otherwise the session is closed history.
+//!
+//! Windows has no process probe, so there every session is history.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -364,6 +367,7 @@ fn process_cwds(pids: &[u32], runner: &dyn CommandRunner) -> BTreeMap<u32, PathB
 }
 
 /// Parse `lsof -Fpn` output: `p<pid>` starts a process, `n<path>` is its cwd.
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
 pub(super) fn parse_lsof_cwds(output: &str) -> BTreeMap<u32, PathBuf> {
     let mut cwds = BTreeMap::new();
     let mut current = None;
