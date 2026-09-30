@@ -18,6 +18,10 @@ and future released versions are intended to follow Semantic Versioning.
   still holds it) and Inspect lists the recorded prompts.
   `--cursor-chats-dir` overrides the store location. Running-state detection
   works on macOS and Linux; elsewhere every chat is listed as closed history.
+- OpenCode is a launch harness outside Linux. Choosing it opens OpenCode's
+  interface with the task already submitted, and the session it creates is
+  recorded as the dashboard's own, so its row is listed without
+  `--include-external` and Enter/Right reattaches it.
 
 ### Fixed
 
@@ -32,6 +36,13 @@ and future released versions are intended to follow Semantic Versioning.
   own `ctrl+c to stop` hint and idle composer on the chat's screen instead of
   how recently the chat store was written. A screen that shows neither, such
   as a follow-up typed mid-turn, still falls back to the store.
+- OpenCode rows show their real state instead of always "completed". A session
+  an `opencode` process is running is working while its turn runs and needs
+  input when it waits at the prompt or on a question. For a session left
+  running behind the dashboard, OpenCode's own screen decides, which also
+  catches permission requests. A turn left unfinished by a killed process no
+  longer reads as working. Subagent sessions are no longer listed as separate
+  rows. Live state works on macOS and Linux.
 
 ## [0.1.53] - 2026-09-04
 

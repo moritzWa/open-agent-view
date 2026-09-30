@@ -15,8 +15,8 @@ use open_agent_view::adapters::{
     DockerTarget, FixtureSource, KimiController, KimiOwnership, KimiSource,
     ManagedDockerCreateSpec, ManagedDockerService, ManagedDockerStatus, MistralVibeController,
     MistralVibeOwnership, MistralVibeSource, MuseController, MuseOwnership, MuseSource,
-    OpenCodeController, OpenCodeSource, PiController, PiSource, QwenController, QwenOwnership,
-    QwenSource, SessionMigrateNativeController, SessionMigrateNativeOwnership,
+    OpenCodeController, OpenCodeOwnership, OpenCodeSource, PiController, PiSource, QwenController,
+    QwenOwnership, QwenSource, SessionMigrateNativeController, SessionMigrateNativeOwnership,
     SessionMigrateNativeSource, TerminalHarness,
 };
 #[cfg(target_os = "linux")]
@@ -612,6 +612,10 @@ fn main() -> Result<()> {
     let opencode_supervisor = opencode_enabled
         .then(|| OpenCodeSupervisor::host(cli.opencode_bin.clone()).map(Arc::new))
         .transpose()?;
+    #[cfg(not(target_os = "linux"))]
+    let opencode_ownership = opencode_enabled
+        .then(OpenCodeOwnership::load_default)
+        .transpose()?;
     #[cfg(target_os = "linux")]
     let cursor_supervisor = cursor_enabled
         .then(|| CursorSupervisor::host(cli.cursor_bin.clone()).map(Arc::new))
@@ -672,7 +676,11 @@ fn main() -> Result<()> {
                     .clone(),
             );
             #[cfg(not(target_os = "linux"))]
-            let controller = OpenCodeController::host(cli.opencode_bin.clone());
+            let controller = OpenCodeController::host(cli.opencode_bin.clone()).with_ownership(
+                opencode_ownership
+                    .clone()
+                    .expect("OpenCode ownership exists when OpenCode is enabled"),
+            );
             control.register_controller(Arc::new(controller))?;
         }
         if copilot_enabled {
@@ -860,7 +868,9 @@ fn main() -> Result<()> {
                 }
             };
             #[cfg(not(target_os = "linux"))]
-            let source = OpenCodeSource::host(cli.opencode_bin);
+            let source = OpenCodeSource::host(cli.opencode_bin).owned(
+                opencode_ownership.expect("OpenCode ownership exists when OpenCode is enabled"),
+            );
             engine.add_source(source);
         }
         if copilot_enabled {

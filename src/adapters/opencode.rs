@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -7,6 +7,8 @@ use std::time::{Duration, SystemTime};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use super::native_owned::{poll_unique, NativeOwnership};
+use super::opencode_live::{self, Candidate, Holder, LastMessage};
 use super::{DiscoveryRequest, SessionSource, SourceDiscovery};
 use crate::control::{
     run_native_authentication, ControlOutcome, LaunchMode, LaunchPresentation, LaunchRequest,
@@ -20,12 +22,53 @@ use crate::process::{CancellableProcessRunner, CommandRequest, CommandRunner};
 
 // `opencode session list` is workspace-scoped in OpenCode 1.18.18 despite its
 // generic help text. The official read-only `db` command is the only current
-// CLI surface that projects every root and child session across workspaces.
+// CLI surface that projects every session across workspaces.
 // Ask SQLite to encode each row separately. OpenCode 1.17 truncates a large
 // JSON-array result when stdout is a pipe, while TSV rows stream completely.
 // json_object also preserves tabs/newlines in user titles and paths safely.
-const GLOBAL_SESSION_ROWS: &str = "SELECT json_object('id', id, 'title', title, 'created', time_created, 'updated', time_updated, 'projectId', project_id, 'directory', directory) AS record FROM session";
+// Subagent sessions (those with a parent) are listed under their parent's
+// running turn rather than as rows of their own. `last` is the newest message,
+// read through the (session_id, time_created) index, which live state needs.
+const GLOBAL_SESSION_ROWS: &str = "SELECT json_object('id', s.id, 'title', s.title, 'created', s.time_created, 'updated', s.time_updated, 'projectId', s.project_id, 'directory', s.directory, 'last', json((SELECT json_object('role', json_extract(m.data, '$.role'), 'created', m.time_created, 'completed', json_extract(m.data, '$.time.completed'), 'question', EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id AND json_extract(p.data, '$.tool') = 'question' AND json_extract(p.data, '$.state.status') IN ('pending', 'running'))) FROM message m WHERE m.session_id = s.id ORDER BY m.time_created DESC, m.id DESC LIMIT 1))) AS record FROM session s WHERE s.parent_id IS NULL";
 const MAX_MODEL_CATALOG_BYTES: usize = 4 * 1024 * 1024;
+const LAUNCH_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
+
+type HolderProbe = Arc<dyn Fn() -> Vec<Holder> + Send + Sync>;
+
+/// OpenCode sessions this dashboard started where no managed server records
+/// them (every platform but Linux). The history source lists these even
+/// without `--include-external`.
+pub struct OpenCodeOwnership {
+    inner: NativeOwnership,
+}
+
+impl OpenCodeOwnership {
+    pub fn load_default() -> Result<Arc<Self>> {
+        Self::load(default_opencode_ownership_path()?)
+    }
+
+    pub fn load(path: PathBuf) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            inner: NativeOwnership::load(path, "OpenCode")?,
+        }))
+    }
+
+    fn session_ids(&self) -> BTreeSet<String> {
+        self.inner
+            .records()
+            .into_iter()
+            .map(|record| record.session_id)
+            .collect()
+    }
+}
+
+pub fn default_opencode_ownership_path() -> Result<PathBuf> {
+    if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(state_home).join("open-agent-view/opencode-owned.json"));
+    }
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".local/state/open-agent-view/opencode-owned.json"))
+}
 
 /// A command prefix for an OpenCode installation on the host or in Docker.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,6 +106,8 @@ pub struct OpenCodeSource {
     runner: Arc<dyn CommandRunner>,
     supervisor: Option<Arc<OpenCodeSupervisor>>,
     discover_external_history: bool,
+    probe: HolderProbe,
+    ownership: Option<Arc<OpenCodeOwnership>>,
 }
 
 /// Read-only history control plus optional exact owned-server lifecycle.
@@ -73,6 +118,9 @@ pub struct OpenCodeController {
     executable: String,
     source: OpenCodeSource,
     supervisor: Option<Arc<OpenCodeSupervisor>>,
+    /// Sessions this controller starts in OpenCode's own interface where no
+    /// managed server exists, listed without `--include-external`.
+    ownership: Option<Arc<OpenCodeOwnership>>,
 }
 
 impl OpenCodeController {
@@ -82,6 +130,7 @@ impl OpenCodeController {
             source: OpenCodeSource::host(executable.clone()),
             executable,
             supervisor: None,
+            ownership: None,
         }
     }
 
@@ -91,7 +140,16 @@ impl OpenCodeController {
             source: OpenCodeSource::managed(executable.clone(), supervisor.clone()),
             executable,
             supervisor: Some(supervisor),
+            ownership: None,
         }
+    }
+
+    /// Start new sessions in OpenCode's interface and record them in
+    /// `ownership`. Without a managed server this is how the dashboard
+    /// launches OpenCode.
+    pub fn with_ownership(mut self, ownership: Arc<OpenCodeOwnership>) -> Self {
+        self.ownership = Some(ownership);
+        self
     }
 }
 
@@ -101,7 +159,7 @@ impl ProviderController for OpenCodeController {
     }
 
     fn launch_mode(&self) -> LaunchMode {
-        if self.supervisor.is_some() {
+        if self.supervisor.is_some() || self.ownership.is_some() {
             LaunchMode::SelectableModel
         } else {
             LaunchMode::Unavailable
@@ -109,7 +167,11 @@ impl ProviderController for OpenCodeController {
     }
 
     fn launch_presentation(&self) -> LaunchPresentation {
-        LaunchPresentation::DeferredForeground
+        if self.supervisor.is_some() {
+            LaunchPresentation::DeferredForeground
+        } else {
+            LaunchPresentation::Foreground
+        }
     }
 
     fn available_models(&self) -> Result<Vec<String>> {
@@ -165,6 +227,13 @@ impl ProviderController for OpenCodeController {
             message: format!("started managed OpenCode session {}", session.title),
             provider_session_hint: Some(session.id),
         })
+    }
+
+    fn launch_foreground(&self, request: &LaunchRequest) -> Result<ControlOutcome> {
+        if self.supervisor.is_some() {
+            return self.launch(request);
+        }
+        self.open_new_session(request)
     }
 
     fn inspect(&self, session: &AgentSession) -> Result<String> {
@@ -224,23 +293,32 @@ impl ProviderController for OpenCodeController {
                 .current_dir(&session.cwd);
             command
         };
-        match crate::native_session::run(command, &session.id)? {
-            crate::native_session::NativeSessionExit::Backgrounded => Ok(ControlOutcome {
-                message: format!(
-                    "backgrounded OpenCode session {}; Enter/Right resumes it",
-                    session.name
-                ),
-                provider_session_hint: Some(session.provider_session_id.clone()),
-            }),
-            crate::native_session::NativeSessionExit::Exited(status) if status.success() => {
-                Ok(ControlOutcome {
-                    message: format!("returned from OpenCode session {}", session.name),
-                    provider_session_hint: Some(session.provider_session_id.clone()),
-                })
-            }
-            crate::native_session::NativeSessionExit::Exited(status) => {
-                bail!("OpenCode session exited with status {status}")
-            }
+        native_outcome(
+            crate::native_session::run(command, &session.id)?,
+            &session.provider_session_id,
+            &session.name,
+        )
+    }
+}
+
+fn native_outcome(
+    exit: crate::native_session::NativeSessionExit,
+    session_id: &str,
+    name: &str,
+) -> Result<ControlOutcome> {
+    match exit {
+        crate::native_session::NativeSessionExit::Backgrounded => Ok(ControlOutcome {
+            message: format!("backgrounded OpenCode session {name}; Enter/Right resumes it"),
+            provider_session_hint: Some(session_id.to_owned()),
+        }),
+        crate::native_session::NativeSessionExit::Exited(status) if status.success() => {
+            Ok(ControlOutcome {
+                message: format!("returned from OpenCode session {name}"),
+                provider_session_hint: Some(session_id.to_owned()),
+            })
+        }
+        crate::native_session::NativeSessionExit::Exited(status) => {
+            bail!("OpenCode session exited with status {status}")
         }
     }
 }
@@ -263,6 +341,74 @@ impl OpenCodeController {
         self.owned_session(session)?
             .context("refusing to control an OpenCode session not created by this supervisor")
     }
+
+    /// Open OpenCode's interface with the task already submitted, then record
+    /// the session it created. OpenCode chooses session IDs itself, so the new
+    /// one is found afterwards as the only root session created in the
+    /// requested directory since the launch.
+    fn open_new_session(&self, request: &LaunchRequest) -> Result<ControlOutcome> {
+        if request.provider != Provider::OpenCode {
+            bail!("the OpenCode controller cannot launch another provider");
+        }
+        let ownership = self
+            .ownership
+            .as_ref()
+            .context("OpenCode launch is not configured")?;
+        let prompt = request.prompt.trim();
+        if prompt.is_empty() {
+            bail!("the OpenCode launch prompt cannot be empty");
+        }
+        if !request.cwd.is_absolute() {
+            bail!("the OpenCode workspace must be absolute");
+        }
+        let mut command = Command::new(&self.executable);
+        command.current_dir(&request.cwd);
+        if let Some(model) = request.model.as_deref() {
+            validate_model(model)?;
+            command.arg(format!("--model={model}"));
+        }
+        // The `=` form keeps a prompt that starts with `-` from being read as
+        // an option. OpenCode submits it once the interface is ready.
+        command.arg(format!("--prompt={prompt}"));
+        let launched_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let launch_key = format!(
+            "opencode:host:launch-{}",
+            crate::native_session::new_session_id()?
+        );
+        let exit = crate::native_session::run(command, &launch_key)?;
+        let session_id = poll_unique(
+            "one new OpenCode session in the requested workspace",
+            LAUNCH_DISCOVERY_TIMEOUT,
+            || {
+                self.source
+                    .sessions_created_since(&request.cwd, launched_ms)
+            },
+        )?;
+        ownership
+            .inner
+            .record(&session_id, &request.cwd, prompt, None, "OpenCode")?;
+        if matches!(exit, crate::native_session::NativeSessionExit::Backgrounded) {
+            crate::native_session::rename_key(&launch_key, &format!("opencode:host:{session_id}"))?;
+        }
+        native_outcome(exit, &session_id, &session_id)
+    }
+}
+
+fn validate_model(model: &str) -> Result<()> {
+    let valid = model
+        .split_once('/')
+        .is_some_and(|(provider, name)| !provider.is_empty() && !name.trim().is_empty())
+        && model.len() <= 256
+        && !model
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace());
+    if !valid {
+        bail!("OpenCode models are provider/model identifiers without spaces");
+    }
+    Ok(())
 }
 
 impl OpenCodeSource {
@@ -274,6 +420,8 @@ impl OpenCodeSource {
             runner: Arc::new(CancellableProcessRunner::default()),
             supervisor: None,
             discover_external_history: true,
+            probe: Arc::new(opencode_live::probe_host_holders),
+            ownership: None,
         }
     }
 
@@ -285,6 +433,8 @@ impl OpenCodeSource {
             runner: Arc::new(CancellableProcessRunner::default()),
             supervisor: Some(supervisor),
             discover_external_history: true,
+            probe: Arc::new(opencode_live::probe_host_holders),
+            ownership: None,
         }
     }
 
@@ -300,6 +450,8 @@ impl OpenCodeSource {
             runner: Arc::new(CancellableProcessRunner::default()),
             supervisor: Some(supervisor),
             discover_external_history: false,
+            probe: Arc::new(opencode_live::probe_host_holders),
+            ownership: None,
         }
     }
 
@@ -321,7 +473,16 @@ impl OpenCodeSource {
             runner: Arc::new(CancellableProcessRunner::default()),
             supervisor: None,
             discover_external_history: true,
+            probe: Arc::new(Vec::new),
+            ownership: None,
         }
+    }
+
+    /// Also list the sessions `ownership` records when external history is
+    /// not requested.
+    pub fn owned(mut self, ownership: Arc<OpenCodeOwnership>) -> Self {
+        self.ownership = Some(ownership);
+        self
     }
 
     fn available_models(&self) -> Result<Vec<String>> {
@@ -378,7 +539,15 @@ impl OpenCodeSource {
             runner,
             supervisor: None,
             discover_external_history: true,
+            probe: Arc::new(Vec::new),
+            ownership: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_probe(mut self, probe: impl Fn() -> Vec<Holder> + Send + Sync + 'static) -> Self {
+        self.probe = Arc::new(probe);
+        self
     }
 }
 
@@ -394,72 +563,66 @@ impl SessionSource for OpenCodeSource {
     fn discover_with_warnings(&self, request: &DiscoveryRequest) -> Result<SourceDiscovery> {
         let mut sessions = BTreeMap::new();
         let mut warnings = Vec::new();
-        // Persisted OpenCode history has no live-state signal and every record
-        // normalizes as Completed. Avoid starting the potentially enormous
-        // global database query when completed sessions were not requested.
-        if self.discover_external_history && request.include_external && request.include_completed {
-            let mut args = self.invocation.prefix_args.clone();
-            args.extend([
-                "db".into(),
-                global_session_query(
-                    request.history_limit.max(1).saturating_add(1),
-                    request.history_oldest_first,
-                ),
-                "--format".into(),
-                "tsv".into(),
-            ]);
-            let mut command = CommandRequest::new(self.invocation.program.clone(), args);
-            command.timeout = Duration::from_secs(8);
-            let mut output = self.runner.run(&command)?;
-            let mut used_global_query = output.status == 0;
-            if output.status != 0 {
-                // Older OpenCode builds do not have `db`; retain their supported,
-                // though potentially workspace-scoped, session-list behavior.
-                let mut args = self.invocation.prefix_args.clone();
-                args.extend([
-                    "session".into(),
-                    "list".into(),
-                    "--format".into(),
-                    "json".into(),
-                ]);
-                let mut fallback = CommandRequest::new(self.invocation.program.clone(), args);
-                fallback.timeout = Duration::from_secs(8);
-                output = self.runner.run(&fallback)?;
-                used_global_query = false;
-                if output.status != 0 {
-                    bail!(
-                        "OpenCode global discovery and session-list fallback failed with status {}: {}",
-                        output.status,
-                        output.stderr_lossy()
-                    );
+        let external = self.discover_external_history && request.include_external;
+        let owned = match (&self.ownership, external) {
+            (Some(ownership), false) => ownership.session_ids(),
+            _ => BTreeSet::new(),
+        };
+        if external || !owned.is_empty() {
+            let holders = if self.runtime == Runtime::Host {
+                (self.probe)()
+            } else {
+                Vec::new()
+            };
+            // Persisted history that no live process holds is completed.
+            // Avoid starting the potentially enormous global database query
+            // when completed sessions are hidden and nothing runs OpenCode.
+            if request.include_completed || !holders.is_empty() {
+                let history_limit = request.history_limit.max(1);
+                let scope = if external {
+                    Scope::Recent {
+                        limit: history_limit.saturating_add(1),
+                        oldest_first: request.history_oldest_first,
+                        pinned: opencode_live::named_sessions(&holders),
+                    }
+                } else {
+                    Scope::Only(owned)
+                };
+                let mut history = self.normalize_with_live_state(self.query(&scope)?, &holders);
+                if request.history_oldest_first {
+                    history.sort_by_key(|session| session.updated_at);
+                } else {
+                    history.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+                }
+                let mut completed = 0usize;
+                let mut truncated = false;
+                for session in history {
+                    if session.state == SessionState::Completed {
+                        if !request.include_completed {
+                            continue;
+                        }
+                        if completed >= history_limit {
+                            truncated = true;
+                            continue;
+                        }
+                        completed += 1;
+                    }
+                    if request
+                        .cwd
+                        .as_ref()
+                        .map(|cwd| session.cwd.starts_with(cwd))
+                        .unwrap_or(true)
+                    {
+                        sessions.insert(session.provider_session_id.clone(), session);
+                    }
+                }
+                if truncated {
+                    warnings.push(format!(
+                        "OpenCode history is limited to {} records for this refresh; increase --history-limit to load more",
+                        history_limit
+                    ));
                 }
             }
-
-            let mut history = if used_global_query {
-                parse_opencode_db_rows(output.stdout_text()?, self.runtime.clone())?
-            } else {
-                parse_opencode_session_list(output.stdout_text()?, self.runtime.clone())?
-            };
-            let history_limit = request.history_limit.max(1);
-            if history.len() > history_limit {
-                history.truncate(history_limit);
-                warnings.push(format!(
-                    "OpenCode history is limited to {} records for this refresh; increase --history-limit to load more",
-                    history_limit
-                ));
-            }
-            sessions.extend(
-                history
-                    .into_iter()
-                    .filter(|session| {
-                        request
-                            .cwd
-                            .as_ref()
-                            .map(|cwd| session.cwd.starts_with(cwd))
-                            .unwrap_or(true)
-                    })
-                    .map(|session| (session.provider_session_id.clone(), session)),
-            );
         }
         if let Some(supervisor) = &self.supervisor {
             for managed in supervisor.list()? {
@@ -486,15 +649,212 @@ impl SessionSource for OpenCodeSource {
     }
 }
 
+/// Which persisted sessions one discovery reads.
+enum Scope {
+    /// The most recently updated sessions, plus sessions a live process names
+    /// on its command line even when they fall outside that window.
+    Recent {
+        limit: usize,
+        oldest_first: bool,
+        pinned: BTreeSet<String>,
+    },
+    /// Exactly these sessions.
+    Only(BTreeSet<String>),
+}
+
+impl OpenCodeSource {
+    fn query(&self, scope: &Scope) -> Result<Vec<OpenCodeRecord>> {
+        let mut args = self.invocation.prefix_args.clone();
+        args.extend([
+            "db".into(),
+            session_query(scope),
+            "--format".into(),
+            "tsv".into(),
+        ]);
+        let mut command = CommandRequest::new(self.invocation.program.clone(), args);
+        command.timeout = Duration::from_secs(8);
+        let output = self.runner.run(&command)?;
+        if output.status == 0 {
+            return parse_opencode_db_records(output.stdout_text()?);
+        }
+        // Older OpenCode builds do not have `db`; retain their supported,
+        // though potentially workspace-scoped, session-list behavior.
+        let mut args = self.invocation.prefix_args.clone();
+        args.extend([
+            "session".into(),
+            "list".into(),
+            "--format".into(),
+            "json".into(),
+        ]);
+        let mut fallback = CommandRequest::new(self.invocation.program.clone(), args);
+        fallback.timeout = Duration::from_secs(8);
+        let output = self.runner.run(&fallback)?;
+        if output.status != 0 {
+            bail!(
+                "OpenCode global discovery and session-list fallback failed with status {}: {}",
+                output.status,
+                output.stderr_lossy()
+            );
+        }
+        let mut records = parse_opencode_session_records(output.stdout_text()?)?;
+        if let Scope::Only(ids) = scope {
+            records.retain(|record| ids.contains(&record.id));
+        }
+        Ok(records)
+    }
+
+    fn normalize_with_live_state(
+        &self,
+        records: Vec<OpenCodeRecord>,
+        holders: &[Holder],
+    ) -> Vec<AgentSession> {
+        let assigned = if holders.is_empty() {
+            BTreeMap::new()
+        } else {
+            let candidates = records
+                .iter()
+                .map(|record| Candidate {
+                    id: &record.id,
+                    directory: &record.directory,
+                    created_ms: record.created,
+                    updated_ms: record.updated,
+                })
+                .collect::<Vec<_>>();
+            opencode_live::assign(holders, &candidates)
+        };
+        records
+            .into_iter()
+            .map(|mut record| {
+                let last = record.last.take();
+                let mut session = normalize_record(record, self.runtime.clone());
+                if self.runtime == Runtime::Host {
+                    let holder = assigned.get(&session.provider_session_id);
+                    apply_live_state(&mut session, last.as_ref(), holder);
+                }
+                session
+            })
+            .collect()
+    }
+}
+
+impl OpenCodeSource {
+    /// Root sessions created in `cwd` at or after `since_ms`.
+    fn sessions_created_since(&self, cwd: &Path, since_ms: u64) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Created {
+            id: String,
+            directory: PathBuf,
+        }
+        let mut args = self.invocation.prefix_args.clone();
+        args.extend([
+            "db".into(),
+            format!(
+                "SELECT json_object('id', id, 'directory', directory) AS record FROM session WHERE parent_id IS NULL AND time_created >= {}",
+                since_ms.saturating_sub(2_000)
+            ),
+            "--format".into(),
+            "tsv".into(),
+        ]);
+        let mut command = CommandRequest::new(self.invocation.program.clone(), args);
+        command.timeout = Duration::from_secs(8);
+        let output = self.runner.run(&command)?;
+        if output.status != 0 {
+            bail!(
+                "OpenCode session lookup exited with status {}: {}",
+                output.status,
+                output.stderr_lossy()
+            );
+        }
+        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_owned());
+        Ok(output
+            .stdout_text()?
+            .lines()
+            .skip(1)
+            .filter_map(|line| serde_json::from_str::<Created>(line).ok())
+            .filter(|created| {
+                std::fs::canonicalize(&created.directory)
+                    .unwrap_or_else(|_| created.directory.clone())
+                    == cwd
+            })
+            .map(|created| created.id)
+            .collect())
+    }
+}
+
+/// Replace the persisted-history state of a session that a live OpenCode
+/// process runs.
+fn apply_live_state(
+    session: &mut AgentSession,
+    last: Option<&LastMessage>,
+    holder: Option<&Holder>,
+) {
+    let background = crate::native_session::background_screen_contents(&session.id);
+    let Some(pid) = background
+        .as_ref()
+        .map(|(pid, _)| *pid)
+        .or(holder.map(|holder| holder.pid))
+    else {
+        return;
+    };
+    let (state, raw_state) = background
+        .as_ref()
+        .and_then(|(_, screen)| opencode_live::screen_state(screen))
+        .unwrap_or_else(|| {
+            opencode_live::held_state(last, holder.map_or(0, |holder| holder.started_ms))
+        });
+    session.state = state;
+    session.raw_state = Some(raw_state.into());
+    session.pid = Some(pid);
+}
+
+fn session_query(scope: &Scope) -> String {
+    match scope {
+        Scope::Recent {
+            limit,
+            oldest_first,
+            pinned,
+        } => {
+            let recent = global_session_query(*limit, *oldest_first);
+            match sql_id_list(pinned) {
+                None => recent,
+                Some(ids) => format!(
+                    "SELECT record FROM ({recent}) UNION ALL SELECT record FROM ({GLOBAL_SESSION_ROWS} AND s.id IN ({ids}))"
+                ),
+            }
+        }
+        Scope::Only(ids) => format!(
+            "{GLOBAL_SESSION_ROWS} AND s.id IN ({})",
+            sql_id_list(ids).unwrap_or_else(|| "NULL".into())
+        ),
+    }
+}
+
 fn global_session_query(limit: usize, oldest_first: bool) -> String {
     format!(
-        "{GLOBAL_SESSION_ROWS} ORDER BY time_updated {} LIMIT {}",
+        "{GLOBAL_SESSION_ROWS} ORDER BY s.time_updated {} LIMIT {}",
         if oldest_first { "ASC" } else { "DESC" },
         limit.max(1)
     )
 }
 
-fn parse_opencode_db_rows(input: &str, runtime: Runtime) -> Result<Vec<AgentSession>> {
+/// A quoted SQL list of the IDs that are plain OpenCode identifiers. Anything
+/// else comes from an arbitrary command line or file and is left out.
+fn sql_id_list(ids: &BTreeSet<String>) -> Option<String> {
+    let quoted = ids
+        .iter()
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                })
+        })
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>();
+    (!quoted.is_empty()).then(|| quoted.join(", "))
+}
+
+fn parse_opencode_db_records(input: &str) -> Result<Vec<OpenCodeRecord>> {
     let mut lines = input.lines();
     let Some(header) = lines.next() else {
         return Ok(Vec::new());
@@ -506,9 +866,8 @@ fn parse_opencode_db_rows(input: &str, runtime: Runtime) -> Result<Vec<AgentSess
         .filter(|line| !line.trim().is_empty())
         .enumerate()
         .map(|(index, line)| {
-            let record: OpenCodeRecord = serde_json::from_str(line)
-                .with_context(|| format!("invalid OpenCode db record on row {}", index + 2))?;
-            Ok(normalize_record(record, runtime.clone()))
+            serde_json::from_str(line)
+                .with_context(|| format!("invalid OpenCode db record on row {}", index + 2))
         })
         .collect()
 }
@@ -572,19 +931,23 @@ struct OpenCodeRecord {
     #[allow(dead_code)]
     project_id: String,
     directory: PathBuf,
+    #[serde(default)]
+    last: Option<LastMessage>,
 }
 
 pub fn parse_opencode_session_list(input: &str, runtime: Runtime) -> Result<Vec<AgentSession>> {
+    Ok(parse_opencode_session_records(input)?
+        .into_iter()
+        .map(|record| normalize_record(record, runtime.clone()))
+        .collect())
+}
+
+fn parse_opencode_session_records(input: &str) -> Result<Vec<OpenCodeRecord>> {
     // OpenCode 1.18 emits no bytes, rather than `[]`, when its store is empty.
     if input.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let records: Vec<OpenCodeRecord> =
-        serde_json::from_str(input).context("invalid OpenCode session-list JSON")?;
-    Ok(records
-        .into_iter()
-        .map(|record| normalize_record(record, runtime.clone()))
-        .collect())
+    serde_json::from_str(input).context("invalid OpenCode session-list JSON")
 }
 
 fn render_opencode_export(input: &str) -> Result<String> {
@@ -784,6 +1147,7 @@ mod tests {
             executable: "opencode".into(),
             source,
             supervisor: None,
+            ownership: None,
         };
 
         assert_eq!(
@@ -904,6 +1268,70 @@ mod tests {
         assert_eq!(result.sessions.len(), 2);
         assert_eq!(result.warnings.len(), 1);
         assert!(result.warnings[0].contains("limited to 2 records"));
+    }
+
+    #[test]
+    fn a_live_process_turns_its_session_into_an_active_row() {
+        let mut expected = CommandRequest::new(
+            "opencode",
+            vec![
+                "db".into(),
+                session_query(&Scope::Recent {
+                    limit: 101,
+                    oldest_first: false,
+                    pinned: BTreeSet::from(["ses_1".to_owned()]),
+                }),
+                "--format".into(),
+                "tsv".into(),
+            ],
+        );
+        expected.timeout = Duration::from_secs(8);
+        let runner = Arc::new(FakeRunner {
+            expected,
+            output: Mutex::new(Some(CommandOutput {
+                status: 0,
+                stdout: b"record\n{\"id\":\"ses_1\",\"title\":\"one\",\"updated\":12000,\"created\":9000,\"projectId\":\"global\",\"directory\":\"/work\",\"last\":{\"role\":\"assistant\",\"created\":10000,\"completed\":null,\"question\":0}}\n{\"id\":\"ses_2\",\"title\":\"two\",\"updated\":2,\"created\":1,\"projectId\":\"global\",\"directory\":\"/work\",\"last\":{\"role\":\"assistant\",\"created\":1,\"completed\":null,\"question\":0}}\n".to_vec(),
+                stderr: vec![],
+            })),
+        });
+        let source = OpenCodeSource::with_runner(
+            "test",
+            OpenCodeInvocation::host("opencode"),
+            Runtime::Host,
+            runner,
+        )
+        .with_probe(|| {
+            vec![Holder {
+                pid: 42,
+                started_ms: 5_000,
+                target: opencode_live::Target::Session("ses_1".into()),
+            }]
+        });
+
+        // Completed history is hidden, but a held session is not history.
+        let sessions = source
+            .discover(&DiscoveryRequest {
+                include_external: true,
+                ..DiscoveryRequest::default()
+            })
+            .unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].provider_session_id, "ses_1");
+        assert_eq!(sessions[0].state, SessionState::Working);
+        assert_eq!(sessions[0].pid, Some(42));
+        assert_eq!(sessions[0].raw_state.as_deref(), Some("running turn"));
+    }
+
+    #[test]
+    fn pinned_and_owned_ids_are_quoted_only_when_they_are_plain_identifiers() {
+        let ids = BTreeSet::from([
+            "ses_ok-1".to_owned(),
+            "ses_x') OR 1=1 --".to_owned(),
+            String::new(),
+        ]);
+        assert_eq!(sql_id_list(&ids).as_deref(), Some("'ses_ok-1'"));
+        assert!(session_query(&Scope::Only(BTreeSet::new())).ends_with("AND s.id IN (NULL)"));
     }
 
     #[test]

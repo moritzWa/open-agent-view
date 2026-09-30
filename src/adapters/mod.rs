@@ -16,6 +16,7 @@ mod mistral_vibe;
 mod muse;
 mod native_owned;
 mod opencode;
+mod opencode_live;
 mod pi;
 mod qwen;
 mod session_migrate_native;
@@ -77,7 +78,8 @@ pub use muse::{
     MuseOwnership, MuseSource,
 };
 pub use opencode::{
-    parse_opencode_session_list, OpenCodeController, OpenCodeInvocation, OpenCodeSource,
+    default_opencode_ownership_path, parse_opencode_session_list, OpenCodeController,
+    OpenCodeInvocation, OpenCodeOwnership, OpenCodeSource,
 };
 pub use pi::{default_pi_session_dir, parse_pi_session, PiController, PiSource};
 pub use qwen::{default_qwen_ownership_path, QwenController, QwenOwnership, QwenSource};
