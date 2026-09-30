@@ -145,8 +145,9 @@ update the refresh worker without changing the ownership scope;
 `--hide-completed` selects an active-only startup and `--all` remains a
 compatibility flag. Providers still avoid expensive history work when hidden:
 Claude does not receive its `--all` flag, and
-OpenCode never runs its global persisted-session database query unless both
-external and completed scopes are enabled. Because provider versions can
+OpenCode never runs its global persisted-session database query unless the
+external scope is enabled and completed rows are shown or a live `opencode`
+process could make a row active. Because provider versions can
 violate filters, the discovery engine independently enforces completed,
 interactive, and cwd rules before every partial snapshot is published.
 External history is capped per provider (100 records by default), and a partial

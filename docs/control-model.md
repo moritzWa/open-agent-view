@@ -320,8 +320,21 @@ never grants authority.
 | Archive/delete | Disabled | Disabled |
 
 The supervisor intentionally does not attach to an arbitrary OpenCode TUI or
-unregistered random server. Durable managed control requires Linux; other
-platforms retain CLI history inspection and native resume.
+unregistered random server. Durable managed control requires Linux. Elsewhere
+a dashboard launch runs `opencode --prompt=TASK` in the requested directory,
+then records the single root session created there since the launch in
+`opencode-owned.json`. Ambiguity (two new sessions) refuses to record either.
+These rows are listed without `--include-external` and receive Inspect and
+native open only.
+
+State of CLI sessions comes from observation, never from a claim of control.
+OpenCode keeps busy/idle status and pending permission requests in the memory
+of the process running a session, and a killed process leaves its last turn
+unfinished in the database. So a row is active only while a live `opencode`
+process holds it, found through `ps` plus the process's exact argument vector
+and working directory. The screen of a frontend this dashboard holds in the
+background is read first; otherwise the newest message decides, counting only
+turns written after the holder started. Unattributed sessions stay completed.
 
 ## Cursor ownership boundary
 

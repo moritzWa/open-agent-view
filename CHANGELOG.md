@@ -38,6 +38,10 @@ and future released versions are intended to follow Semantic Versioning.
   leaving the dashboard. The jump waits while Peek or another panel is open,
   is dropped once you move the cursor, and a restored row that the current
   filter excludes is reported instead of timing out.
+- OpenCode is a launch harness outside Linux. Choosing it opens OpenCode's
+  interface with the task already submitted, and the session it creates is
+  recorded as the dashboard's own, so its row is listed without
+  `--include-external` and Enter/Right reattaches it.
 
 ### Fixed
 
@@ -70,6 +74,13 @@ and future released versions are intended to follow Semantic Versioning.
   filter, local rename, and migration name, which are single-line fields.
 - Pasted tabs are visible in the composer; they render as spaces and stay tabs
   in the submitted prompt.
+- OpenCode rows show their real state instead of always "completed". A session
+  an `opencode` process is running is working while its turn runs and needs
+  input when it waits at the prompt or on a question. For a session left
+  running behind the dashboard, OpenCode's own screen decides, which also
+  catches permission requests. A turn left unfinished by a killed process no
+  longer reads as working. Subagent sessions are no longer listed as separate
+  rows. Live state works on macOS and Linux.
 
 ### Tests
 

@@ -49,7 +49,7 @@ Open Agent View is already up to date.
 | `--no-host-codex` | Disable host Codex discovery and supervision. |
 | `--pi-bin PATH` / `--pi-session-dir PATH` | Select Pi and optionally override its documented history store. |
 | `--no-host-pi` | Disable host Pi history and managed supervision. |
-| `--opencode-bin PATH` / `--no-host-opencode` | Select or disable OpenCode history plus durable managed supervision on Linux. |
+| `--opencode-bin PATH` / `--no-host-opencode` | Select or disable OpenCode history and launch: durable managed supervision on Linux, OpenCode's own interface elsewhere. |
 | `--copilot-bin PATH` / `--no-host-copilot` | Select or disable persisted Copilot discovery and process-local managed ACP control. |
 | `--cursor-bin PATH` / `--no-host-cursor` | Select or disable Cursor support on the host. External chats are read from Cursor's own chat store with `--include-external --include-interactive`. On Linux, launch and inline reply go through OAV's managed supervisor. Elsewhere, choosing Cursor in the harness list runs `cursor-agent create-chat` and opens that chat with the prompt in Cursor's interface; OAV records the chat id in `cursor-owned.json`, so its row is listed without `--include-external`. Inline reply stays Linux-only. |
 | `--cursor-chats-dir PATH` | Override the chat store Cursor's CLI writes to (default `~/.cursor/chats`). |
@@ -532,6 +532,23 @@ same exact authenticated loopback server/session rather than starting a second
 server. They do not yet expose provider permission or structured-input
 requests. External OpenCode history remains inspect/native-open only.
 
+Outside Linux, a new OpenCode task opens OpenCode's interface with the task
+submitted. The session it creates is recorded as OAV's own and listed without
+`--include-external`; it has Inspect and native open but no inline control.
+
+OpenCode rows that a live `opencode` process runs (a TUI, or a headless
+`opencode run`) are shown as working or needs input rather than completed. For a
+session held in the background by this dashboard, OpenCode's screen decides:
+the footer's interrupt hint means working, a permission or question panel or an
+idle prompt means needs input. Otherwise the newest persisted message decides,
+counting only turns written after that process started, so a turn cut off by a
+killed process does not read as working. A permission prompt in another
+terminal is not recorded by OpenCode and reads as working there. Sessions no
+live process runs are completed history. A process started with `--session ID`
+holds exactly that session; any other holds the newest session it created in
+its working directory, or failing that the one it most recently touched there.
+Live state needs `ps` and, on macOS, `lsof`; on Windows every row is history.
+
 New Pi dashboard tasks open its full native interface first and save into OAV's
 managed session directory. Managed Pi RPC rows expose Ctrl+X stop while their exact RPC process is alive,
 including an idle process after a completed turn. Stop closes the selected
@@ -552,6 +569,7 @@ when `XDG_STATE_HOME` is unset, the current implementation stores:
 | `codex-supervisor/` | Detached App Server record, socket, locks, log, and owned Codex thread/turn IDs. |
 | `pi/` | Detached Linux RPC supervisor record, socket, locks/logs, and OAV-owned Pi session history. |
 | `opencode/` | Private authenticated-loopback server record, lock, log, and exact OAV-owned OpenCode session IDs. |
+| `opencode-owned.json` | OpenCode sessions launched in OpenCode's own interface outside Linux: exact IDs, workspaces, and names. |
 | `cursor/` | Linux ownership registry, process identities, locks, and bounded logs for OAV-owned Cursor runs. |
 | `copilot/` | Exact OAV-created Copilot IDs, workspaces, titles, latest bounded summaries, provider timestamps, and registry lock. No credentials or full transcripts. |
 | `cursor-owned.json` | Exact Cursor chat IDs this dashboard created outside Linux, so their rows are listed without `--include-external`. |
