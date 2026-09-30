@@ -216,14 +216,11 @@ fn render_session_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
         let collapsed = app.collapsed.contains(&group.key);
         let suffix = collapsed.then(|| format!(" {}", group.sessions.len()));
         lines.push(styled_line(
-            vec![Span::styled(
-                format!(
-                    "{}{}",
-                    sanitize_inline(&group.label),
-                    suffix.unwrap_or_default()
-                ),
-                Style::default().add_modifier(Modifier::BOLD),
-            )],
+            vec![Span::raw(format!(
+                "{}{}",
+                sanitize_inline(&group.label),
+                suffix.unwrap_or_default()
+            ))],
             is_selected,
         ));
 
@@ -373,8 +370,8 @@ fn render_session_row(
         truncate(session.provider.label(), provider_width),
         provider_width,
     );
-    let state_prefix = (view_mode == ViewMode::Directory)
-        .then(|| format!("{} · ", short_state(session.state)))
+    let state_label = (view_mode == ViewMode::Directory)
+        .then(|| short_state(session.state))
         .unwrap_or_default();
     let age = format_age(session.age(SystemTime::now()));
     let prs = session
@@ -391,19 +388,31 @@ fn render_session_row(
     };
     let fixed = 5 + name_width + provider_width + display_width(&right);
     let summary_width = (width as usize).saturating_sub(fixed).max(1);
-    let summary = truncate(&format!("{state_prefix}{}", session.summary), summary_width);
     let name = pad_to_width(truncate(&session.name, name_width), name_width);
-    let summary = pad_to_width(summary, summary_width);
-    let spans = vec![
+    let mut spans = vec![
         Span::styled(format!(" {symbol} "), symbol_style),
-        Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(
-            format!(" {provider} "),
-            Style::default().fg(palette().accent),
-        ),
-        Span::styled(summary, Style::default().fg(palette().dim)),
-        Span::styled(right, Style::default().fg(palette().dim)),
+        Span::raw(name),
+        Span::styled(format!(" {provider} "), Style::default().fg(palette().dim)),
     ];
+    let label = truncate(state_label, summary_width);
+    let label_width = display_width(&label);
+    if label_width > 0 {
+        spans.push(Span::styled(label, symbol_style));
+    }
+    let separator = if label_width > 0 && !session.summary.is_empty() {
+        " · "
+    } else {
+        ""
+    };
+    let rest = summary_width.saturating_sub(label_width);
+    if rest > 0 {
+        let summary = truncate(&format!("{separator}{}", session.summary), rest);
+        spans.push(Span::styled(
+            pad_to_width(summary, rest),
+            Style::default().fg(palette().dim),
+        ));
+    }
+    spans.push(Span::styled(right, Style::default().fg(palette().dim)));
     styled_line(spans, selected)
 }
 
@@ -1563,7 +1572,7 @@ fn state_symbol(state: SessionState, live_animation_visible: bool) -> &'static s
 fn state_color(state: SessionState) -> Color {
     match state {
         SessionState::ReadyForReview | SessionState::NeedsInput => palette().attention,
-        SessionState::Working => palette().accent,
+        SessionState::Working => palette().fg,
         SessionState::Completed => palette().complete,
         SessionState::Unknown => palette().dim,
     }
@@ -2007,6 +2016,29 @@ mod tests {
         let completed = session("done", SessionState::Completed);
         let completed = render_session_row(&completed, ViewMode::Status, 120, false, false);
         assert_eq!(completed.spans[0].content, " • ");
+    }
+
+    #[test]
+    fn directory_row_colors_the_state_label_and_keeps_the_harness_quiet() {
+        for (state, label, color) in [
+            (SessionState::NeedsInput, "Needs input", palette().attention),
+            (SessionState::Completed, "Done", palette().complete),
+            (SessionState::Working, "Working", palette().fg),
+        ] {
+            let item = session("worker", state);
+            let row = render_session_row(&item, ViewMode::Directory, 120, false, true);
+            let provider = row
+                .spans
+                .iter()
+                .find(|span| span.content.contains("Claude"))
+                .unwrap();
+            assert_eq!(provider.style.fg, Some(palette().dim));
+            let state_span = row.spans.iter().find(|span| span.content == label).unwrap();
+            assert_eq!(state_span.style.fg, Some(color));
+            let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+            assert!(text.contains(&format!("{label} · latest summary from worker")));
+            assert_eq!(display_width(&text), 120);
+        }
     }
 
     #[test]

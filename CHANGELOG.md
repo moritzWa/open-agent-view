@@ -43,6 +43,14 @@ and future released versions are intended to follow Semantic Versioning.
   recorded as the dashboard's own, so its row is listed without
   `--include-external` and Enter/Right reattaches it.
 
+### Changed
+
+- Session rows follow Claude Code's agent view. In directory view the state
+  word takes the state's color (Needs input and Review amber, Done green,
+  Working in the normal text color) ahead of a grey summary, the harness name
+  is grey instead of accent blue, and session names and group headings are no
+  longer bold.
+
 ### Fixed
 
 - Pasting multi-line text into the composer no longer submits once per line.
