@@ -4,7 +4,8 @@
 //! Plain Left and Right remain available to edit the provider's input line. At
 //! a cursor boundary, the first arrow is still forwarded and opens a short,
 //! visible return window; pressing the same arrow again returns to the
-//! dashboard. Shift+Left and Shift+Right are immediate equivalents. The
+//! dashboard. OpenCode sessions return on that first Left instead.
+//! Shift+Left and Shift+Right are immediate equivalents. The
 //! provider process keeps running on its own pseudo-terminal, and a drain
 //! thread holds the screen it produces. Selecting the same row attaches that
 //! live screen again.
@@ -661,7 +662,7 @@ fn bridge_session(
         }
     }
     let mut parser = DetachParser::default();
-    let mut return_gesture = ReturnGesture::default();
+    let mut return_gesture = ReturnGesture::for_session(session_key);
     let mut current_size = terminal_size(libc::STDIN_FILENO).ok();
     if let Some(size) = current_size {
         set_pty_size(master.as_raw_fd(), size)?;
@@ -715,6 +716,7 @@ fn bridge_session(
             }
             forward_ready_initial_input(&mut initial_input, &screen, &mut master)?;
         }
+        let mut detach = false;
         if descriptors[1].revents & libc::POLLIN != 0 {
             let mut input = [0_u8; 256];
             let read =
@@ -728,7 +730,6 @@ fn bridge_session(
                 }
                 std::cmp::Ordering::Equal => {}
                 std::cmp::Ordering::Greater => {
-                    let mut detach = false;
                     for action in parser.push(&input[..read as usize]) {
                         match action {
                             InputAction::Forward(bytes) => {
@@ -762,36 +763,36 @@ fn bridge_session(
                             }
                         }
                     }
-                    if detach {
-                        // The provider keeps its controlling terminal, which is
-                        // the private pseudo-terminal, not the dashboard's.
-                        // Stopping it here aborts an in-flight model request.
-                        restore_dashboard_terminal_modes(&mut stdout)?;
-                        let drain = start_output_drain(master, screen)?;
-                        detached_registry()
-                            .lock()
-                            .map_err(|_| {
-                                anyhow!("provider-native background registry lock was poisoned")
-                            })?
-                            .insert(
-                                session_key.to_owned(),
-                                DetachedSession {
-                                    child: Some(child),
-                                    warning,
-                                    drain: Some(drain),
-                                },
-                            );
-                        return Ok(NativeSessionExit::Backgrounded);
-                    }
                 }
             }
         }
-        if let Some(bytes) = parser.flush_expired() {
-            return_gesture.clear(&mut stdout, &screen)?;
-            master.write_all(&bytes)?;
-            master.flush()?;
+        if !detach {
+            if let Some(bytes) = parser.flush_expired() {
+                return_gesture.clear(&mut stdout, &screen)?;
+                master.write_all(&bytes)?;
+                master.flush()?;
+            }
+            detach = return_gesture.update(&mut stdout, &screen)?;
         }
-        return_gesture.update(&mut stdout, &screen)?;
+        if detach {
+            // The provider keeps its controlling terminal, which is the
+            // private pseudo-terminal, not the dashboard's. Stopping it here
+            // aborts an in-flight model request.
+            restore_dashboard_terminal_modes(&mut stdout)?;
+            let drain = start_output_drain(master, screen)?;
+            detached_registry()
+                .lock()
+                .map_err(|_| anyhow!("provider-native background registry lock was poisoned"))?
+                .insert(
+                    session_key.to_owned(),
+                    DetachedSession {
+                        child: Some(child),
+                        warning,
+                        drain: Some(drain),
+                    },
+                );
+            return Ok(NativeSessionExit::Backgrounded);
+        }
         if redraw_restore_at.is_some_and(|at| Instant::now() >= at) {
             redraw_restore_at = None;
             if let Some(size) = current_size {
@@ -1422,9 +1423,19 @@ struct ReturnGesture {
     probe: Option<ArrowProbe>,
     armed: Option<ArmedReturn>,
     hint_visible: bool,
+    immediate_left: bool,
 }
 
 impl ReturnGesture {
+    /// OpenCode has no view of its own behind Left at the input boundary, so
+    /// one Left that reaches it returns to the dashboard without a second press.
+    fn for_session(session_key: &str) -> Self {
+        Self {
+            immediate_left: session_key.starts_with("opencode:"),
+            ..Self::default()
+        }
+    }
+
     fn begin_probe(
         &mut self,
         direction: ArrowDirection,
@@ -1454,7 +1465,8 @@ impl ReturnGesture {
                 .unwrap_or(true)
     }
 
-    fn update(&mut self, output: &mut impl Write, screen: &vt100::Parser) -> Result<()> {
+    /// Advance the return window; `true` means the settled arrow itself returns.
+    fn update(&mut self, output: &mut impl Write, screen: &vt100::Parser) -> Result<bool> {
         let now = Instant::now();
         if screen.screen().hide_cursor()
             && self
@@ -1467,14 +1479,18 @@ impl ReturnGesture {
                 .map_or(true, |armed| armed.cursor_guard.is_some())
         {
             self.clear(output, screen)?;
-            return Ok(());
+            return Ok(false);
         }
         if let Some(probe) = self.probe.as_ref() {
             if !probe.allow_cursor_change && screen.screen().cursor_position() != probe.cursor {
                 self.clear(output, screen)?;
-                return Ok(());
+                return Ok(false);
             }
             if now.duration_since(probe.started) >= ARROW_SETTLE_DELAY {
+                if self.immediate_left && probe.direction == ArrowDirection::Left {
+                    self.clear(output, screen)?;
+                    return Ok(true);
+                }
                 self.armed = Some(ArmedReturn {
                     direction: probe.direction,
                     cursor_guard: (!probe.allow_cursor_change).then_some(probe.cursor),
@@ -1486,7 +1502,7 @@ impl ReturnGesture {
         }
 
         let Some(armed) = self.armed.as_mut() else {
-            return Ok(());
+            return Ok(false);
         };
         if now >= armed.expires
             || armed
@@ -1494,7 +1510,7 @@ impl ReturnGesture {
                 .is_some_and(|cursor| screen.screen().cursor_position() != cursor)
         {
             self.clear(output, screen)?;
-            return Ok(());
+            return Ok(false);
         }
         let remaining = armed.expires.saturating_duration_since(now);
         let bucket = remaining.as_millis() as u64 / RETURN_HINT_REFRESH.as_millis() as u64;
@@ -1503,7 +1519,7 @@ impl ReturnGesture {
             armed.last_bucket = Some(bucket);
             self.hint_visible = true;
         }
-        Ok(())
+        Ok(false)
     }
 
     fn clear(&mut self, output: &mut impl Write, screen: &vt100::Parser) -> Result<()> {
@@ -1939,5 +1955,42 @@ mod tests {
 
         assert!(gesture.should_detach(ArrowDirection::Left, &screen));
         assert!(String::from_utf8_lossy(&output).contains("Press ← again"));
+    }
+
+    fn settled_left(session_key: &str, screen: &mut vt100::Parser, moved: &[u8]) -> bool {
+        let mut gesture = ReturnGesture::for_session(session_key);
+        gesture.begin_probe(
+            ArrowDirection::Left,
+            screen.screen().cursor_position(),
+            false,
+        );
+        screen.process(moved);
+        std::thread::sleep(ARROW_SETTLE_DELAY + Duration::from_millis(10));
+        gesture.update(&mut Vec::new(), screen).unwrap()
+    }
+
+    #[test]
+    fn opencode_returns_on_one_left_at_the_input_boundary() {
+        let mut screen = vt100::Parser::new(40, 120, 0);
+        screen.process(b"\x1b[21;27H\x1b[?25h");
+        assert!(settled_left("opencode:host:abc", &mut screen, b""));
+    }
+
+    #[test]
+    fn opencode_left_that_moves_the_cursor_stays_in_the_session() {
+        let mut screen = vt100::Parser::new(40, 120, 0);
+        screen.process(b"\x1b[21;29H\x1b[?25h");
+        assert!(!settled_left(
+            "opencode:host:abc",
+            &mut screen,
+            b"\x1b[21;28H"
+        ));
+    }
+
+    #[test]
+    fn other_providers_still_need_a_second_left() {
+        let mut screen = vt100::Parser::new(40, 120, 0);
+        screen.process(b"\x1b[21;27H\x1b[?25h");
+        assert!(!settled_left("claude:host:abc", &mut screen, b""));
     }
 }
