@@ -8,6 +8,11 @@ and future released versions are intended to follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Directory view lists each directory's sessions newest-created first instead
+  of by state, so replying to a session no longer moves its row or the cursor.
+
 ## [0.1.53] - 2026-09-04
 
 ### Added
