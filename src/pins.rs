@@ -91,6 +91,31 @@ impl PinnedSessions {
             .expect("pinned-session registry mutex poisoned") = records;
         Ok(())
     }
+
+    /// Overwrite `pinned_at_ms` for ids that are still pinned, which is what
+    /// orders the Pinned group. Ids pinned nowhere are ignored.
+    pub fn set_pinned_at(&self, updates: &[(String, u64)]) -> Result<()> {
+        for (session_id, _) in updates {
+            validate_session_id(session_id)?;
+        }
+        let parent = self
+            .path
+            .parent()
+            .context("pinned-session registry path has no parent")?;
+        let _lock = RegistryLock::acquire(&parent.join("pinned-sessions.lock"))?;
+        let mut records = read_registry(&self.path)?;
+        for (session_id, pinned_at_ms) in updates {
+            if let Some(record) = records.get_mut(session_id) {
+                *record = *pinned_at_ms;
+            }
+        }
+        write_registry(&self.path, &records)?;
+        *self
+            .records
+            .lock()
+            .expect("pinned-session registry mutex poisoned") = records;
+        Ok(())
+    }
 }
 
 pub fn default_pinned_sessions_path() -> Result<PathBuf> {
@@ -103,7 +128,7 @@ pub fn default_pinned_sessions_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local/state/open-agent-view/pinned-sessions.json"))
 }
 
-fn validate_session_id(session_id: &str) -> Result<()> {
+pub(crate) fn validate_session_id(session_id: &str) -> Result<()> {
     if session_id.is_empty() || session_id.len() > MAX_SESSION_ID_BYTES {
         bail!("session ID must contain between 1 and {MAX_SESSION_ID_BYTES} bytes");
     }
@@ -180,7 +205,7 @@ fn write_registry(path: &Path, records: &BTreeMap<String, u64>) -> Result<()> {
     result
 }
 
-fn ensure_private_directory(path: &Path) -> Result<()> {
+pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
     if !path.exists() {
         fs::create_dir_all(path)
             .with_context(|| format!("failed to create private directory {}", path.display()))?;
@@ -208,7 +233,7 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_private_regular_file(path: &Path) -> Result<()> {
+pub(crate) fn ensure_private_regular_file(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -228,12 +253,12 @@ fn ensure_private_regular_file(path: &Path) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct RegistryLock {
+pub(crate) struct RegistryLock {
     file: File,
 }
 
 impl RegistryLock {
-    fn acquire(path: &Path) -> Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
         match fs::symlink_metadata(path) {
             Ok(_) => ensure_private_regular_file(path)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -256,7 +281,7 @@ impl RegistryLock {
             use std::os::fd::AsRawFd;
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
                 return Err(std::io::Error::last_os_error())
-                    .context("failed to lock pinned-session registry");
+                    .with_context(|| format!("failed to lock {}", path.display()));
             }
         }
         Ok(Self { file })
@@ -273,10 +298,10 @@ impl Drop for RegistryLock {
     }
 }
 
-fn temporary_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn temporary_path(path: &Path) -> Result<PathBuf> {
     let name = path
         .file_name()
-        .context("pinned-session registry path has no file name")?
+        .with_context(|| format!("{} has no file name", path.display()))?
         .to_string_lossy();
     let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     Ok(path.with_file_name(format!(".{name}.tmp-{}-{sequence}", std::process::id())))

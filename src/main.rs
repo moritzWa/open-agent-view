@@ -1063,6 +1063,7 @@ fn main() -> Result<()> {
         &control,
         hidden_sessions,
         PinnedSessions::load_default()?,
+        open_agent_view::order::SessionOrder::load_default()?,
         last_harness,
         LastView::load_default()?,
         session_aliases,

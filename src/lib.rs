@@ -16,6 +16,7 @@ pub mod maintenance;
 pub mod migration;
 pub mod native_session;
 pub mod opencode_supervisor;
+pub mod order;
 pub mod pi_supervisor;
 pub mod pins;
 pub mod process;

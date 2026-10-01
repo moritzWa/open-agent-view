@@ -1050,6 +1050,7 @@ fn help_actions(app: &App) -> Vec<String> {
     actions.push("ctrl+l to refresh".into());
     if app.selected_session().is_some() {
         actions.push("ctrl+t or ctrl+p to pin the session to the top".into());
+        actions.push("option+up/down to move the session within its group".into());
     }
     if app.selected_session().is_some_and(|session| {
         session.runtime == crate::domain::Runtime::Host

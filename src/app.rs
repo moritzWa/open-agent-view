@@ -193,6 +193,12 @@ pub enum AppAction {
         session_id: String,
         pinned: bool,
     },
+    /// Remember swapped sort keys after a manual move. The row order is
+    /// already updated. Pinned rows store theirs as pin times.
+    SetSortKeys {
+        pinned: bool,
+        keys: Vec<(String, u64)>,
+    },
     /// Load the locally hidden registry into the restore picker.
     BrowseHidden,
     /// Remove one ID from the local hidden registry and reveal its row.
@@ -240,6 +246,7 @@ pub struct App {
     pub migration_targets: Vec<Provider>,
     pub migration_selection: usize,
     pub pinned: BTreeMap<String, u64>,
+    pub sort_keys: BTreeMap<String, u64>,
     pub hidden_candidates: Vec<HiddenSessionRecord>,
     pub hidden_filter: String,
     pub hidden_selection: usize,
@@ -325,6 +332,7 @@ impl App {
             migration_targets: Vec::new(),
             migration_selection: 0,
             pinned: BTreeMap::new(),
+            sort_keys: BTreeMap::new(),
             hidden_candidates: Vec::new(),
             restorable: BTreeMap::new(),
             hidden_ids: BTreeSet::new(),
@@ -1497,6 +1505,104 @@ impl App {
         self.rebuild_group_cache();
     }
 
+    pub fn set_sort_keys(&mut self, sort_keys: BTreeMap<String, u64>) {
+        self.sort_keys = sort_keys;
+        self.rebuild_group_cache();
+    }
+
+    fn directory_sort_key(&self, session: &AgentSession) -> u64 {
+        self.sort_keys.get(&session.id).copied().unwrap_or_else(|| {
+            session
+                .started_at
+                .and_then(|started| started.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map_or(0, |since| since.as_millis() as u64)
+        })
+    }
+
+    /// Swap the selected session with its neighbour in the same group.
+    /// `delta` is -1 for up and 1 for down. Persistence is the caller's job.
+    pub fn move_selected_session(&mut self, delta: isize) -> AppAction {
+        let Some(session) = self.selected_session() else {
+            self.set_notice("select a session to move");
+            return AppAction::None;
+        };
+        let session_id = session.id.clone();
+        let Some(index) = self.session_indices.get(&session_id).copied() else {
+            return AppAction::None;
+        };
+        let Some(group) = self
+            .groups()
+            .iter()
+            .find(|group| group.sessions.contains(&index))
+        else {
+            return AppAction::None;
+        };
+        let pinned = group.key == "pinned";
+        if !pinned && self.view_mode != ViewMode::Directory {
+            self.set_notice("reorder sessions in the directory view (ctrl+s) or pin them");
+            return AppAction::None;
+        }
+        let position = group
+            .sessions
+            .iter()
+            .position(|candidate| *candidate == index)
+            .expect("group contains the selected session");
+        let Some(target_position) = position
+            .checked_add_signed(delta)
+            .filter(|target| *target < group.sessions.len())
+        else {
+            self.set_notice(if delta < 0 {
+                "already at the top of its group"
+            } else {
+                "already at the bottom of its group"
+            });
+            return AppAction::None;
+        };
+        let rows = group.sessions.clone();
+        let ids: Vec<String> = rows
+            .iter()
+            .map(|row| self.snapshot.sessions[*row].id.clone())
+            .collect();
+        let before: Vec<u64> = rows
+            .iter()
+            .zip(&ids)
+            .map(|(row, id)| {
+                if pinned {
+                    self.pinned.get(id).copied().unwrap_or(0)
+                } else {
+                    self.directory_sort_key(&self.snapshot.sessions[*row])
+                }
+            })
+            .collect();
+        // Groups sort by descending key with ties in row order. Make keys
+        // strictly descending first, so swapping two always moves the rows.
+        let mut after = before.clone();
+        for index in (0..after.len().saturating_sub(1)).rev() {
+            if after[index] <= after[index + 1] {
+                after[index] = after[index + 1] + 1;
+            }
+        }
+        after.swap(position, target_position);
+        let keys: Vec<(String, u64)> = ids
+            .into_iter()
+            .zip(before.into_iter().zip(after))
+            .filter(|(id, (old, new))| old != new || *id == session_id)
+            .map(|(id, (_, new))| (id, new))
+            .collect();
+        let target = if pinned {
+            &mut self.pinned
+        } else {
+            &mut self.sort_keys
+        };
+        for (id, key) in &keys {
+            target.insert(id.clone(), *key);
+        }
+        self.rebuild_group_cache();
+        self.select_and_reveal_session(&session_id);
+        self.notice = None;
+        AppAction::SetSortKeys { pinned, keys }
+    }
+
     /// Pin or unpin the selected session and move it into or out of the
     /// leading Pinned group. Persistence is the caller's job.
     pub fn toggle_pin(&mut self) -> AppAction {
@@ -1630,9 +1736,8 @@ impl App {
             sessions.sort_by(|left, right| {
                 let left = &self.snapshot.sessions[*left];
                 let right = &self.snapshot.sessions[*right];
-                right
-                    .started_at
-                    .cmp(&left.started_at)
+                self.directory_sort_key(right)
+                    .cmp(&self.directory_sort_key(left))
                     .then_with(|| left.id.cmp(&right.id))
             });
             Group {
@@ -3591,6 +3696,109 @@ mod tests {
         snapshot.sessions[1].state = SessionState::ReadyForReview;
         app.replace_snapshot(snapshot);
         assert_eq!(order(&app), ["new", "mid", "old"]);
+    }
+
+    #[test]
+    fn moving_a_session_swaps_it_with_its_neighbour_and_keeps_new_ones_on_top() {
+        let started = |id: &str, secs| {
+            let mut item = session(id, SessionState::Working);
+            item.started_at = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+            item
+        };
+        let mut app = app_with(vec![
+            started("old", 1),
+            started("new", 3),
+            started("mid", 2),
+        ]);
+        app.set_view_mode(ViewMode::Directory);
+        let order = |app: &App| -> Vec<String> {
+            app.group_cache[0]
+                .sessions
+                .iter()
+                .map(|index| app.snapshot.sessions[*index].id.clone())
+                .collect()
+        };
+        app.selection = Some(SelectionKey::Session("old".into()));
+
+        let AppAction::SetSortKeys { pinned, keys } = app.move_selected_session(-1) else {
+            panic!("expected a sort-key action");
+        };
+        assert!(!pinned);
+        assert_eq!(keys, [("mid".into(), 1000), ("old".into(), 2000)]);
+        assert_eq!(order(&app), ["new", "old", "mid"]);
+        app.move_selected_session(-1);
+        assert_eq!(order(&app), ["old", "new", "mid"]);
+        assert_eq!(app.move_selected_session(-1), AppAction::None);
+        assert_eq!(app.selection, Some(SelectionKey::Session("old".into())));
+
+        let mut snapshot = app.snapshot.clone();
+        snapshot.sessions.push(started("newest", 4));
+        app.replace_snapshot(snapshot);
+        assert_eq!(order(&app), ["newest", "old", "new", "mid"]);
+    }
+
+    #[test]
+    fn moving_sessions_without_start_times_moves_exactly_one_place() {
+        let mut app = app_with(vec![
+            session("a", SessionState::Working),
+            session("b", SessionState::Working),
+            session("c", SessionState::Working),
+        ]);
+        app.set_view_mode(ViewMode::Directory);
+        let order = |app: &App| -> Vec<String> {
+            app.group_cache[0]
+                .sessions
+                .iter()
+                .map(|index| app.snapshot.sessions[*index].id.clone())
+                .collect()
+        };
+        assert_eq!(order(&app), ["a", "b", "c"]);
+        app.selection = Some(SelectionKey::Session("b".into()));
+        app.move_selected_session(1);
+        assert_eq!(order(&app), ["a", "c", "b"]);
+        app.move_selected_session(-1);
+        app.move_selected_session(-1);
+        assert_eq!(order(&app), ["b", "a", "c"]);
+    }
+
+    #[test]
+    fn moving_a_pinned_session_reorders_the_pinned_group() {
+        let mut app = app_with(vec![
+            session("one", SessionState::Working),
+            session("two", SessionState::Working),
+        ]);
+        app.set_pins(BTreeMap::from([("one".into(), 20), ("two".into(), 10)]));
+        app.selection = Some(SelectionKey::Session("two".into()));
+
+        let AppAction::SetSortKeys { pinned, keys } = app.move_selected_session(-1) else {
+            panic!("expected a sort-key action");
+        };
+        assert!(pinned);
+        assert_eq!(keys, [("one".into(), 10), ("two".into(), 20)]);
+        assert_eq!(app.groups()[0].label, "Pinned");
+        assert_eq!(
+            app.groups()[0]
+                .sessions
+                .iter()
+                .map(|index| app.snapshot.sessions[*index].id.as_str())
+                .collect::<Vec<_>>(),
+            ["two", "one"]
+        );
+    }
+
+    #[test]
+    fn moving_an_unpinned_session_in_status_view_explains_where_it_works() {
+        let mut app = app_with(vec![
+            session("one", SessionState::Working),
+            session("two", SessionState::Working),
+        ]);
+        app.set_view_mode(ViewMode::Status);
+        app.selection = Some(SelectionKey::Session("two".into()));
+        assert_eq!(app.move_selected_session(-1), AppAction::None);
+        assert!(app
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("directory view")));
     }
 
     #[test]
