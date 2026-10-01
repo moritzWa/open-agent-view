@@ -472,7 +472,10 @@ impl ControlHub {
             return Ok(self.launch_cwd.clone());
         };
         if !cwd.is_absolute() || !cwd.is_dir() {
-            bail!("launch directory {} is not an existing directory", cwd.display());
+            bail!(
+                "launch directory {} is not an existing directory",
+                cwd.display()
+            );
         }
         Ok(cwd)
     }

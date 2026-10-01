@@ -757,7 +757,7 @@ pub fn run_dashboard(
                                 &effect.hide_session_ids,
                             ) {
                                 Ok(count) => app.set_notice(format!(
-                                    "hid {count} session{} locally; provider history was retained",
+                                    "hid {count} session{} locally; provider history was retained · ctrl+g to restore",
                                     if count == 1 { "" } else { "s" }
                                 )),
                                 Err(error) => {
@@ -1367,6 +1367,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
             KeyCode::Right if by_line => Some(CursorMovement::LineEnd),
             KeyCode::Left if by_word => Some(CursorMovement::WordLeft),
             KeyCode::Right if by_word => Some(CursorMovement::WordRight),
+            // Terminals without "Option as Meta" arrow sequences send
+            // Option+Left/Right as the readline ESC b / ESC f.
+            KeyCode::Char('b') if by_word => Some(CursorMovement::WordLeft),
+            KeyCode::Char('f') if by_word => Some(CursorMovement::WordRight),
             KeyCode::Left => Some(CursorMovement::Left),
             KeyCode::Right => Some(CursorMovement::Right),
             KeyCode::Up => Some(CursorMovement::Up),
@@ -3220,6 +3224,29 @@ mod tests {
 
         app.escape();
         assert_eq!(app.input_cursor(), app.input.len());
+    }
+
+    #[test]
+    fn composer_jumps_words_on_readline_alt_b_and_alt_f() {
+        let mut app = app();
+        app.start_new_session(None);
+        app.input = "one two three".into();
+        handle_key(
+            &mut app,
+            modified_key(KeyCode::Char('b'), KeyModifiers::ALT),
+        );
+        assert_eq!(app.input_cursor(), 8);
+        handle_key(
+            &mut app,
+            modified_key(KeyCode::Char('b'), KeyModifiers::ALT),
+        );
+        assert_eq!(app.input_cursor(), 4);
+        handle_key(
+            &mut app,
+            modified_key(KeyCode::Char('f'), KeyModifiers::ALT),
+        );
+        assert_eq!(app.input_cursor(), 7);
+        assert_eq!(app.input, "one two three");
     }
 
     #[test]

@@ -6,9 +6,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{
-    hidden_picker_rows_for_height, is_active_session_state, App, ComposerMode,
-    ConfirmTarget, Overlay, SelectionKey, ViewMode, MIGRATION_PICKER_PAGE_SIZE,
-    MODEL_PICKER_PAGE_SIZE,
+    hidden_picker_rows_for_height, is_active_session_state, App, ComposerMode, ConfirmTarget,
+    Overlay, SelectionKey, ViewMode, MIGRATION_PICKER_PAGE_SIZE, MODEL_PICKER_PAGE_SIZE,
 };
 use crate::domain::{AgentSession, Capability, Provider, SessionState};
 
@@ -1037,6 +1036,7 @@ fn help_actions(app: &App) -> Vec<String> {
     actions.push("ctrl+j for newline".into());
     actions.push("tab for new task/harness picker".into());
     actions.push("/harness [name] switches harness".into());
+    actions.push("/cd path starts the next session in any directory".into());
     actions.push("/model [name|default] selects a model (or Terminal shell)".into());
     actions.push("/shell [name|default] selects a Terminal shell".into());
     actions.push("/login opens native setup".into());

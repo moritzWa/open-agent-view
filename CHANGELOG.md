@@ -10,6 +10,9 @@ and future released versions are intended to follow Semantic Versioning.
 
 ### Added
 
+- `/cd path` starts the next new session in any directory, including one with
+  no sessions yet. `~` and paths relative to the current launch directory work;
+  the header shows the choice, and `/cd` alone clears it.
 - Cursor is a launch harness on every platform. Choosing it from the harness
   list creates a chat and opens it in Cursor's interface. Outside Linux the
   chat is recorded as the dashboard's own, so its row is listed on return
@@ -62,6 +65,8 @@ and future released versions are intended to follow Semantic Versioning.
 
 ### Fixed
 
+- Option+Left/Right word jumps in the composer now also work in terminals that
+  send them as the readline `ESC b` / `ESC f`, which used to type `b` or `f`.
 - Pasting multi-line text into the composer no longer submits once per line.
   Without bracketed paste, each line break in a clipboard arrived as Enter, so
   a large paste could start hundreds of coding-agent sessions at once. The

@@ -45,6 +45,7 @@ const DASHBOARD_COMMANDS: &[&str] = &[
     "/shell",
     "/login",
     "/setup",
+    "/cd",
     "/completed",
     "/filter",
 ];
@@ -226,6 +227,9 @@ pub struct App {
     pub launch_targets: Vec<LaunchTarget>,
     pub launch_provider: Provider,
     pub launch_model: Option<String>,
+    /// Directory chosen with `/cd` for the next new session. It wins over the
+    /// directory view selection and is cleared once a session launches there.
+    pub launch_directory_override: Option<PathBuf>,
     pub yolo: bool,
     pub yolo_supported_providers: BTreeSet<Provider>,
     pub harness_selection: usize,
@@ -310,6 +314,7 @@ impl App {
             launch_targets,
             launch_provider,
             launch_model: None,
+            launch_directory_override: None,
             yolo: false,
             yolo_supported_providers: BTreeSet::new(),
             harness_selection,
@@ -557,6 +562,9 @@ impl App {
     /// The project directory selected in the directory view, which the header
     /// shows and new sessions start in.
     pub fn launch_directory(&self) -> Option<PathBuf> {
+        if let Some(directory) = &self.launch_directory_override {
+            return Some(directory.clone());
+        }
         if self.view_mode != ViewMode::Directory {
             return None;
         }
@@ -1952,11 +1960,13 @@ impl App {
                 self.set_input(input);
                 return self.open_model_picker();
             }
+            let cwd = self.launch_directory();
+            self.launch_directory_override = None;
             return AppAction::Launch {
                 provider: self.launch_provider.clone(),
                 model: self.launch_model.clone(),
                 prompt: input,
-                cwd: self.launch_directory(),
+                cwd,
             };
         }
         let (command, argument) = input
@@ -1989,6 +1999,7 @@ impl App {
                     "unknown harness {argument}; use /help for supported setup names"
                 )),
             },
+            "/cd" => self.select_launch_directory(argument),
             "/completed" => return self.select_completed_visibility(argument),
             // Alternative to ctrl+g, which multiplexers such as Zellij bind
             // to their own lock mode before OAV can see it.
@@ -2004,6 +2015,44 @@ impl App {
             _ => self.set_notice(format!("unknown dashboard command {command}; use /help")),
         }
         AppAction::None
+    }
+
+    fn select_launch_directory(&mut self, argument: &str) {
+        if argument.is_empty() {
+            self.launch_directory_override = None;
+            self.set_notice("new sessions start in the selected or launch directory");
+            return;
+        }
+        let path = match argument.strip_prefix('~') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                match std::env::var_os("HOME") {
+                    Some(home) => PathBuf::from(home).join(rest.trim_start_matches('/')),
+                    None => {
+                        self.set_notice("cannot expand ~ because HOME is not set");
+                        return;
+                    }
+                }
+            }
+            _ => PathBuf::from(argument),
+        };
+        let path = if path.is_absolute() {
+            path
+        } else {
+            match self
+                .launch_directory()
+                .or_else(|| std::env::current_dir().ok())
+            {
+                Some(base) => base.join(path),
+                None => path,
+            }
+        };
+        match path.canonicalize() {
+            Ok(directory) if directory.is_dir() => {
+                self.set_notice(format!("next session starts in {}", directory.display()));
+                self.launch_directory_override = Some(directory);
+            }
+            _ => self.set_notice(format!("{} is not an existing directory", path.display())),
+        }
     }
 
     fn select_launch_provider(&mut self, argument: &str) {
@@ -3203,7 +3252,10 @@ mod tests {
 
         app.start_new_session(None);
         app.input = "status view".into();
-        assert!(matches!(app.activate(), AppAction::Launch { cwd: None, .. }));
+        assert!(matches!(
+            app.activate(),
+            AppAction::Launch { cwd: None, .. }
+        ));
 
         app.toggle_view();
         app.selection = Some(SelectionKey::Group("cwd:/home/user".into()));
@@ -3221,6 +3273,37 @@ mod tests {
             app.activate(),
             AppAction::Launch { cwd: Some(cwd), .. } if cwd == PathBuf::from("/home/user/code/arca")
         ));
+    }
+
+    #[test]
+    fn cd_starts_the_next_session_in_a_directory_without_sessions() {
+        let root = std::env::temp_dir().join(format!("oav-cd-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("fresh")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let fresh = root.join("fresh");
+        let mut app = app_with(vec![session("one", SessionState::Working)]);
+
+        app.start_new_session(None);
+        app.input = format!("/cd {}", root.join("missing").display());
+        assert!(matches!(app.activate(), AppAction::None));
+        assert_eq!(app.launch_directory(), None);
+
+        app.start_new_session(None);
+        app.input = format!("/cd {}", root.display());
+        app.activate();
+        app.start_new_session(None);
+        app.input = "/cd fresh".into();
+        app.activate();
+        assert_eq!(app.launch_directory(), Some(fresh.clone()));
+
+        app.start_new_session(None);
+        app.input = "task".into();
+        assert!(matches!(
+            app.activate(),
+            AppAction::Launch { cwd: Some(cwd), .. } if cwd == fresh
+        ));
+        assert_eq!(app.launch_directory(), None);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
