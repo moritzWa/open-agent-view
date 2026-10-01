@@ -532,8 +532,8 @@ same exact authenticated loopback server/session rather than starting a second
 server. They do not yet expose provider permission or structured-input
 requests. External OpenCode history remains inspect/native-open only.
 
-Outside Linux, a new OpenCode task opens OpenCode's interface with the task
-submitted. The session it creates is recorded as OAV's own and listed without
+Outside Linux, a new OpenCode task opens OpenCode's interface and pastes the
+task into its editor once it is ready. The session it creates is recorded as OAV's own and listed without
 `--include-external`; it has Inspect and native open but no inline control.
 
 OpenCode rows that a live `opencode` process runs (a TUI, or a headless
@@ -542,11 +542,17 @@ session held in the background by this dashboard, OpenCode's screen decides:
 the footer's interrupt hint means working, a permission or question panel or an
 idle prompt means needs input. Otherwise the newest persisted message decides,
 counting only turns written after that process started, so a turn cut off by a
-killed process does not read as working. A permission prompt in another
+killed process does not read as working. A background subagent (OpenCode's
+`task` tool with `background: true`, its closest equivalent of a monitor) keeps
+its parent working until the subagent's turn ends. An idle prompt on the
+dashboard's own screen yields to that, and to a turn another process is running
+for the same session. A permission prompt in another
 terminal is not recorded by OpenCode and reads as working there. Sessions no
 live process runs are completed history. A process started with `--session ID`
-holds exactly that session; any other holds the newest session it created in
-its working directory, or failing that the one it most recently touched there.
+holds exactly that session. Any other holds one session in its working
+directory that changed since it started: sessions with an unfinished turn
+written in the last ten minutes are matched first, each to the process that
+created it if that one is free, otherwise to the newest free process.
 Live state needs `ps` and, on macOS, `lsof`; on Windows every row is history.
 
 New Pi dashboard tasks open its full native interface first and save into OAV's

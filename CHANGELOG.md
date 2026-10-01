@@ -39,7 +39,7 @@ and future released versions are intended to follow Semantic Versioning.
   is dropped once you move the cursor, and a restored row that the current
   filter excludes is reported instead of timing out.
 - OpenCode is a launch harness outside Linux. Choosing it opens OpenCode's
-  interface with the task already submitted, and the session it creates is
+  interface and submits the task once its editor is ready, and the session it creates is
   recorded as the dashboard's own, so its row is listed without
   `--include-external` and Enter/Right reattaches it.
 
@@ -88,8 +88,10 @@ and future released versions are intended to follow Semantic Versioning.
   input when it waits at the prompt or on a question. For a session left
   running behind the dashboard, OpenCode's own screen decides, which also
   catches permission requests. A turn left unfinished by a killed process no
-  longer reads as working. Subagent sessions are no longer listed as separate
-  rows. Live state works on macOS and Linux.
+  longer reads as working. A background subagent keeps its parent working, and
+  opening a session that another process is running does not make it look
+  idle. A session in the middle of a turn is credited to the `opencode`
+  process in its directory before a session that process merely created. Subagent sessions are no longer listed as separate rows. Live state works on macOS and Linux.
 
 ### Tests
 
