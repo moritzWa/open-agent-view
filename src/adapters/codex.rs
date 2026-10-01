@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{DiscoveryRequest, SessionSource, SourceDiscovery};
-use crate::codex_rpc::{AppServerClient, AppServerInvocation};
+use crate::codex_rpc::{AppServerClient, AppServerInvocation, OversizedResponse};
 use crate::codex_supervisor::CodexSupervisor;
 use crate::domain::{AgentSession, Provider, Runtime, SessionKind, SessionState};
 
@@ -149,9 +149,12 @@ impl CodexSource {
         let mut cursor: Option<String> = None;
         let mut records = Vec::new();
         let history_limit = request.history_limit.max(1);
+        // Previews carry each thread's first prompt, so a page of large pastes
+        // can exceed the RPC limit; shrink the page instead of losing Codex.
+        let mut max_page = 100;
         while records.len() < history_limit {
-            let page_limit = (history_limit - records.len()).min(100);
-            let response = transport.request(
+            let page_limit = (history_limit - records.len()).min(max_page);
+            let response = match transport.request(
                 "thread/list",
                 json!({
                     "archived": false,
@@ -162,7 +165,13 @@ impl CodexSource {
                     "sourceKinds": SOURCE_KINDS,
                     "useStateDbOnly": false
                 }),
-            )?;
+            ) {
+                Err(error) if error.is::<OversizedResponse>() && page_limit > 1 => {
+                    max_page = (page_limit / 2).max(1);
+                    continue;
+                }
+                other => other?,
+            };
             let page = parse_codex_thread_list(&response, self.runtime.clone())?;
             records.extend(page.sessions);
             cursor = page.next_cursor;
@@ -232,10 +241,18 @@ fn read_threads(
     thread_ids
         .into_iter()
         .map(|thread_id| {
-            let response = transport.request(
+            let response = match transport.request(
                 "thread/read",
                 json!({"threadId": thread_id, "includeTurns": true}),
-            )?;
+            ) {
+                // Long threads (screenshots, big tool output) can exceed the RPC
+                // limit with turns included; the row only needs the metadata.
+                Err(error) if error.is::<OversizedResponse>() => transport.request(
+                    "thread/read",
+                    json!({"threadId": thread_id, "includeTurns": false}),
+                )?,
+                other => other?,
+            };
             parse_codex_thread_read(&response, runtime.clone())
         })
         .collect()

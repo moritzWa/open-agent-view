@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -9,11 +10,35 @@ use std::time::{Duration, Instant};
 use std::os::unix::net::UnixStream;
 
 use anyhow::{anyhow, bail, Context, Result};
+use serde::Deserialize;
 use serde_json::{json, Value};
 #[cfg(unix)]
 use tungstenite::{client, Message, WebSocket};
 
-const MAX_RPC_MESSAGE_BYTES: usize = 1024 * 1024;
+// Matches tungstenite's default WebSocket message cap; a single thread with
+// pasted files or screenshots routinely exceeds a few MiB.
+const MAX_RPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// A response to one of our requests was larger than the safety limit.
+///
+/// The connection stays usable; only that request fails, so callers can ask
+/// for a smaller shape of the same data.
+#[derive(Debug)]
+pub(crate) struct OversizedResponse {
+    method: String,
+}
+
+impl fmt::Display for OversizedResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "App Server {} response exceeded the {}-byte safety limit",
+            self.method, MAX_RPC_MESSAGE_BYTES
+        )
+    }
+}
+
+impl std::error::Error for OversizedResponse {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AppServerInvocation {
@@ -90,6 +115,7 @@ enum ClientTransport {
 pub(crate) struct AppServerClient {
     transport: ClientTransport,
     pending_responses: BTreeMap<u64, Value>,
+    oversized_responses: BTreeSet<u64>,
     events: VecDeque<Value>,
     next_id: u64,
 }
@@ -124,6 +150,7 @@ impl AppServerClient {
         let mut client = Self {
             transport,
             pending_responses: BTreeMap::new(),
+            oversized_responses: BTreeSet::new(),
             events: VecDeque::new(),
             next_id: 1,
         };
@@ -217,6 +244,12 @@ impl AppServerClient {
         loop {
             if let Some(response) = self.pending_responses.remove(&id) {
                 return response_result(method, response);
+            }
+            if self.oversized_responses.remove(&id) {
+                return Err(OversizedResponse {
+                    method: method.to_owned(),
+                }
+                .into());
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -321,6 +354,17 @@ impl AppServerClient {
             OutputLine::Error(error) => bail!("App Server stdout error: {error}"),
         };
         if line.len() > MAX_RPC_MESSAGE_BYTES {
+            #[derive(Deserialize)]
+            struct Envelope {
+                id: Option<Value>,
+                method: Option<String>,
+            }
+            if let Ok(Envelope { id, method: None }) = serde_json::from_str::<Envelope>(&line) {
+                if let Some(id) = id.as_ref().and_then(Value::as_u64) {
+                    self.oversized_responses.insert(id);
+                    return Ok(());
+                }
+            }
             bail!(
                 "App Server message exceeded the {}-byte safety limit",
                 MAX_RPC_MESSAGE_BYTES

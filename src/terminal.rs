@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -99,6 +100,7 @@ struct LaunchJob {
     provider: Provider,
     model: Option<String>,
     prompt: String,
+    cwd: Option<PathBuf>,
     open_when_visible: bool,
     known_session_ids: BTreeSet<String>,
 }
@@ -664,6 +666,7 @@ pub fn run_dashboard(
                                 provider,
                                 model,
                                 prompt,
+                                cwd,
                             } => {
                                 if let Err(error) = last_harness.save(&provider) {
                                     app.set_notice(format!(
@@ -683,6 +686,7 @@ pub fn run_dashboard(
                                             provider,
                                             model,
                                             prompt,
+                                            cwd,
                                             control,
                                         )
                                     }
@@ -705,6 +709,7 @@ pub fn run_dashboard(
                                                 provider,
                                                 model,
                                                 prompt,
+                                                cwd,
                                                 open_when_visible: presentation
                                                     == LaunchPresentation::DeferredForeground,
                                                 known_session_ids,
@@ -902,8 +907,14 @@ fn schedule_launch(control: ControlHub, job: LaunchJob, sender: mpsc::Sender<Lau
     let operation_provider = job.provider.clone();
     let operation_model = job.model.clone();
     let operation_prompt = job.prompt.clone();
+    let operation_cwd = job.cwd.clone();
     schedule_launch_job(job, sender, move || {
-        control.launch_with(operation_provider, operation_model, operation_prompt)
+        control.launch_with(
+            operation_provider,
+            operation_model,
+            operation_prompt,
+            operation_cwd,
+        )
     });
 }
 
@@ -950,6 +961,7 @@ fn dispatch_foreground_launch<T: DashboardTerminal, C: DashboardControl>(
     provider: Provider,
     model: Option<String>,
     prompt: String,
+    cwd: Option<PathBuf>,
     control: &C,
 ) -> ActionEffect {
     let known_session_ids = provider_session_ids(app, &provider);
@@ -959,7 +971,7 @@ fn dispatch_foreground_launch<T: DashboardTerminal, C: DashboardControl>(
     }
     let retry_model = model.clone();
     let retry_prompt = prompt.clone();
-    let result = control.launch_foreground_session(provider.clone(), model, prompt);
+    let result = control.launch_foreground_session(provider.clone(), model, prompt, cwd);
     let resume = terminal.resume_dashboard();
     match (result, resume) {
         (Ok(outcome), Ok(())) => {
@@ -1565,14 +1577,16 @@ trait DashboardControl {
         provider: Provider,
         model: Option<String>,
         prompt: String,
+        cwd: Option<PathBuf>,
     ) -> Result<ControlOutcome>;
     fn launch_foreground_session(
         &self,
         provider: Provider,
         model: Option<String>,
         prompt: String,
+        cwd: Option<PathBuf>,
     ) -> Result<ControlOutcome> {
-        self.launch_session(provider, model, prompt)
+        self.launch_session(provider, model, prompt, cwd)
     }
     fn authenticate_provider(&self, provider: &Provider) -> Result<ControlOutcome> {
         Err(anyhow!(
@@ -1619,8 +1633,9 @@ impl DashboardControl for ControlHub {
         provider: Provider,
         model: Option<String>,
         prompt: String,
+        cwd: Option<PathBuf>,
     ) -> Result<ControlOutcome> {
-        self.launch_with(provider, model, prompt)
+        self.launch_with(provider, model, prompt, cwd)
     }
 
     fn launch_foreground_session(
@@ -1628,8 +1643,9 @@ impl DashboardControl for ControlHub {
         provider: Provider,
         model: Option<String>,
         prompt: String,
+        cwd: Option<PathBuf>,
     ) -> Result<ControlOutcome> {
-        self.launch_foreground_with(provider, model, prompt)
+        self.launch_foreground_with(provider, model, prompt, cwd)
     }
 
     fn authenticate_provider(&self, provider: &Provider) -> Result<ControlOutcome> {
@@ -1793,9 +1809,10 @@ fn dispatch_action<T: DashboardTerminal, C: DashboardControl>(
             provider,
             model,
             prompt,
+            cwd,
         } => {
             let known_session_ids = provider_session_ids(app, &provider);
-            let result = control.launch_session(provider.clone(), model, prompt);
+            let result = control.launch_session(provider.clone(), model, prompt, cwd);
             match result {
                 Ok(outcome) => {
                     app.set_notice(outcome.message);
@@ -2845,7 +2862,8 @@ mod tests {
             vec![AppAction::Launch {
                 provider: Provider::Claude,
                 model: None,
-                prompt: "ship".into()
+                prompt: "ship".into(),
+                cwd: None,
             }]
         );
 
@@ -2869,7 +2887,8 @@ mod tests {
             vec![AppAction::Launch {
                 provider: Provider::Claude,
                 model: None,
-                prompt: "one\ntwo".into()
+                prompt: "one\ntwo".into(),
+                cwd: None,
             }]
         );
     }
@@ -3026,7 +3045,8 @@ mod tests {
             AppAction::Launch {
                 provider: Provider::Claude,
                 model: None,
-                prompt: "ship".into()
+                prompt: "ship".into(),
+                cwd: None,
             }
         );
     }
@@ -3372,6 +3392,7 @@ mod tests {
             _provider: Provider,
             _model: Option<String>,
             prompt: String,
+            _cwd: Option<PathBuf>,
         ) -> Result<ControlOutcome> {
             let mut outcome = self.invoke("launch", prompt)?;
             outcome.provider_session_hint = self.launch_hint.map(str::to_owned);
@@ -3581,6 +3602,7 @@ mod tests {
                 provider: Provider::Claude,
                 model: None,
                 prompt: "build".into(),
+                cwd: None,
             },
             AppAction::Reply {
                 session_id: "worker".into(),
@@ -3642,6 +3664,7 @@ mod tests {
                 provider: Provider::Pi,
                 model: Some("openai/gpt-5".into()),
                 prompt: "build".into(),
+                cwd: None,
             },
             &control,
         );
@@ -3662,6 +3685,7 @@ mod tests {
                 provider: Provider::Pi,
                 model: None,
                 prompt: "build".into(),
+                cwd: None,
                 open_when_visible: false,
                 known_session_ids: BTreeSet::from(["pi:host:old".into()]),
             },
@@ -3930,6 +3954,7 @@ mod tests {
                     provider: Provider::Claude,
                     model: None,
                     prompt: "x".into(),
+                    cwd: None,
                 },
                 "launch failed",
             ),

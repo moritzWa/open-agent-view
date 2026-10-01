@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{
-    hidden_picker_rows_for_height, is_active_session_state, project_group_path, App, ComposerMode,
+    hidden_picker_rows_for_height, is_active_session_state, App, ComposerMode,
     ConfirmTarget, Overlay, SelectionKey, ViewMode, MIGRATION_PICKER_PAGE_SIZE,
     MODEL_PICKER_PAGE_SIZE,
 };
@@ -1808,21 +1808,7 @@ fn sanitize_multiline(input: &str) -> String {
 }
 
 fn header_directory(app: &App) -> String {
-    let selected_directory = if app.view_mode == ViewMode::Directory {
-        app.selected_session()
-            .map(|session| project_group_path(&session.cwd))
-            .or_else(|| {
-                app.selected_group().and_then(|group| {
-                    group
-                        .sessions
-                        .first()
-                        .map(|index| project_group_path(&app.snapshot.sessions[*index].cwd))
-                })
-            })
-    } else {
-        None
-    };
-    selected_directory
+    app.launch_directory()
         .or_else(|| std::env::current_dir().ok())
         .map(|path| sanitize_inline(&abbreviate_path(&path)))
         .unwrap_or_else(|| "unknown directory".into())
