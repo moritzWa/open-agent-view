@@ -66,7 +66,9 @@ and future released versions are intended to follow Semantic Versioning.
   each refresh, so the first Enter/Right after a restart attaches in about
   100ms instead of waiting seconds for a cold client to load its history.
   These clients stay out of the row's status until opened and are stopped
-  when the dashboard quits.
+  when the dashboard quits. They are told the terminal's colors match the
+  dashboard's light or dark scheme, so OpenCode does not fall back to its dark
+  theme in a light terminal.
 - The dashboard opens on the view it was last left in. Toggling between the
   status and directory views with ctrl+s is remembered across restarts.
 - Directory view lists each directory's sessions newest-created first instead

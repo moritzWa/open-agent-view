@@ -19,6 +19,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::AtomicU8;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
@@ -92,10 +93,34 @@ struct PtyDrain {
 #[cfg(unix)]
 static DETACHED: OnceLock<Mutex<BTreeMap<String, DetachedSession>>> = OnceLock::new();
 
+/// The dashboard's light or dark scheme, used to answer a background
+/// frontend's terminal color queries the way the visible terminal would.
+/// 0 means unknown, and those queries then go unanswered.
+static COLOR_SCHEME: AtomicU8 = AtomicU8::new(0);
+
 /// Keys whose frontend is in front right now, so a concurrent [`prewarm`]
 /// does not park a second client for the same session.
 #[cfg(unix)]
 static FOREGROUND: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+
+/// Record the dashboard's scheme so background frontends that ask for the
+/// terminal's colors start in the same light or dark mode as the terminal.
+pub fn set_color_scheme(scheme: crate::theme::ColorScheme) {
+    let value = match scheme {
+        crate::theme::ColorScheme::Dark => 1,
+        crate::theme::ColorScheme::Light => 2,
+    };
+    COLOR_SCHEME.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+fn color_scheme() -> Option<crate::theme::ColorScheme> {
+    match COLOR_SCHEME.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(crate::theme::ColorScheme::Dark),
+        2 => Some(crate::theme::ColorScheme::Light),
+        _ => None,
+    }
+}
 
 /// Run or reattach one provider-native client. Non-TTY callers retain the
 /// ordinary inherited-stdio behavior used by scripts and unit-test fixtures.
@@ -1119,6 +1144,20 @@ fn process_detached_output(
                 format!("\x1b[{};{}R", u32::from(row) + 1, u32::from(column) + 1)
             }
             TerminalQuery::PrimaryAttributes => "\x1b[?1;2c".to_owned(),
+            TerminalQuery::Foreground | TerminalQuery::Background => {
+                let Some(palette) = color_scheme().map(crate::theme::Palette::for_scheme) else {
+                    continue;
+                };
+                let (slot, color) = if query == TerminalQuery::Foreground {
+                    (10, palette.fg)
+                } else {
+                    (11, palette.bg)
+                };
+                let ratatui::style::Color::Rgb(red, green, blue) = color else {
+                    continue;
+                };
+                format!("\x1b]{slot};rgb:{red:02x}{red:02x}/{green:02x}{green:02x}/{blue:02x}{blue:02x}\x07")
+            }
         };
         let _ = reply.write_all(answer.as_bytes());
     }
@@ -1132,9 +1171,14 @@ enum TerminalQuery {
     CursorPosition,
     /// `CSI c` or `CSI 0 c`
     PrimaryAttributes,
+    /// `OSC 10 ; ?`
+    Foreground,
+    /// `OSC 11 ; ?`, which OpenCode and others use to pick a light or dark theme
+    Background,
 }
 
-/// Incremental CSI scanner, so a query split across two reads is still seen.
+/// Incremental CSI and OSC scanner, so a query split across two reads is
+/// still seen.
 #[cfg(unix)]
 #[derive(Default)]
 struct TerminalQueryScanner {
@@ -1149,6 +1193,8 @@ enum QueryScanState {
     Ground,
     Escape,
     Csi,
+    Osc,
+    OscEscape,
 }
 
 #[cfg(unix)]
@@ -1168,6 +1214,10 @@ impl TerminalQueryScanner {
                     b'[' => {
                         self.parameters.clear();
                         QueryScanState::Csi
+                    }
+                    b']' => {
+                        self.parameters.clear();
+                        QueryScanState::Osc
                     }
                     0x1b => QueryScanState::Escape,
                     _ => QueryScanState::Ground,
@@ -1196,6 +1246,53 @@ impl TerminalQueryScanner {
                     None
                 }
             },
+            QueryScanState::Osc => match byte {
+                0x07 => {
+                    self.state = QueryScanState::Ground;
+                    self.osc_query()
+                }
+                0x1b => {
+                    self.state = QueryScanState::OscEscape;
+                    None
+                }
+                _ => {
+                    // Long payloads (titles, hyperlinks) are never queries;
+                    // keep scanning for their terminator without storing them.
+                    if self.parameters.len() < Self::MAX_PARAMETERS {
+                        self.parameters.push(byte);
+                    } else {
+                        self.parameters.clear();
+                        self.parameters.push(b'-');
+                    }
+                    None
+                }
+            },
+            QueryScanState::OscEscape => {
+                if byte == b'\\' {
+                    self.state = QueryScanState::Ground;
+                    return self.osc_query();
+                }
+                self.state = if byte == b'[' {
+                    self.parameters.clear();
+                    QueryScanState::Csi
+                } else if byte == b']' {
+                    self.parameters.clear();
+                    QueryScanState::Osc
+                } else if byte == 0x1b {
+                    QueryScanState::Escape
+                } else {
+                    QueryScanState::Ground
+                };
+                None
+            }
+        }
+    }
+
+    fn osc_query(&self) -> Option<TerminalQuery> {
+        match self.parameters.as_slice() {
+            b"10;?" => Some(TerminalQuery::Foreground),
+            b"11;?" => Some(TerminalQuery::Background),
+            _ => None,
         }
     }
 }
@@ -1923,6 +2020,41 @@ mod tests {
         );
         assert!(replies.is_empty());
         assert!(screen.screen().contents().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn detached_output_answers_color_queries_with_the_dashboard_scheme() {
+        let mut screen = vt100::Parser::new(24, 80, 0);
+        let mut queries = TerminalQueryScanner::default();
+        let mut replies = Vec::new();
+        set_color_scheme(crate::theme::ColorScheme::Light);
+        process_detached_output(b"\x1b]11;?", &mut screen, &mut queries, &mut replies);
+        assert!(replies.is_empty());
+        process_detached_output(
+            b"\x07\x1b]10;?\x1b\\",
+            &mut screen,
+            &mut queries,
+            &mut replies,
+        );
+        assert_eq!(
+            String::from_utf8(replies.clone()).unwrap(),
+            "\x1b]11;rgb:ffff/ffff/ffff\x07\x1b]10;rgb:3b3b/3b3b/3b3b\x07"
+        );
+        replies.clear();
+        set_color_scheme(crate::theme::ColorScheme::Dark);
+        process_detached_output(b"\x1b]11;?\x07", &mut screen, &mut queries, &mut replies);
+        assert_eq!(replies, b"\x1b]11;rgb:1818/1a1a/1b1b\x07");
+        replies.clear();
+        // Titles, hyperlinks, palette queries, and a long payload that ends in
+        // a query-looking suffix are not answered, and do not hide a CSI query.
+        process_detached_output(
+            b"\x1b]0;title\x07\x1b]8;;https://x.y/11;?\x1b\\\x1b]4;0;?\x07\x1b[6n",
+            &mut screen,
+            &mut queries,
+            &mut replies,
+        );
+        assert_eq!(replies, b"\x1b[1;1R");
     }
 
     #[test]
