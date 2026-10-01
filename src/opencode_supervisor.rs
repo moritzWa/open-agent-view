@@ -420,10 +420,19 @@ impl OpenCodeSupervisor {
             use std::os::unix::process::CommandExt;
 
             let log = private_append_file(&self.state_dir.join("server.log"))?;
-            let mut child = Command::new(&self.executable)
-                // The server outlives the dashboard, so it must not receive the
-                // interrupt or hangup the terminal sends to OAV's process group.
-                .process_group(0)
+            let mut command = Command::new(&self.executable);
+            // The server and the MCP servers it spawns outlive the dashboard and
+            // the terminal app, so they must not share OAV's terminal session:
+            // quitting the terminal otherwise stops the running turns.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command
                 .args([
                     "serve",
                     "--hostname",
