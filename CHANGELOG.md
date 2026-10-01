@@ -16,6 +16,11 @@ and future released versions are intended to follow Semantic Versioning.
   Enter on the same row shows the screen it has produced since.
   While in the background it still answers cursor-position and device
   attribute queries, so a provider that asks for them does not stall.
+- Going back into an OpenCode session no longer keeps a garbled screen until
+  the window is resized. OpenCode only repaints the cells it thinks changed and
+  ignores a resize signal at an unchanged size, so the bridge briefly gives it
+  one row less, hides the frame drawn at that size, and restores the real size
+  to make it repaint everything.
 
 ## [0.1.53] - 2026-09-04
 
