@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use crate::control::RestorableSession;
 use crate::domain::{
     AgentSession, Capability, LaunchTarget, Provider, SessionSnapshot, SessionState,
 };
@@ -59,6 +60,36 @@ pub enum Overlay {
     MigrationTargetPicker { session_id: String },
     Composer(ComposerMode),
     Confirm(ConfirmTarget),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CursorMovement {
+    Left,
+    Right,
+    WordLeft,
+    WordRight,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+}
+
+/// Start of the shell-style word before `end`, skipping whitespace first.
+fn previous_word_boundary(text: &str, end: usize) -> usize {
+    let mut boundary = end;
+    while let Some((index, character)) = text[..boundary].char_indices().next_back() {
+        if !character.is_whitespace() {
+            break;
+        }
+        boundary = index;
+    }
+    while let Some((index, character)) = text[..boundary].char_indices().next_back() {
+        if character.is_whitespace() {
+            break;
+        }
+        boundary = index;
+    }
+    boundary
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,6 +195,12 @@ pub enum AppAction {
     Unhide {
         session_id: String,
     },
+    /// Bring a persisted provider session back into the list, un-hiding it
+    /// first when `hidden` is set, and reveal its row.
+    Restore {
+        session: RestorableSession,
+        hidden: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -181,6 +218,8 @@ pub struct App {
     pub selection: Option<SelectionKey>,
     pub overlay: Overlay,
     pub input: String,
+    /// Byte offset of the composer cursor in `input`; `None` is the end.
+    input_cursor: Option<usize>,
     pub filter: String,
     pub launch_targets: Vec<LaunchTarget>,
     pub launch_provider: Provider,
@@ -198,6 +237,11 @@ pub struct App {
     pub hidden_filter: String,
     pub hidden_selection: usize,
     hidden_picker_rows: usize,
+    /// Persisted sessions the restore picker offers besides hidden ones,
+    /// keyed by row ID.
+    pub restorable: BTreeMap<String, RestorableSession>,
+    hidden_ids: BTreeSet<String>,
+    pub restorable_loading: bool,
     pub models_loading: bool,
     pub models_provider: Option<Provider>,
     pub models_error: Option<String>,
@@ -259,6 +303,7 @@ impl App {
             selection: None,
             overlay: Overlay::None,
             input: String::new(),
+            input_cursor: None,
             filter: String::new(),
             launch_targets,
             launch_provider,
@@ -273,6 +318,9 @@ impl App {
             migration_selection: 0,
             pinned: BTreeMap::new(),
             hidden_candidates: Vec::new(),
+            restorable: BTreeMap::new(),
+            hidden_ids: BTreeSet::new(),
+            restorable_loading: false,
             hidden_filter: String::new(),
             hidden_selection: 0,
             hidden_picker_rows: HIDDEN_PICKER_PAGE_SIZE,
@@ -323,7 +371,7 @@ impl App {
         );
         if self.selection != previous_selection && selection_bound_overlay {
             self.overlay = Overlay::None;
-            self.input.clear();
+            self.clear_input();
         }
     }
 
@@ -520,7 +568,7 @@ impl App {
                         session_id: session.id.clone(),
                         answer: self.input.trim().to_owned(),
                     };
-                    self.input.clear();
+                    self.clear_input();
                     return action;
                 }
                 if !session.capabilities.contains(&Capability::Reply) {
@@ -528,14 +576,14 @@ impl App {
                     self.set_notice(format!(
                         "{name} is read-only; reply authority was not granted"
                     ));
-                    self.input.clear();
+                    self.clear_input();
                     return AppAction::None;
                 }
                 let action = AppAction::Reply {
                     session_id: session.id.clone(),
                     prompt: self.input.trim().to_owned(),
                 };
-                self.input.clear();
+                self.clear_input();
                 action
             }
             Overlay::HarnessPicker => {
@@ -597,13 +645,13 @@ impl App {
             }
             Overlay::Composer(ComposerMode::MigrationName { session_id, .. }) => {
                 self.overlay = Overlay::MigrationTargetPicker { session_id };
-                self.input.clear();
+                self.clear_input();
                 self.notice = None;
                 AppAction::None
             }
             Overlay::MigrationTargetPicker { .. } => {
                 self.overlay = Overlay::None;
-                self.input.clear();
+                self.clear_input();
                 self.notice = None;
                 AppAction::None
             }
@@ -611,12 +659,14 @@ impl App {
                 self.overlay = Overlay::None;
                 self.hidden_filter.clear();
                 self.hidden_candidates.clear();
+                self.restorable.clear();
+                self.restorable_loading = false;
                 self.notice = None;
                 AppAction::None
             }
             _ => {
                 self.overlay = Overlay::None;
-                self.input.clear();
+                self.clear_input();
                 AppAction::None
             }
         }
@@ -655,7 +705,7 @@ impl App {
             return;
         }
         self.overlay = if self.overlay == Overlay::Peek {
-            self.input.clear();
+            self.clear_input();
             Overlay::None
         } else {
             Overlay::Peek
@@ -665,7 +715,7 @@ impl App {
 
     pub fn start_new_session(&mut self, first_character: Option<char>) {
         self.notice = None;
-        self.input.clear();
+        self.clear_input();
         if let Some(character) = first_character {
             self.input.push(character);
         }
@@ -820,7 +870,7 @@ impl App {
     ) {
         self.launch_provider = provider.clone();
         self.launch_model = model;
-        self.input = prompt;
+        self.set_input(prompt);
         self.model_filter.clear();
         self.available_models.clear();
         self.model_selection = 0;
@@ -937,7 +987,7 @@ impl App {
 
     pub fn start_filter(&mut self) {
         self.notice = None;
-        self.input = self.filter.clone();
+        self.set_input(self.filter.clone());
         self.overlay = Overlay::Composer(ComposerMode::Filter);
     }
 
@@ -958,7 +1008,7 @@ impl App {
         let session_id = session.id.clone();
         let name = session.name.clone();
         self.notice = None;
-        self.input = name;
+        self.set_input(name);
         self.overlay = Overlay::Composer(ComposerMode::Rename { session_id });
     }
 
@@ -979,7 +1029,7 @@ impl App {
         let session_id = session.id.clone();
         self.migration_targets = crate::migration::migration_targets(&session.provider);
         self.migration_selection = 0;
-        self.input.clear();
+        self.clear_input();
         self.notice = None;
         self.overlay = Overlay::MigrationTargetPicker { session_id };
     }
@@ -1024,7 +1074,7 @@ impl App {
             self.set_notice("the selected session disappeared during refresh");
             return;
         };
-        self.input = default_migration_name(&session.name, target.label());
+        self.set_input(default_migration_name(&session.name, target.label()));
         self.notice = None;
         self.overlay = Overlay::Composer(ComposerMode::MigrationName { session_id, target });
     }
@@ -1158,7 +1208,127 @@ impl App {
                     || session.capabilities.contains(&Capability::Respond)
             });
         if peek_is_writable || matches!(self.overlay, Overlay::Composer(_)) {
-            self.input.push(character);
+            let cursor = self.input_cursor();
+            self.input.insert(cursor, character);
+            if self.input_cursor.is_some() {
+                self.input_cursor = Some(cursor + character.len_utf8());
+            }
+        }
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.input_cursor = None;
+    }
+
+    fn set_input(&mut self, text: String) {
+        self.input = text;
+        self.input_cursor = None;
+    }
+
+    /// Where typing lands in `input`. Only composers have a movable cursor;
+    /// peek replies and anything else always edit at the end.
+    pub fn input_cursor(&self) -> usize {
+        match self.input_cursor {
+            Some(cursor)
+                if matches!(self.overlay, Overlay::Composer(_))
+                    && self.input.is_char_boundary(cursor) =>
+            {
+                cursor
+            }
+            _ => self.input.len(),
+        }
+    }
+
+    fn place_input_cursor(&mut self, cursor: usize) {
+        self.input_cursor = (cursor < self.input.len()).then_some(cursor);
+    }
+
+    /// Whether Shift/Alt/Ctrl+Enter add a line instead of submitting: true in
+    /// the new-task composer and while writing a peek reply.
+    pub fn draft_accepts_line_breaks(&self) -> bool {
+        self.overlay == Overlay::Composer(ComposerMode::NewSession)
+            || (self.overlay == Overlay::Peek && !self.input.is_empty())
+    }
+
+    /// Whether arrow and Home/End keys move the cursor in the draft instead
+    /// of acting on the dashboard.
+    pub fn input_cursor_movable(&self) -> bool {
+        matches!(self.overlay, Overlay::Composer(_))
+    }
+
+    pub fn move_input_cursor(&mut self, movement: CursorMovement) {
+        if !self.input_cursor_movable() {
+            return;
+        }
+        let cursor = self.input_cursor();
+        let line_start = self.input[..cursor]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let line_end = self.input[cursor..]
+            .find('\n')
+            .map_or(self.input.len(), |index| cursor + index);
+        let target = match movement {
+            CursorMovement::Left => self.input[..cursor]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(index, _)| index),
+            CursorMovement::Right => self.input[cursor..]
+                .chars()
+                .next()
+                .map_or(cursor, |character| cursor + character.len_utf8()),
+            CursorMovement::WordLeft => previous_word_boundary(&self.input, cursor),
+            CursorMovement::WordRight => {
+                let rest = &self.input[cursor..];
+                let skipped = rest.len() - rest.trim_start().len();
+                let word = rest[skipped..]
+                    .find(char::is_whitespace)
+                    .unwrap_or(rest.len() - skipped);
+                cursor + skipped + word
+            }
+            CursorMovement::LineStart => line_start,
+            CursorMovement::LineEnd => line_end,
+            CursorMovement::Up | CursorMovement::Down => {
+                let column = self.input[line_start..cursor].chars().count();
+                let (start, end) = if movement == CursorMovement::Up {
+                    if line_start == 0 {
+                        self.place_input_cursor(0);
+                        return;
+                    }
+                    let end = line_start - 1;
+                    (
+                        self.input[..end].rfind('\n').map_or(0, |index| index + 1),
+                        end,
+                    )
+                } else {
+                    if line_end == self.input.len() {
+                        self.place_input_cursor(line_end);
+                        return;
+                    }
+                    let start = line_end + 1;
+                    let end = self.input[start..]
+                        .find('\n')
+                        .map_or(self.input.len(), |index| start + index);
+                    (start, end)
+                };
+                self.input[start..end]
+                    .char_indices()
+                    .nth(column)
+                    .map_or(end, |(index, _)| start + index)
+            }
+        };
+        self.place_input_cursor(target);
+    }
+
+    /// Delete the character after the cursor (the Delete key).
+    pub fn delete_next_input(&mut self) {
+        if !self.input_cursor_movable() {
+            return;
+        }
+        let cursor = self.input_cursor();
+        if cursor < self.input.len() {
+            self.input.remove(cursor);
+            self.place_input_cursor(cursor);
         }
     }
 
@@ -1222,7 +1392,13 @@ impl App {
             self.hidden_filter.pop();
             self.reconcile_hidden_selection();
         } else {
-            self.input.pop();
+            let cursor = self.input_cursor();
+            if let Some((index, _)) = self.input[..cursor].char_indices().next_back() {
+                self.input.remove(index);
+                if self.input_cursor.is_some() {
+                    self.place_input_cursor(index);
+                }
+            }
         }
     }
 
@@ -1248,30 +1424,38 @@ impl App {
     /// kept as the portable equivalent. Work on Unicode scalar boundaries so
     /// slicing can never split a UTF-8 code point.
     pub fn delete_previous_word(&mut self) {
+        let cursor = self.text_field_cursor();
         let input = self.active_text_field();
-        let mut boundary = input.len();
-        while let Some((index, character)) = input[..boundary].char_indices().next_back() {
-            if !character.is_whitespace() {
-                break;
-            }
-            boundary = index;
-        }
-        while let Some((index, character)) = input[..boundary].char_indices().next_back() {
-            if character.is_whitespace() {
-                break;
-            }
-            boundary = index;
-        }
-        input.truncate(boundary);
-        self.reconcile_picker_selection();
+        let boundary = previous_word_boundary(input, cursor);
+        input.replace_range(boundary..cursor, "");
+        self.after_text_field_delete(boundary);
     }
 
-    /// Delete from the cursor (which is currently always at the end) to the
-    /// beginning of the current line. Cmd+Backspace and Ctrl+U use this path.
+    /// Delete from the cursor to the beginning of its line. Cmd+Backspace and
+    /// Ctrl+U use this path.
     pub fn delete_to_line_start(&mut self) {
+        let cursor = self.text_field_cursor();
         let input = self.active_text_field();
-        let boundary = input.rfind('\n').map_or(0, |index| index + 1);
-        input.truncate(boundary);
+        let boundary = input[..cursor].rfind('\n').map_or(0, |index| index + 1);
+        input.replace_range(boundary..cursor, "");
+        self.after_text_field_delete(boundary);
+    }
+
+    /// Picker filters are always edited at their end.
+    fn text_field_cursor(&self) -> usize {
+        match self.overlay {
+            Overlay::ModelPicker => self.model_filter.len(),
+            Overlay::HiddenPicker => self.hidden_filter.len(),
+            _ => self.input_cursor(),
+        }
+    }
+
+    fn after_text_field_delete(&mut self, cursor: usize) {
+        if !matches!(self.overlay, Overlay::ModelPicker | Overlay::HiddenPicker)
+            && self.input_cursor.is_some()
+        {
+            self.place_input_cursor(cursor);
+        }
         self.reconcile_picker_selection();
     }
 
@@ -1496,17 +1680,82 @@ impl App {
 
 impl App {
     /// Open the restore picker over the locally hidden registry, newest first.
-    pub fn open_hidden_picker(&mut self, mut records: Vec<HiddenSessionRecord>) {
-        if records.is_empty() {
+    pub fn open_hidden_picker(&mut self, records: Vec<HiddenSessionRecord>) {
+        self.show_restore_picker(records, false);
+    }
+
+    /// Open the restore picker over the hidden registry while the providers'
+    /// saved sessions load; `add_restorable_sessions` merges them in.
+    pub fn open_restore_picker(&mut self, records: Vec<HiddenSessionRecord>) {
+        self.show_restore_picker(records, true);
+    }
+
+    fn show_restore_picker(&mut self, mut records: Vec<HiddenSessionRecord>, loading: bool) {
+        if records.is_empty() && !loading {
             self.set_notice("no sessions are hidden locally");
             return;
         }
         records.sort_by(|left, right| right.hidden_at_ms.cmp(&left.hidden_at_ms));
+        self.hidden_ids = records.iter().map(|record| record.id.clone()).collect();
         self.hidden_candidates = records;
+        self.restorable.clear();
+        self.restorable_loading = loading;
         self.hidden_filter.clear();
         self.hidden_selection = 0;
         self.notice = None;
         self.overlay = Overlay::HiddenPicker;
+    }
+
+    /// Merge saved provider sessions into the open picker, after the hidden
+    /// ones and skipping rows the list already shows.
+    pub fn add_restorable_sessions(&mut self, sessions: Vec<RestorableSession>, errors: &[String]) {
+        if self.overlay != Overlay::HiddenPicker || !self.restorable_loading {
+            return;
+        }
+        self.restorable_loading = false;
+        let listed = self
+            .snapshot
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut added = Vec::new();
+        for session in sessions {
+            if !self.hidden_ids.contains(&session.id) {
+                if listed.contains(session.id.as_str()) {
+                    continue;
+                }
+                added.push(HiddenSessionRecord {
+                    id: session.id.clone(),
+                    provider: Some(session.provider.clone()),
+                    name: Some(session.name.clone()),
+                    hidden_at_ms: session.updated_at_ms,
+                });
+            }
+            self.restorable.insert(session.id.clone(), session);
+        }
+        self.hidden_candidates.extend(added);
+        if !errors.is_empty() {
+            self.set_notice(format!(
+                "could not list every saved session: {}",
+                errors.join("; ")
+            ));
+        }
+        if self.hidden_candidates.is_empty() {
+            self.overlay = Overlay::None;
+            self.hidden_filter.clear();
+            if errors.is_empty() {
+                self.set_notice("no hidden or older sessions to restore");
+            }
+            return;
+        }
+        self.reconcile_hidden_selection();
+    }
+
+    /// Whether a picker row is in the local hidden registry, as opposed to a
+    /// saved session that only fell out of the list.
+    pub fn is_hidden_choice(&self, id: &str) -> bool {
+        self.hidden_ids.contains(id)
     }
 
     pub fn hidden_choices(&self) -> Vec<&HiddenSessionRecord> {
@@ -1523,6 +1772,13 @@ impl App {
                         provider.label().to_ascii_lowercase().contains(&needle)
                     })
                     || record.id.to_ascii_lowercase().contains(&needle)
+                    || self.restorable.get(&record.id).is_some_and(|session| {
+                        session
+                            .cwd
+                            .to_string_lossy()
+                            .to_ascii_lowercase()
+                            .contains(&needle)
+                    })
             })
             .collect()
     }
@@ -1564,10 +1820,17 @@ impl App {
             return AppAction::None;
         };
         let session_id = record.id.clone();
+        let hidden = self.hidden_ids.contains(&session_id);
+        let restorable = self.restorable.remove(&session_id);
         self.overlay = Overlay::None;
         self.hidden_filter.clear();
         self.hidden_candidates.clear();
-        AppAction::Unhide { session_id }
+        self.restorable.clear();
+        self.restorable_loading = false;
+        match restorable {
+            Some(session) => AppAction::Restore { session, hidden },
+            None => AppAction::Unhide { session_id },
+        }
     }
 }
 
@@ -1622,7 +1885,7 @@ impl App {
             ));
             return AppAction::None;
         }
-        self.input.clear();
+        self.clear_input();
         self.overlay = Overlay::None;
         match mode {
             ComposerMode::NewSession => self.submit_new_session(input),
@@ -1666,7 +1929,7 @@ impl App {
                 // Antigravity 1.1.x can terminate a task when its account does
                 // not advertise a default PlanModel/RequestedModel. Never send
                 // the user's task until an exact model has been selected.
-                self.input = input;
+                self.set_input(input);
                 return self.open_model_picker();
             }
             return AppAction::Launch {
@@ -1708,7 +1971,7 @@ impl App {
             "/completed" => return self.select_completed_visibility(argument),
             // Alternative to ctrl+g, which multiplexers such as Zellij bind
             // to their own lock mode before OAV can see it.
-            "/hidden" => return AppAction::BrowseHidden,
+            "/hidden" | "/restore" => return AppAction::BrowseHidden,
             "/filter" => {
                 self.set_filter(argument);
                 self.set_notice(if argument.is_empty() {
@@ -2312,6 +2575,98 @@ mod tests {
             name: Some(name.into()),
             hidden_at_ms,
         }
+    }
+
+    fn restorable(
+        provider_session_id: &str,
+        name: &str,
+        cwd: &str,
+        updated: u64,
+    ) -> RestorableSession {
+        RestorableSession {
+            id: format!("opencode:host:{provider_session_id}"),
+            provider_session_id: provider_session_id.into(),
+            provider: Provider::OpenCode,
+            name: name.into(),
+            cwd: PathBuf::from(cwd),
+            updated_at_ms: updated,
+        }
+    }
+
+    #[test]
+    fn restore_picker_adds_saved_sessions_the_list_lacks_and_restores_them() {
+        let mut listed = session("opencode:host:ses_listed", SessionState::Working);
+        listed.provider = Provider::OpenCode;
+        let mut app = app_with(vec![listed]);
+        app.open_restore_picker(Vec::new());
+        assert_eq!(app.overlay, Overlay::HiddenPicker);
+        assert!(app.restorable_loading);
+
+        app.open_restore_picker(vec![hidden(
+            "opencode:host:ses_hidden",
+            "Hidden one",
+            Provider::OpenCode,
+            50,
+        )]);
+        app.add_restorable_sessions(
+            vec![
+                restorable("ses_listed", "Already listed", "/work/a", 90),
+                restorable("ses_old", "Old arca work", "/work/arca", 40),
+                restorable("ses_hidden", "Hidden one", "/work/b", 30),
+            ],
+            &[],
+        );
+        assert!(!app.restorable_loading);
+        assert_eq!(
+            app.hidden_choices()
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["opencode:host:ses_hidden", "opencode:host:ses_old"]
+        );
+        assert!(app.is_hidden_choice("opencode:host:ses_hidden"));
+        assert!(!app.is_hidden_choice("opencode:host:ses_old"));
+
+        for character in "arca".chars() {
+            app.push_input(character);
+        }
+        assert_eq!(app.hidden_choices().len(), 1);
+        assert_eq!(
+            app.activate(),
+            AppAction::Restore {
+                session: restorable("ses_old", "Old arca work", "/work/arca", 40),
+                hidden: false,
+            }
+        );
+        assert_eq!(app.overlay, Overlay::None);
+
+        app.open_restore_picker(vec![hidden(
+            "opencode:host:ses_hidden",
+            "Hidden one",
+            Provider::OpenCode,
+            50,
+        )]);
+        app.add_restorable_sessions(
+            vec![restorable("ses_hidden", "Hidden one", "/work/b", 30)],
+            &[],
+        );
+        assert!(matches!(
+            app.activate(),
+            AppAction::Restore { hidden: true, .. }
+        ));
+    }
+
+    #[test]
+    fn restore_picker_with_nothing_to_offer_closes_with_a_notice() {
+        let mut app = app_with(vec![session("live", SessionState::Working)]);
+        app.open_restore_picker(Vec::new());
+        app.add_restorable_sessions(Vec::new(), &[]);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("no hidden or older sessions"));
     }
 
     #[test]

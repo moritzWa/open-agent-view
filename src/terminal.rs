@@ -19,8 +19,10 @@ use ratatui::Terminal;
 
 use crate::adapters::{DiscoveryEngine, DiscoveryRequest};
 use crate::aliases::SessionAliases;
-use crate::app::{hidden_picker_rows_for_height, App, AppAction, Overlay, SESSION_PAGE_SIZE};
-use crate::control::{ControlHub, ControlOutcome, LaunchPresentation};
+use crate::app::{
+    hidden_picker_rows_for_height, App, AppAction, CursorMovement, Overlay, SESSION_PAGE_SIZE,
+};
+use crate::control::{ControlHub, ControlOutcome, LaunchPresentation, RestorableSession};
 use crate::domain::{AgentSession, Capability, Provider, SessionSnapshot, SessionState};
 use crate::hidden::HiddenSessions;
 use crate::migration::{MigrationClient, MigrationOutcome, MigrationRegistry, MigrationRequest};
@@ -156,6 +158,7 @@ pub fn run_dashboard(
     let (models_tx, models_rx) = mpsc::channel::<(Provider, bool, Result<Vec<String>, String>)>();
     let (launch_tx, launch_rx) = mpsc::channel::<LaunchWorkerResult>();
     let (migration_tx, migration_rx) = mpsc::channel::<MigrationWorkerResult>();
+    let (restorable_tx, restorable_rx) = mpsc::channel::<(Vec<RestorableSession>, Vec<String>)>();
     let worker_engine = (*engine).clone();
     let worker_control = control.clone();
     let worker_hidden_sessions = hidden_sessions.clone();
@@ -334,6 +337,10 @@ pub fn run_dashboard(
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
+        }
+        while let Ok((sessions, errors)) = restorable_rx.try_recv() {
+            app.add_restorable_sessions(sessions, &errors);
+            needs_draw = true;
         }
         let mut completed_launch_needs_refresh = false;
         loop {
@@ -552,8 +559,39 @@ pub fn run_dashboard(
                                 ActionEffect::default()
                             }
                             AppAction::BrowseHidden => {
-                                app.open_hidden_picker(hidden_sessions.list());
+                                app.open_restore_picker(hidden_sessions.list());
+                                let worker_control = control.clone();
+                                let sender = restorable_tx.clone();
+                                let _restorable_worker = thread::spawn(move || {
+                                    let _ = sender.send(worker_control.restorable_sessions());
+                                });
                                 ActionEffect::default()
+                            }
+                            AppAction::Restore { session, hidden } => {
+                                let unhidden = if hidden {
+                                    hidden_sessions.unhide(&session.id).map(|_| ())
+                                } else {
+                                    Ok(())
+                                };
+                                match unhidden.and_then(|()| control.adopt(&session)) {
+                                    Ok(()) => {
+                                        app.set_notice(format!(
+                                            "restoring {}; it returns as soon as discovery lists it",
+                                            session.name
+                                        ));
+                                        pending_reveal = Some(PendingReveal {
+                                            session_id: session.id,
+                                            deadline: Instant::now() + REVEAL_DISCOVERY_TIMEOUT,
+                                        });
+                                    }
+                                    Err(error) => app.set_notice(format!(
+                                        "failed to restore session: {error:#}"
+                                    )),
+                                }
+                                ActionEffect {
+                                    refresh: true,
+                                    ..ActionEffect::default()
+                                }
                             }
                             AppAction::Unhide { session_id } => {
                                 match hidden_sessions.unhide(&session_id) {
@@ -1252,6 +1290,18 @@ fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
                 app.push_input('\n');
                 AppAction::None
             }
+            KeyCode::Enter if app.draft_accepts_line_breaks() => {
+                app.push_input('\n');
+                AppAction::None
+            }
+            KeyCode::Char('a') if app.input_cursor_movable() => {
+                app.move_input_cursor(CursorMovement::LineStart);
+                AppAction::None
+            }
+            KeyCode::Char('e') if app.input_cursor_movable() => {
+                app.move_input_cursor(CursorMovement::LineEnd);
+                AppAction::None
+            }
             KeyCode::Char('w') | KeyCode::Backspace => {
                 app.delete_previous_word();
                 AppAction::None
@@ -1277,6 +1327,40 @@ fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
     if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Backspace {
         app.delete_previous_word();
         return AppAction::None;
+    }
+    if key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+        && app.draft_accepts_line_breaks()
+    {
+        app.push_input('\n');
+        return AppAction::None;
+    }
+    if app.input_cursor_movable() {
+        let by_word = key.modifiers.contains(KeyModifiers::ALT);
+        let by_line = key.modifiers.contains(KeyModifiers::SUPER);
+        let movement = match key.code {
+            KeyCode::Left if by_line => Some(CursorMovement::LineStart),
+            KeyCode::Right if by_line => Some(CursorMovement::LineEnd),
+            KeyCode::Left if by_word => Some(CursorMovement::WordLeft),
+            KeyCode::Right if by_word => Some(CursorMovement::WordRight),
+            KeyCode::Left => Some(CursorMovement::Left),
+            KeyCode::Right => Some(CursorMovement::Right),
+            KeyCode::Up => Some(CursorMovement::Up),
+            KeyCode::Down => Some(CursorMovement::Down),
+            KeyCode::Home => Some(CursorMovement::LineStart),
+            KeyCode::End => Some(CursorMovement::LineEnd),
+            _ => None,
+        };
+        if let Some(movement) = movement {
+            app.move_input_cursor(movement);
+            return AppAction::None;
+        }
+        if key.code == KeyCode::Delete {
+            app.delete_next_input();
+            return AppAction::None;
+        }
     }
 
     match key.code {
@@ -1761,7 +1845,8 @@ fn handle_action_legacy<T: DashboardTerminal, C: DashboardControl>(
         | AppAction::Hide { .. }
         | AppAction::SetPin { .. }
         | AppAction::BrowseHidden
-        | AppAction::Unhide { .. } => false,
+        | AppAction::Unhide { .. }
+        | AppAction::Restore { .. } => false,
         AppAction::Refresh => {
             app.set_notice("refreshing provider sessions…");
             true
@@ -3056,6 +3141,55 @@ mod tests {
         app.input = "first line\nsecond line".into();
         handle_key(&mut app, control_key('u'));
         assert_eq!(app.input, "first line\n");
+    }
+
+    #[test]
+    fn composer_modified_enter_adds_lines_like_opencode_and_plain_enter_submits() {
+        let mut app = app();
+        app.start_new_session(Some('a'));
+        handle_key(&mut app, modified_key(KeyCode::Enter, KeyModifiers::SHIFT));
+        handle_key(&mut app, key(KeyCode::Char('b')));
+        handle_key(&mut app, modified_key(KeyCode::Enter, KeyModifiers::ALT));
+        handle_key(&mut app, key(KeyCode::Char('c')));
+        handle_key(
+            &mut app,
+            modified_key(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+        handle_key(&mut app, key(KeyCode::Char('d')));
+        assert_eq!(app.input, "a\nb\nc\nd");
+        assert_eq!(app.overlay, Overlay::Composer(ComposerMode::NewSession));
+
+        assert!(matches!(
+            handle_key(&mut app, key(KeyCode::Enter)),
+            AppAction::Launch { ref prompt, .. } if prompt == "a\nb\nc\nd"
+        ));
+    }
+
+    #[test]
+    fn composer_cursor_moves_and_edits_in_the_middle_of_the_draft() {
+        let mut app = app();
+        app.start_new_session(None);
+        app.input = "first line\nsecond".into();
+        handle_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.input_cursor(), 6);
+        handle_key(&mut app, key(KeyCode::Char('X')));
+        assert_eq!(app.input, "first Xline\nsecond");
+        handle_key(&mut app, key(KeyCode::Backspace));
+        handle_key(&mut app, key(KeyCode::Home));
+        handle_key(&mut app, key(KeyCode::Delete));
+        assert_eq!(app.input, "irst line\nsecond");
+        handle_key(&mut app, modified_key(KeyCode::Right, KeyModifiers::ALT));
+        handle_key(&mut app, modified_key(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.input, "irst\n line\nsecond");
+        handle_key(&mut app, control_key('w'));
+        assert_eq!(app.input, " line\nsecond");
+        handle_key(&mut app, key(KeyCode::Down));
+        handle_key(&mut app, key(KeyCode::End));
+        handle_key(&mut app, key(KeyCode::Char('!')));
+        assert_eq!(app.input, " line\nsecond!");
+
+        app.escape();
+        assert_eq!(app.input_cursor(), app.input.len());
     }
 
     #[test]

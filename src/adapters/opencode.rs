@@ -12,7 +12,7 @@ use super::opencode_live::{self, Candidate, Holder, LastMessage};
 use super::{DiscoveryRequest, SessionSource, SourceDiscovery};
 use crate::control::{
     run_native_authentication, ControlOutcome, LaunchMode, LaunchPresentation, LaunchRequest,
-    ProviderController,
+    ProviderController, RestorableSession,
 };
 use crate::domain::{
     AgentSession, Capability, Provider, Runtime, SessionKind, SessionSnapshot, SessionState,
@@ -33,6 +33,7 @@ use crate::process::{CancellableProcessRunner, CommandRequest, CommandRunner};
 const GLOBAL_SESSION_ROWS: &str = "SELECT json_object('id', s.id, 'title', s.title, 'created', s.time_created, 'updated', s.time_updated, 'projectId', s.project_id, 'directory', s.directory, 'last', json((SELECT json_object('role', json_extract(m.data, '$.role'), 'created', m.time_created, 'completed', json_extract(m.data, '$.time.completed'), 'question', EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id AND json_extract(p.data, '$.tool') = 'question' AND json_extract(p.data, '$.state.status') IN ('pending', 'running'))) FROM message m WHERE m.session_id = s.id ORDER BY m.time_created DESC, m.id DESC LIMIT 1)), 'child', (SELECT MAX(m.time_created) FROM session c JOIN message m ON m.id = (SELECT m2.id FROM message m2 WHERE m2.session_id = c.id ORDER BY m2.time_created DESC, m2.id DESC LIMIT 1) WHERE c.parent_id = s.id AND (json_extract(m.data, '$.role') = 'user' OR json_extract(m.data, '$.time.completed') IS NULL))) AS record FROM session s WHERE s.parent_id IS NULL";
 const MAX_MODEL_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 const LAUNCH_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_RESTORABLE_SESSIONS: usize = 2_000;
 const OPENCODE_READY_MARKER: &str = "Ask anything";
 
 type HolderProbe = Arc<dyn Fn() -> Vec<Holder> + Send + Sync>;
@@ -236,6 +237,30 @@ impl ProviderController for OpenCodeController {
             return self.launch(request);
         }
         self.open_new_session(request)
+    }
+
+    fn restorable_sessions(&self) -> Result<Vec<RestorableSession>> {
+        if self.ownership.is_none() {
+            return Ok(Vec::new());
+        }
+        self.source.restorable_sessions()
+    }
+
+    fn adopt(&self, session: &RestorableSession) -> Result<()> {
+        if session.provider != Provider::OpenCode {
+            bail!("the OpenCode controller cannot adopt another provider's session");
+        }
+        self.ownership
+            .as_ref()
+            .context("bringing OpenCode sessions back is not configured")?
+            .inner
+            .record(
+                &session.provider_session_id,
+                &session.cwd,
+                &session.name,
+                None,
+                "OpenCode",
+            )
     }
 
     fn inspect(&self, session: &AgentSession) -> Result<String> {
@@ -572,10 +597,13 @@ impl SessionSource for OpenCodeSource {
         let mut sessions = BTreeMap::new();
         let mut warnings = Vec::new();
         let external = self.discover_external_history && request.include_external;
-        let owned = match (&self.ownership, external) {
-            (Some(ownership), false) => ownership.session_ids(),
-            _ => BTreeSet::new(),
-        };
+        // Sessions the dashboard started or brought back are always listed,
+        // and are loaded even when they fall outside the history window.
+        let owned = self
+            .ownership
+            .as_ref()
+            .map(|ownership| ownership.session_ids())
+            .unwrap_or_default();
         if external || !owned.is_empty() {
             let holders = if self.runtime == Runtime::Host {
                 (self.probe)()
@@ -591,10 +619,13 @@ impl SessionSource for OpenCodeSource {
                     Scope::Recent {
                         limit: history_limit.saturating_add(1),
                         oldest_first: request.history_oldest_first,
-                        pinned: opencode_live::named_sessions(&holders),
+                        pinned: opencode_live::named_sessions(&holders)
+                            .into_iter()
+                            .chain(owned.iter().cloned())
+                            .collect(),
                     }
                 } else {
-                    Scope::Only(owned)
+                    Scope::Only(owned.clone())
                 };
                 let mut history = self.normalize_with_live_state(self.query(&scope)?, &holders);
                 if request.history_oldest_first {
@@ -609,7 +640,9 @@ impl SessionSource for OpenCodeSource {
                         if !request.include_completed {
                             continue;
                         }
-                        if completed >= history_limit {
+                        if owned.contains(&session.provider_session_id) {
+                            // Listed on purpose; not part of the history window.
+                        } else if completed >= history_limit {
                             truncated = true;
                             continue;
                         }
@@ -758,6 +791,55 @@ impl OpenCodeSource {
 }
 
 impl OpenCodeSource {
+    /// The newest root sessions in OpenCode's whole history, for the restore
+    /// picker. Only metadata is read.
+    fn restorable_sessions(&self) -> Result<Vec<RestorableSession>> {
+        #[derive(Deserialize)]
+        struct Row {
+            id: String,
+            title: String,
+            directory: PathBuf,
+            updated: u64,
+        }
+        let mut args = self.invocation.prefix_args.clone();
+        args.extend([
+            "db".into(),
+            format!(
+                "SELECT json_object('id', id, 'title', title, 'directory', directory, 'updated', time_updated) AS record FROM session WHERE parent_id IS NULL ORDER BY time_updated DESC LIMIT {MAX_RESTORABLE_SESSIONS}"
+            ),
+            "--format".into(),
+            "tsv".into(),
+        ]);
+        let mut command = CommandRequest::new(self.invocation.program.clone(), args);
+        command.timeout = Duration::from_secs(8);
+        let output = self.runner.run(&command)?;
+        if output.status != 0 {
+            bail!(
+                "OpenCode history lookup exited with status {}: {}",
+                output.status,
+                output.stderr_lossy()
+            );
+        }
+        let runtime_id = match &self.runtime {
+            Runtime::Host => "host",
+            Runtime::Docker { container_id, .. } => container_id,
+        };
+        Ok(output
+            .stdout_text()?
+            .lines()
+            .skip(1)
+            .filter_map(|line| serde_json::from_str::<Row>(line).ok())
+            .map(|row| RestorableSession {
+                id: format!("opencode:{runtime_id}:{}", row.id),
+                provider_session_id: row.id,
+                provider: Provider::OpenCode,
+                name: row.title,
+                cwd: row.directory,
+                updated_at_ms: row.updated,
+            })
+            .collect())
+    }
+
     /// Root sessions created in `cwd` at or after `since_ms`.
     fn sessions_created_since(&self, cwd: &Path, since_ms: u64) -> Result<Vec<String>> {
         #[derive(Deserialize)]
@@ -1345,6 +1427,115 @@ mod tests {
         assert_eq!(sessions[0].state, SessionState::Working);
         assert_eq!(sessions[0].pid, Some(42));
         assert_eq!(sessions[0].raw_state.as_deref(), Some("running turn"));
+    }
+
+    #[test]
+    fn restorable_sessions_list_root_history_as_dashboard_rows() {
+        let mut expected = CommandRequest::new(
+            "opencode",
+            vec![
+                "db".into(),
+                format!("SELECT json_object('id', id, 'title', title, 'directory', directory, 'updated', time_updated) AS record FROM session WHERE parent_id IS NULL ORDER BY time_updated DESC LIMIT {MAX_RESTORABLE_SESSIONS}"),
+                "--format".into(),
+                "tsv".into(),
+            ],
+        );
+        expected.timeout = Duration::from_secs(8);
+        let runner = Arc::new(FakeRunner {
+            expected,
+            output: Mutex::new(Some(CommandOutput {
+                status: 0,
+                stdout: b"record\n{\"id\":\"ses_old\",\"title\":\"arca memory\",\"directory\":\"/work/arca\",\"updated\":7}\nnot json\n".to_vec(),
+                stderr: vec![],
+            })),
+        });
+        let source = OpenCodeSource::with_runner(
+            "test",
+            OpenCodeInvocation::host("opencode"),
+            Runtime::Host,
+            runner,
+        );
+
+        assert_eq!(
+            source.restorable_sessions().unwrap(),
+            vec![RestorableSession {
+                id: "opencode:host:ses_old".into(),
+                provider_session_id: "ses_old".into(),
+                provider: Provider::OpenCode,
+                name: "arca memory".into(),
+                cwd: PathBuf::from("/work/arca"),
+                updated_at_ms: 7,
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopted_sessions_are_listed_beyond_the_history_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ownership = OpenCodeOwnership::load(state.join("owned.json")).unwrap();
+        ownership
+            .inner
+            .record("ses_old", Path::new("/work"), "old", None, "OpenCode")
+            .unwrap();
+        let mut expected = CommandRequest::new(
+            "opencode",
+            vec![
+                "db".into(),
+                session_query(&Scope::Recent {
+                    limit: 2,
+                    oldest_first: false,
+                    pinned: BTreeSet::from(["ses_old".to_owned()]),
+                }),
+                "--format".into(),
+                "tsv".into(),
+            ],
+        );
+        expected.timeout = Duration::from_secs(8);
+        let row = |id: &str, updated: u64| {
+            format!("{{\"id\":\"{id}\",\"title\":\"{id}\",\"updated\":{updated},\"created\":1,\"projectId\":\"global\",\"directory\":\"/work\"}}")
+        };
+        let runner = Arc::new(FakeRunner {
+            expected,
+            output: Mutex::new(Some(CommandOutput {
+                status: 0,
+                stdout: format!(
+                    "record\n{}\n{}\n{}\n",
+                    row("ses_new", 30),
+                    row("ses_mid", 20),
+                    row("ses_old", 1)
+                )
+                .into_bytes(),
+                stderr: vec![],
+            })),
+        });
+        let source = OpenCodeSource::with_runner(
+            "test",
+            OpenCodeInvocation::host("opencode"),
+            Runtime::Host,
+            runner,
+        )
+        .owned(ownership)
+        .with_probe(Vec::new);
+
+        let result = source
+            .discover_with_warnings(&DiscoveryRequest {
+                include_completed: true,
+                include_external: true,
+                history_limit: 1,
+                ..DiscoveryRequest::default()
+            })
+            .unwrap();
+
+        let ids = result
+            .sessions
+            .iter()
+            .map(|session| session.provider_session_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids, BTreeSet::from(["ses_new", "ses_old"]));
     }
 
     #[test]

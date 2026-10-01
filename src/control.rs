@@ -46,6 +46,19 @@ pub enum LaunchPresentation {
     Foreground,
 }
 
+/// A persisted provider session that the dashboard can bring back into its
+/// list, for example one hidden locally or older than the history window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestorableSession {
+    /// The dashboard's normalized row ID, such as `opencode:host:ses_...`.
+    pub id: String,
+    pub provider_session_id: String,
+    pub provider: Provider,
+    pub name: String,
+    pub cwd: PathBuf,
+    pub updated_at_ms: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlOutcome {
     pub message: String,
@@ -182,6 +195,20 @@ pub trait ProviderController: Send + Sync {
     /// is deliberately not inherited.
     fn open_imported(&self, session: &AgentSession) -> Result<ControlOutcome> {
         self.open(session)
+    }
+
+    /// Persisted sessions the restore picker can offer, newest first.
+    fn restorable_sessions(&self) -> Result<Vec<RestorableSession>> {
+        Ok(Vec::new())
+    }
+
+    /// Record a persisted session as one the dashboard lists, so discovery
+    /// returns it without `--include-external` and beyond the history window.
+    fn adopt(&self, _session: &RestorableSession) -> Result<()> {
+        bail!(
+            "{} sessions cannot be brought back into the list",
+            self.provider().label()
+        )
     }
 }
 
@@ -589,6 +616,29 @@ impl ControlHub {
         } else {
             controller.open(session)
         }
+    }
+
+    /// Every provider's restorable sessions, newest first. One provider's
+    /// failure is reported and does not hide the others.
+    pub fn restorable_sessions(&self) -> (Vec<RestorableSession>, Vec<String>) {
+        let mut sessions = Vec::new();
+        let mut errors = Vec::new();
+        if self.ensure_provider_io().is_err() {
+            return (sessions, errors);
+        }
+        for controller in self.controllers.values() {
+            match controller.restorable_sessions() {
+                Ok(found) => sessions.extend(found),
+                Err(error) => errors.push(format!("{}: {error:#}", controller.provider().label())),
+            }
+        }
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
+        (sessions, errors)
+    }
+
+    pub fn adopt(&self, session: &RestorableSession) -> Result<()> {
+        self.ensure_provider_io()?;
+        self.controller(&session.provider)?.adopt(session)
     }
 
     fn controller(&self, provider: &Provider) -> Result<&Arc<dyn ProviderController>> {

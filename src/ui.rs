@@ -51,11 +51,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
                     as u16;
             (4 + help_lines).min(area.height.saturating_sub(5))
         }
-        Overlay::HarnessPicker => (3 + input_line_count(&app.input).saturating_sub(1))
-            .min(7)
-            .min(area.height.saturating_sub(5)),
-        Overlay::Composer(_) => (3 + input_line_count(&app.input).saturating_sub(1))
-            .min(7)
+        Overlay::HarnessPicker | Overlay::Composer(_) => composer_draft_layout(app, area.width)
+            .map_or(3, |layout| 2 + layout.visible_rows() as u16)
             .min(area.height.saturating_sub(5)),
         _ => 3,
     };
@@ -515,13 +512,15 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         Style::default().fg(palette().dim)
     };
-    let content_lines = if editable {
-        input_lines(content)
-            .into_iter()
+    let layout = composer_draft_layout(app, area.width);
+    let content_lines = if let Some(layout) = &layout {
+        let start = layout.visible_start();
+        layout.rows[start..start + layout.visible_rows()]
+            .iter()
             .enumerate()
             .map(|(index, line)| {
                 Line::from(vec![
-                    Span::styled(if index == 0 { prefix } else { "" }, {
+                    Span::styled(if start + index == 0 { prefix } else { "" }, {
                         let style = Style::default().fg(if renaming || naming_migration {
                             palette().accent
                         } else {
@@ -533,7 +532,7 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
                             style
                         }
                     }),
-                    Span::styled(line, text_style),
+                    Span::styled(line.clone(), text_style),
                 ])
             })
             .collect::<Vec<_>>()
@@ -551,19 +550,11 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ])]
     };
     frame.render_widget(Paragraph::new(content_lines).block(block), area);
-    if editable {
-        let last_line = app.input.rsplit('\n').next().unwrap_or_default();
-        let line_index = input_line_count(&app.input)
-            .saturating_sub(1)
-            .min(area.height.saturating_sub(3));
-        let prefix_width = (line_index == 0)
-            .then(|| display_width(prefix))
-            .unwrap_or(0);
-        let cursor_x =
-            area.x + prefix_width as u16 + display_width(&expand_input_tabs(last_line)) as u16;
+    if let Some(layout) = layout.filter(|_| editable) {
+        let row = (layout.cursor_row - layout.visible_start()) as u16;
         frame.set_cursor(
-            cursor_x.min(area.right().saturating_sub(1)),
-            area.y + 1 + line_index,
+            (area.x + layout.cursor_column as u16).min(area.right().saturating_sub(1)),
+            (area.y + 1 + row).min(area.bottom().saturating_sub(2)),
         );
     }
 }
@@ -684,6 +675,91 @@ fn input_line_count(input: &str) -> u16 {
     input.split('\n').count().min(5) as u16
 }
 
+/// Rows of the composer draft that fit on screen at once; longer drafts
+/// scroll to keep the cursor visible.
+const MAX_DRAFT_ROWS: usize = 10;
+
+#[derive(Debug, Eq, PartialEq)]
+struct DraftLayout {
+    rows: Vec<String>,
+    cursor_row: usize,
+    /// Includes the prompt prefix on the first row.
+    cursor_column: usize,
+}
+
+impl DraftLayout {
+    fn visible_start(&self) -> usize {
+        (self.cursor_row + 1).saturating_sub(MAX_DRAFT_ROWS)
+    }
+
+    fn visible_rows(&self) -> usize {
+        (self.rows.len() - self.visible_start()).min(MAX_DRAFT_ROWS)
+    }
+}
+
+/// Wrap the draft into rows of at most `width` columns, with the prompt
+/// prefix taking the start of the first row. One column stays free so the
+/// cursor can sit after the last character of a full row.
+fn layout_draft(input: &str, cursor: usize, prefix_width: usize, width: usize) -> DraftLayout {
+    let limit = width.saturating_sub(1).max(prefix_width + 1);
+    let mut rows = vec![String::new()];
+    let mut column = prefix_width;
+    let mut cursor_at = (0, prefix_width);
+    for (line_index, line) in input.split('\n').enumerate() {
+        if line_index > 0 {
+            rows.push(String::new());
+            column = 0;
+        }
+        let line_start = line.as_ptr() as usize - input.as_ptr() as usize;
+        for (offset, character) in line.char_indices() {
+            let shown = if character == '\t' {
+                INPUT_TAB.to_owned()
+            } else {
+                character.to_string()
+            };
+            let character_width = display_width(&shown);
+            if column + character_width > limit && column > 0 {
+                rows.push(String::new());
+                column = 0;
+            }
+            if line_start + offset == cursor {
+                cursor_at = (rows.len() - 1, column);
+            }
+            rows.last_mut()
+                .expect("rows is never empty")
+                .push_str(&shown);
+            column += character_width;
+        }
+        if line_start + line.len() == cursor {
+            cursor_at = (rows.len() - 1, column);
+        }
+    }
+    DraftLayout {
+        rows,
+        cursor_row: cursor_at.0,
+        cursor_column: cursor_at.1,
+    }
+}
+
+fn composer_draft_layout(app: &App, width: u16) -> Option<DraftLayout> {
+    let prefix = match &app.overlay {
+        Overlay::Composer(ComposerMode::NewSession)
+        | Overlay::HarnessPicker
+        | Overlay::ModelPicker => "❯ ",
+        Overlay::Composer(ComposerMode::Rename { .. } | ComposerMode::MigrationName { .. }) => {
+            "name ❯ "
+        }
+        Overlay::Composer(ComposerMode::Filter) => "❯ filter ",
+        _ => return None,
+    };
+    Some(layout_draft(
+        &app.input,
+        app.input_cursor(),
+        display_width(prefix),
+        width as usize,
+    ))
+}
+
 fn render_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::TOP)
@@ -772,11 +848,11 @@ fn contextual_footer(app: &App, width: u16) -> String {
             "enter migrate · esc targets".into()
         }
         Overlay::Composer(ComposerMode::NewSession) if width >= 100 => format!(
-            "enter create · tab harness · shift+tab {} · ctrl+j newline · esc cancel",
+            "enter create · tab harness · shift+tab {} · shift+enter newline · esc cancel",
             if app.launch_provider == Provider::Terminal { "shell" } else { "model" }
         ),
         Overlay::Composer(ComposerMode::NewSession) if width >= 70 => format!(
-            "enter create · tab harness · shift+tab {} · ctrl+j newline · esc cancel",
+            "enter create · tab harness · shift+tab {} · shift+enter newline · esc cancel",
             if app.launch_provider == Provider::Terminal { "shell" } else { "model" }
         ),
         Overlay::Composer(ComposerMode::NewSession) if width >= 55 => {
@@ -794,7 +870,7 @@ fn contextual_footer(app: &App, width: u16) -> String {
         ),
         Overlay::ModelPicker => "type filter · ↑/↓ · enter · esc".into(),
         Overlay::HiddenPicker if width >= 70 => {
-            "type to search hidden sessions · ↑/↓ move · enter restore · esc close".into()
+            "type to search hidden and older sessions · ↑/↓ move · enter restore · esc close".into()
         }
         Overlay::HiddenPicker => "type to search · ↑/↓ · enter restore · esc".into(),
         Overlay::MigrationTargetPicker { .. } if width >= 58 => {
@@ -955,7 +1031,8 @@ fn help_actions(app: &App) -> Vec<String> {
         actions.push("ctrl+m to migrate session".into());
     }
     actions.push("ctrl+f to filter".into());
-    actions.push("ctrl+g or /hidden to search and restore hidden sessions".into());
+    actions
+        .push("ctrl+g or /restore to search hidden and older sessions and bring one back".into());
     actions.push("/filter text to filter sessions".into());
     actions.push("ctrl+j for newline".into());
     actions.push("tab for new task/harness picker".into());
@@ -1223,7 +1300,7 @@ fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(" search  ", Style::default().fg(palette().dim)),
         Span::styled(
             if app.hidden_filter.is_empty() {
-                "type a name, harness, or ID".into()
+                "type a name, harness, folder, or ID".into()
             } else {
                 sanitize_inline(&app.hidden_filter)
             },
@@ -1236,7 +1313,11 @@ fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
     ])];
     if choices.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  No hidden sessions match",
+            if app.restorable_loading {
+                "  Loading saved sessions…"
+            } else {
+                "  No sessions match"
+            },
             Style::default().fg(palette().dim),
         )));
     } else {
@@ -1261,9 +1342,27 @@ fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
                             UNIX_EPOCH + std::time::Duration::from_millis(record.hidden_at_ms),
                         )
                         .ok();
-                    let age = format!("hidden {} ago", format_age(hidden_for));
+                    let age = format!(
+                        "{} {} ago",
+                        if app.is_hidden_choice(&record.id) {
+                            "hidden"
+                        } else {
+                            "updated"
+                        },
+                        format_age(hidden_for)
+                    );
                     let name = sanitize_inline(record.name.as_deref().unwrap_or(&record.id));
-                    let mut tail = format!("  {provider} · {age}");
+                    let folder = app
+                        .restorable
+                        .get(&record.id)
+                        .map(|session| {
+                            format!(" · {}", sanitize_inline(&abbreviate_path(&session.cwd)))
+                        })
+                        .unwrap_or_default();
+                    let mut tail = format!("  {provider}{folder} · {age}");
+                    if inner_width < display_width(&tail) + 3 + HIDDEN_PICKER_MIN_NAME_WIDTH {
+                        tail = format!("  {provider} · {age}");
+                    }
                     if inner_width < display_width(&tail) + 3 + HIDDEN_PICKER_MIN_NAME_WIDTH {
                         // Narrow popup: keep the age and drop the harness
                         // rather than pushing the suffix past the border.
@@ -1300,9 +1399,14 @@ fn render_hidden_picker(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .block(
                 Block::default()
                     .title(format!(
-                        " restore hidden session · {} of {} ",
+                        " restore session · {} of {}{} ",
                         choices.len(),
-                        app.hidden_candidates.len()
+                        app.hidden_candidates.len(),
+                        if app.restorable_loading {
+                            " · loading saved sessions…"
+                        } else {
+                            ""
+                        }
                     ))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(palette().accent)),
@@ -1766,6 +1870,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn draft_layout_wraps_long_lines_and_tracks_the_cursor() {
+        let layout = layout_draft("abcdefgh\nxy", 4, 2, 7);
+        assert_eq!(layout.rows, vec!["abcd", "efgh", "xy"]);
+        assert_eq!((layout.cursor_row, layout.cursor_column), (1, 0));
+
+        let at_end = layout_draft("abcdefgh\nxy", 11, 2, 7);
+        assert_eq!((at_end.cursor_row, at_end.cursor_column), (2, 2));
+
+        let long = layout_draft(&"line\n".repeat(30), 0, 2, 40);
+        assert_eq!(long.visible_start(), 0);
+        assert_eq!(long.visible_rows(), MAX_DRAFT_ROWS);
+        let bottom = layout_draft(&"line\n".repeat(30), 150, 2, 40);
+        assert_eq!(bottom.cursor_row, 30);
+        assert_eq!(bottom.visible_start(), 30 + 1 - MAX_DRAFT_ROWS);
+    }
+
+    #[test]
     fn dashboard_renders_reference_sections_and_composer() {
         let snapshot = SessionSnapshot {
             sessions: vec![
@@ -2187,7 +2308,7 @@ mod tests {
         assert!(rendered.contains("❯ first line"));
         assert!(rendered.contains("second line"));
         assert!(rendered.contains("third line"));
-        assert!(rendered.contains("ctrl+j newline"));
+        assert!(rendered.contains("shift+enter newline"));
     }
 
     #[test]

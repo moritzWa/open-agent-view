@@ -38,6 +38,14 @@ and future released versions are intended to follow Semantic Versioning.
   leaving the dashboard. The jump waits while Peek or another panel is open,
   is dropped once you move the cursor, and a restored row that the current
   filter excludes is reported instead of timing out.
+- The `ctrl+g` picker also lists older OpenCode sessions the dashboard does
+  not show, searchable by folder too. Enter adopts the chosen session, so its
+  row stays listed without `--include-external`, and Enter/Right on that row
+  reopens it.
+- The new-task composer takes multi-line tasks. `shift+enter` (also
+  `ctrl+enter`, `alt+enter`, or `ctrl+j`) adds a line, pasted text keeps its
+  lines, and the arrow, Home/End, and word keys move a cursor through the
+  draft. The composer grows with the draft and wraps long lines.
 - OpenCode is a launch harness outside Linux. Choosing it opens OpenCode's
   interface and submits the task once its editor is ready, and the session it creates is
   recorded as the dashboard's own, so its row is listed without
