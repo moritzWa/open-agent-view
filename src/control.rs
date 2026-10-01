@@ -464,7 +464,17 @@ impl ControlHub {
     }
 
     pub fn launch(&self, prompt: String) -> Result<ControlOutcome> {
-        self.launch_with(self.launch_provider.clone(), None, prompt)
+        self.launch_with(self.launch_provider.clone(), None, prompt, None)
+    }
+
+    fn resolve_launch_cwd(&self, cwd: Option<PathBuf>) -> Result<PathBuf> {
+        let Some(cwd) = cwd else {
+            return Ok(self.launch_cwd.clone());
+        };
+        if !cwd.is_absolute() || !cwd.is_dir() {
+            bail!("launch directory {} is not an existing directory", cwd.display());
+        }
+        Ok(cwd)
     }
 
     pub fn launch_with(
@@ -472,6 +482,7 @@ impl ControlHub {
         provider: Provider,
         model: Option<String>,
         prompt: String,
+        cwd: Option<PathBuf>,
     ) -> Result<ControlOutcome> {
         self.ensure_provider_io()?;
         let controller = self.controller(&provider)?;
@@ -495,7 +506,7 @@ impl ControlHub {
             provider,
             model,
             prompt,
-            cwd: self.launch_cwd.clone(),
+            cwd: self.resolve_launch_cwd(cwd)?,
         };
         if self.yolo {
             controller.launch_yolo(&request)
@@ -509,6 +520,7 @@ impl ControlHub {
         provider: Provider,
         model: Option<String>,
         prompt: String,
+        cwd: Option<PathBuf>,
     ) -> Result<ControlOutcome> {
         self.ensure_provider_io()?;
         let controller = self.controller(&provider)?;
@@ -532,7 +544,7 @@ impl ControlHub {
             provider,
             model,
             prompt,
-            cwd: self.launch_cwd.clone(),
+            cwd: self.resolve_launch_cwd(cwd)?,
         };
         if self.yolo {
             controller.launch_foreground_yolo(&request)
@@ -2748,7 +2760,7 @@ exit 0
             }]
         );
         assert_eq!(
-            hub.launch_with(Provider::Pi, Some("custom".into()), "prompt".into())
+            hub.launch_with(Provider::Pi, Some("custom".into()), "prompt".into(), None)
                 .unwrap_err()
                 .to_string(),
             "Pi does not expose model selection"
@@ -2790,7 +2802,7 @@ exit 0
         .unwrap();
 
         let error = hub
-            .launch_with(Provider::Pi, None, "safe prompt".into())
+            .launch_with(Provider::Pi, None, "safe prompt".into(), None)
             .unwrap_err()
             .to_string();
 

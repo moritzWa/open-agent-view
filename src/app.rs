@@ -150,6 +150,8 @@ pub enum AppAction {
         provider: Provider,
         model: Option<String>,
         prompt: String,
+        /// Directory picked in the directory view; `None` uses the launch cwd.
+        cwd: Option<PathBuf>,
     },
     Reply {
         session_id: String,
@@ -550,6 +552,24 @@ impl App {
             .iter()
             .find(|group| &group.key == key)
             .cloned()
+    }
+
+    /// The project directory selected in the directory view, which the header
+    /// shows and new sessions start in.
+    pub fn launch_directory(&self) -> Option<PathBuf> {
+        if self.view_mode != ViewMode::Directory {
+            return None;
+        }
+        self.selected_session()
+            .map(|session| project_group_path(&session.cwd))
+            .or_else(|| {
+                self.selected_group().and_then(|group| {
+                    group
+                        .sessions
+                        .first()
+                        .map(|index| project_group_path(&self.snapshot.sessions[*index].cwd))
+                })
+            })
     }
 
     pub fn activate(&mut self) -> AppAction {
@@ -1936,6 +1956,7 @@ impl App {
                 provider: self.launch_provider.clone(),
                 model: self.launch_model.clone(),
                 prompt: input,
+                cwd: self.launch_directory(),
             };
         }
         let (command, argument) = input
@@ -3173,6 +3194,36 @@ mod tests {
     }
 
     #[test]
+    fn new_sessions_start_in_the_directory_selected_in_directory_view() {
+        let mut home = session("home", SessionState::Completed);
+        home.cwd = PathBuf::from("/home/user");
+        let mut project = session("project", SessionState::Working);
+        project.cwd = PathBuf::from("/home/user/code/arca");
+        let mut app = app_with(vec![home, project]);
+
+        app.start_new_session(None);
+        app.input = "status view".into();
+        assert!(matches!(app.activate(), AppAction::Launch { cwd: None, .. }));
+
+        app.toggle_view();
+        app.selection = Some(SelectionKey::Group("cwd:/home/user".into()));
+        app.start_new_session(None);
+        app.input = "selected group".into();
+        assert!(matches!(
+            app.activate(),
+            AppAction::Launch { cwd: Some(cwd), .. } if cwd == PathBuf::from("/home/user")
+        ));
+
+        app.selection = Some(SelectionKey::Session("project".into()));
+        app.start_new_session(None);
+        app.input = "selected session".into();
+        assert!(matches!(
+            app.activate(),
+            AppAction::Launch { cwd: Some(cwd), .. } if cwd == PathBuf::from("/home/user/code/arca")
+        ));
+    }
+
+    #[test]
     fn activating_a_group_toggles_collapse_both_directions() {
         let mut app = app_with(vec![session("one", SessionState::Working)]);
         app.selection = Some(SelectionKey::Group("state:Working".into()));
@@ -3476,7 +3527,8 @@ mod tests {
             AppAction::Launch {
                 provider: Provider::Claude,
                 model: None,
-                prompt: "build it".into()
+                prompt: "build it".into(),
+                cwd: None,
             }
         );
 
@@ -3794,6 +3846,7 @@ mod tests {
                 provider: Provider::Claude,
                 model: Some("opus".into()),
                 prompt: "ship it".into(),
+                cwd: None,
             }
         );
 
