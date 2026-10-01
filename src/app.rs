@@ -9,7 +9,8 @@ use crate::domain::{
 use crate::hidden::HiddenSessionRecord;
 use crate::theme::ColorScheme;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ViewMode {
     Status,
     Directory,
@@ -683,10 +684,14 @@ impl App {
 
     pub fn toggle_view(&mut self) {
         self.notice = None;
-        self.view_mode = match self.view_mode {
+        self.set_view_mode(match self.view_mode {
             ViewMode::Status => ViewMode::Directory,
             ViewMode::Directory => ViewMode::Status,
-        };
+        });
+    }
+
+    pub fn set_view_mode(&mut self, view_mode: ViewMode) {
+        self.view_mode = view_mode;
         self.collapsed.clear();
         self.visible_limits.clear();
         self.rebuild_group_cache();

@@ -145,6 +145,7 @@ pub fn run_dashboard(
     hidden_sessions: HiddenSessions,
     pinned_sessions: crate::pins::PinnedSessions,
     last_harness: crate::last_harness::LastHarness,
+    last_view: crate::last_view::LastView,
     session_aliases: SessionAliases,
     migrations: MigrationServices,
     theme_preference: ThemePreference,
@@ -221,6 +222,9 @@ pub fn run_dashboard(
     );
     app.set_yolo(control.yolo_enabled(), control.yolo_supported_providers());
     app.set_pins(pinned_sessions.pins());
+    if let Some(view_mode) = last_view.view_mode() {
+        app.set_view_mode(view_mode);
+    }
     app.color_scheme = color_scheme;
     let scheme_watcher = SchemeWatcher::spawn(theme_preference);
     let mut terminal = TerminalSession::enter()?;
@@ -546,7 +550,13 @@ pub fn run_dashboard(
                         needs_draw = true;
                     }
                     Event::Key(key) => {
+                        let view_before = app.view_mode;
                         let mut action = handle_key_with_reveal(&mut app, key, &mut pending_reveal);
+                        if app.view_mode != view_before {
+                            if let Err(error) = last_view.save(app.view_mode) {
+                                app.set_notice(format!("failed to remember view: {error:#}"));
+                            }
+                        }
                         if action == AppAction::Quit && migrating_target.is_some() {
                             app.should_quit = false;
                             app.set_notice(

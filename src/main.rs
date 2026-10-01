@@ -29,6 +29,7 @@ use open_agent_view::doctor::{diagnose, render_text};
 use open_agent_view::domain::Provider;
 use open_agent_view::hidden::{HiddenSessionRecord, HiddenSessions};
 use open_agent_view::last_harness::LastHarness;
+use open_agent_view::last_view::LastView;
 use open_agent_view::maintenance::{
     execute_completed_archive, plan_completed_archive, BulkArchiveReport,
 };
@@ -1036,6 +1037,7 @@ fn main() -> Result<()> {
         hidden_sessions,
         PinnedSessions::load_default()?,
         last_harness,
+        LastView::load_default()?,
         session_aliases,
         MigrationServices::new(migration_client, migration_registry),
         cli.theme,
