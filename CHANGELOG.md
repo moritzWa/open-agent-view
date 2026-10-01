@@ -14,8 +14,9 @@ and future released versions are intended to follow Semantic Versioning.
   word takes the state's color (Needs input and Review amber, Done green,
   Working in the normal text color) ahead of a grey summary, the harness name
   is grey instead of accent blue, and session names and group headings are no
-  longer bold. Wide terminals give session names up to 36 columns and leave a
-  three-column gap before the harness name.
+  longer bold. Wide terminals give session names up to 44 columns and leave a
+  three-column gap before the harness name. When every listed session uses the
+  same harness, the harness column is dropped and its width goes to the name.
 
 ## [0.1.53] - 2026-09-04
 

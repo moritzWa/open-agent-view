@@ -194,7 +194,19 @@ fn render_session_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Overlay::Composer(_) | Overlay::HarnessPicker | Overlay::ModelPicker
     );
 
-    for (group_position, group) in app.groups().iter().enumerate() {
+    let groups = app.groups();
+    // A provider column that repeats the same name on every row is noise. It is
+    // decided across the whole list, not per page, so the layout never shifts
+    // while scrolling or expanding groups.
+    let mut providers = groups
+        .iter()
+        .flat_map(|group| group.sessions.iter())
+        .map(|index| &app.snapshot.sessions[*index].provider);
+    let show_provider = providers
+        .next()
+        .is_some_and(|first| providers.any(|provider| provider != first));
+
+    for (group_position, group) in groups.iter().enumerate() {
         if group_position > 0 {
             lines.push(Line::default());
         }
@@ -229,6 +241,7 @@ fn render_session_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 session,
                 app.view_mode,
                 area.width,
+                show_provider,
                 is_selected,
                 app.live_animation_visible(),
             ));
@@ -338,32 +351,46 @@ fn render_session_row(
     session: &AgentSession,
     view_mode: ViewMode,
     width: u16,
+    show_provider: bool,
     selected: bool,
     live_animation_visible: bool,
 ) -> Line<'static> {
     let symbol = state_symbol(session.state, live_animation_visible);
     let symbol_style = Style::default().fg(state_color(session.state));
-    let name_width = if width >= 140 {
-        36
+    // Provider identity is primary row information when the list mixes
+    // providers. Keep the complete names of every built-in provider visible
+    // instead of requiring users to decode the old C@H/X@D-style marker.
+    // Runtime details remain available in Peek.
+    let provider_width = 14;
+    let base_name_width = if width >= 140 {
+        44
     } else if width >= 120 {
-        30
+        38
     } else if width >= 100 {
-        26
+        32
     } else if width >= 70 {
-        20
+        24
     } else if width >= 50 {
         16
     } else {
         10
     };
-    // Provider identity is primary row information. Keep the complete names of
-    // every built-in provider visible instead of requiring users to decode the
-    // old C@H/X@D-style marker. Runtime details remain available in Peek.
-    let provider_width = 14;
-    let provider = pad_to_width(
-        truncate(session.provider.label(), provider_width),
-        provider_width,
-    );
+    let name_width = if show_provider {
+        base_name_width
+    } else {
+        base_name_width + provider_width
+    };
+    let provider_column = if show_provider {
+        format!(
+            "{} ",
+            pad_to_width(
+                truncate(session.provider.label(), provider_width),
+                provider_width,
+            )
+        )
+    } else {
+        String::new()
+    };
     let state_label = (view_mode == ViewMode::Directory)
         .then(|| short_state(session.state))
         .unwrap_or_default();
@@ -381,14 +408,15 @@ fn render_session_row(
         format!("{prs:>7} {age:>5}")
     };
     let name_gap = if width >= 70 { "   " } else { " " };
-    let fixed = 4 + name_gap.len() + name_width + provider_width + display_width(&right);
+    let fixed =
+        3 + name_gap.len() + name_width + display_width(&provider_column) + display_width(&right);
     let summary_width = (width as usize).saturating_sub(fixed).max(1);
     let name = pad_to_width(truncate(&session.name, name_width), name_width);
     let mut spans = vec![
         Span::styled(format!(" {symbol} "), symbol_style),
         Span::raw(name),
         Span::styled(
-            format!("{name_gap}{provider} "),
+            format!("{name_gap}{provider_column}"),
             Style::default().fg(DIM),
         ),
     ];
@@ -1788,7 +1816,7 @@ mod tests {
         for (provider, expected) in providers {
             let mut item = session("recognizable-session", SessionState::Working);
             item.provider = provider;
-            let row = render_session_row(&item, ViewMode::Status, 120, false, true);
+            let row = render_session_row(&item, ViewMode::Status, 120, true, false, true);
             let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
 
             assert!(
@@ -1806,13 +1834,42 @@ mod tests {
             SessionState::Working,
         );
         item.provider = Provider::Antigravity;
-        let row = render_session_row(&item, ViewMode::Status, 120, false, true);
+        let row = render_session_row(&item, ViewMode::Status, 120, true, false, true);
         let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
 
         assert!(
             text.contains("…   Antigravity"),
             "provider column touched name: {text:?}"
         );
+    }
+
+    #[test]
+    fn single_provider_list_drops_the_provider_column_and_widens_the_name() {
+        let name = "session name that fits once provider column is gone";
+        let mut item = session(name, SessionState::Working);
+        item.provider = Provider::OpenCode;
+
+        let with_provider = render_session_row(&item, ViewMode::Status, 120, true, false, true);
+        let without_provider = render_session_row(&item, ViewMode::Status, 120, false, false, true);
+        let with_text: String = with_provider
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let without_text: String = without_provider
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(with_text.contains("OpenCode"));
+        assert!(!with_text.contains(name));
+        assert!(!without_text.contains("OpenCode"));
+        assert!(
+            without_text.contains(name),
+            "name was cut off: {without_text:?}"
+        );
+        assert_eq!(display_width(&without_text), 120);
     }
 
     #[test]
@@ -1823,7 +1880,7 @@ mod tests {
         item.updated_at = Some(SystemTime::now() - Duration::from_secs(86_400));
 
         for width in [80, 120, 160] {
-            let row = render_session_row(&item, ViewMode::Status, width, false, true);
+            let row = render_session_row(&item, ViewMode::Status, width, true, false, true);
             let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
 
             assert_eq!(display_width(&text), width as usize);
@@ -1841,13 +1898,13 @@ mod tests {
     #[test]
     fn working_marker_blinks_without_changing_other_session_states() {
         let working = session("worker", SessionState::Working);
-        let visible = render_session_row(&working, ViewMode::Status, 120, false, true);
-        let dimmed = render_session_row(&working, ViewMode::Status, 120, false, false);
+        let visible = render_session_row(&working, ViewMode::Status, 120, true, false, true);
+        let dimmed = render_session_row(&working, ViewMode::Status, 120, true, false, false);
         assert_eq!(visible.spans[0].content, " ✳ ");
         assert_eq!(dimmed.spans[0].content, " · ");
 
         let completed = session("done", SessionState::Completed);
-        let completed = render_session_row(&completed, ViewMode::Status, 120, false, false);
+        let completed = render_session_row(&completed, ViewMode::Status, 120, true, false, false);
         assert_eq!(completed.spans[0].content, " • ");
     }
 
@@ -1859,7 +1916,7 @@ mod tests {
             (SessionState::Working, "Working", FG),
         ] {
             let item = session("worker", state);
-            let row = render_session_row(&item, ViewMode::Directory, 120, false, true);
+            let row = render_session_row(&item, ViewMode::Directory, 120, true, false, true);
             let provider = row
                 .spans
                 .iter()
