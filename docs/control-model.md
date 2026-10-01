@@ -321,8 +321,9 @@ never grants authority.
 
 The supervisor intentionally does not attach to an arbitrary OpenCode TUI or
 unregistered random server. Durable managed control requires Linux. Elsewhere
-a dashboard launch runs `opencode --prompt=TASK` in the requested directory,
-then records the single root session created there since the launch in
+a dashboard launch starts `opencode` in the requested directory, waits for its
+empty `Ask anything…` editor, pastes the task with bracketed paste and presses
+Enter (OpenCode 1.18.34's `--prompt` only prefills the editor), then records the single root session created there since the launch in
 `opencode-owned.json`. Ambiguity (two new sessions) refuses to record either.
 These rows are listed without `--include-external` and receive Inspect and
 native open only.

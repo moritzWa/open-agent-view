@@ -31,6 +31,10 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 /// `ps` reports elapsed time in whole seconds, so a process start is known to
 /// about a second. Records this close to the start still count as its own.
 const START_SLACK_MS: u64 = 2_000;
+/// A session with an unfinished turn updated this recently claims a process
+/// before idle sessions do. A long tool call writes nothing while it runs, so
+/// this is a window rather than "updated since the process started".
+const ACTIVE_WINDOW_MS: u64 = 10 * 60 * 1_000;
 /// The footer and prompt panels sit in the last rows, below the transcript.
 const PROMPT_ROWS: usize = 8;
 
@@ -69,6 +73,8 @@ pub(super) struct Candidate<'a> {
     pub directory: &'a Path,
     pub created_ms: u64,
     pub updated_ms: u64,
+    /// An unfinished turn written recently: some live process is running it.
+    pub active: bool,
 }
 
 /// Every live `opencode` process that runs a TUI or a headless `run`.
@@ -394,12 +400,12 @@ pub(super) fn named_sessions(holders: &[Holder]) -> BTreeSet<String> {
 }
 
 /// Map each held session to its holder. A process that names its session
-/// holds exactly that one. Of the rest, a process first holds the newest
-/// session it created itself: in its directory, created after it started and
-/// before any later process there started. A process that created none (it
-/// resumed one from the session list) holds the most recently updated
-/// unclaimed session in its directory that changed after it started. One that
-/// has not touched a session yet (a fresh TUI on its home screen) holds none.
+/// holds exactly that one. Every other process holds at most one session in
+/// its directory that changed after it started. Sessions with an active turn
+/// claim first, then the most recently updated. Each goes to the process that
+/// created it (the latest one started before the session was created) when
+/// that process is still free, otherwise to the newest free process. A fresh
+/// TUI on its home screen that touched nothing holds none.
 pub(super) fn assign(holders: &[Holder], candidates: &[Candidate<'_>]) -> BTreeMap<String, Holder> {
     let known = candidates
         .iter()
@@ -435,61 +441,125 @@ pub(super) fn assign(holders: &[Holder], candidates: &[Candidate<'_>]) -> BTreeM
         .iter()
         .map(|candidate| (candidate, canonical(candidate.directory)))
         .collect::<Vec<_>>();
-    ordered.sort_by_key(|(candidate, _)| std::cmp::Reverse(candidate.updated_ms));
-    let creator = |candidate: &Candidate<'_>, dir: &PathBuf| {
-        by_directory.iter().position(|(holder, holder_dir)| {
-            holder_dir == dir && holder.started_ms <= candidate.created_ms + START_SLACK_MS
-        })
-    };
+    ordered.sort_by_key(|(candidate, _)| {
+        (
+            std::cmp::Reverse(candidate.active),
+            std::cmp::Reverse(candidate.updated_ms),
+        )
+    });
     let mut claimed = vec![false; by_directory.len()];
     for (candidate, dir) in &ordered {
         if assigned.contains_key(candidate.id) {
             continue;
         }
-        if let Some(index) = creator(candidate, dir) {
-            if !claimed[index] {
-                claimed[index] = true;
-                assigned.insert(candidate.id.to_owned(), by_directory[index].0.clone());
-            }
-        }
-    }
-    // Processes that created nothing; the newest claims first.
-    for (index, (holder, dir)) in by_directory.iter().enumerate() {
-        if claimed[index] {
-            continue;
-        }
-        let claim = ordered.iter().find(|(candidate, candidate_dir)| {
-            candidate_dir == dir
-                && candidate.updated_ms + START_SLACK_MS >= holder.started_ms
-                && !assigned.contains_key(candidate.id)
-        });
-        if let Some((candidate, _)) = claim {
-            assigned.insert(candidate.id.to_owned(), (*holder).clone());
+        let free = (0..by_directory.len())
+            .filter(|&index| {
+                let (holder, holder_dir) = &by_directory[index];
+                !claimed[index]
+                    && holder_dir == dir
+                    && holder.started_ms <= candidate.updated_ms + START_SLACK_MS
+            })
+            .collect::<Vec<_>>();
+        let pick = free
+            .iter()
+            .copied()
+            .find(|&index| {
+                by_directory[index].0.started_ms <= candidate.created_ms + START_SLACK_MS
+            })
+            .or_else(|| free.first().copied());
+        if let Some(index) = pick {
+            claimed[index] = true;
+            assigned.insert(candidate.id.to_owned(), by_directory[index].0.clone());
         }
     }
     assigned
+}
+
+/// Whether a session has an unfinished turn, its own or a subagent's, that
+/// was written within the active window.
+pub(super) fn is_active(
+    last: Option<&LastMessage>,
+    child_turn_ms: Option<u64>,
+    updated_ms: u64,
+    now_ms: u64,
+) -> bool {
+    let unfinished = child_turn_ms.is_some()
+        || last.is_some_and(|last| {
+            matches!(
+                (last.role.as_deref(), last.completed),
+                (Some("assistant"), None) | (Some("user"), _)
+            )
+        });
+    unfinished && now_ms.saturating_sub(updated_ms) <= ACTIVE_WINDOW_MS
 }
 
 fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
 }
 
-/// State from the database for a session held by a live process.
+/// The earliest start among live processes that could be running this
+/// session: one naming it, or one working in its directory. A turn written
+/// before all of them started was cut off with a process that has exited.
+pub(super) fn earliest_start(holders: &[Holder], id: &str, directory: &Path) -> Option<u64> {
+    let mut directory_canonical = None;
+    holders
+        .iter()
+        .filter(|holder| match &holder.target {
+            Target::Session(session) => session == id,
+            Target::Directory(Some(dir)) => {
+                canonical(dir) == *directory_canonical.get_or_insert_with(|| canonical(directory))
+            }
+            Target::Directory(None) => false,
+        })
+        .map(|holder| holder.started_ms)
+        .min()
+}
+
+/// State from the database for a session held by a live process, counting
+/// only turns written since `since_ms`. `child_turn_ms` is when the newest
+/// unfinished turn of one of its subagent sessions began: a background task
+/// (`task` with `background: true`) keeps working after the parent's own turn
+/// has ended.
 pub(super) fn held_state(
     last: Option<&LastMessage>,
-    holder_started_ms: u64,
+    child_turn_ms: Option<u64>,
+    since_ms: u64,
 ) -> (SessionState, &'static str) {
-    let Some(last) = last.filter(|last| last.created + START_SLACK_MS >= holder_started_ms) else {
-        // No turn since this process started, or one left unfinished by an
-        // earlier process that exited mid-turn.
-        return (SessionState::NeedsInput, "waiting at prompt");
-    };
-    match (last.role.as_deref(), last.completed) {
-        (Some("assistant"), None) if last.question != 0 => {
-            (SessionState::NeedsInput, "question asked")
+    let current = |created: u64| created + START_SLACK_MS >= since_ms;
+    if let Some(last) = last.filter(|last| current(last.created)) {
+        match (last.role.as_deref(), last.completed) {
+            (Some("assistant"), None) if last.question != 0 => {
+                return (SessionState::NeedsInput, "question asked");
+            }
+            (Some("assistant"), None) | (Some("user"), _) => {
+                return (SessionState::Working, "running turn");
+            }
+            _ => {}
         }
-        (Some("assistant"), None) | (Some("user"), _) => (SessionState::Working, "running turn"),
-        _ => (SessionState::NeedsInput, "waiting at prompt"),
+    }
+    if child_turn_ms.is_some_and(current) {
+        return (SessionState::Working, "background task");
+    }
+    (SessionState::NeedsInput, "waiting at prompt")
+}
+
+/// Combine a background screen's reading with the database's. An idle prompt
+/// on this dashboard's screen does not rule out a background subagent, or a
+/// turn another process is running for the same session, so it yields to a
+/// database that shows work. Permission, question, and interrupt hints are
+/// shown only by the process running the turn and always win.
+pub(super) fn combine(
+    screen: Option<(SessionState, &'static str)>,
+    database: (SessionState, &'static str),
+) -> (SessionState, &'static str) {
+    match screen {
+        Some((SessionState::NeedsInput, "waiting at prompt"))
+            if database.0 == SessionState::Working =>
+        {
+            database
+        }
+        Some(screen) => screen,
+        None => database,
     }
 }
 
@@ -526,7 +596,7 @@ pub(super) fn screen_state(screen: &str) -> Option<(SessionState, &'static str)>
     None
 }
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -648,7 +718,42 @@ mod tests {
             directory,
             created_ms,
             updated_ms,
+            active: false,
         }
+    }
+
+    #[test]
+    fn a_session_mid_turn_claims_the_process_before_one_it_created_and_left() {
+        // Observed live: a TUI resumed an older session and is running a long
+        // polling loop in it, while a session it created after starting sits
+        // idle and was updated more recently.
+        let work = PathBuf::from("/nonexistent-oav/work");
+        let mut running = candidate("ses_running", &work, 100, 20_000);
+        running.active = true;
+        let left = candidate("ses_left", &work, 12_000, 30_000);
+        let tui = holder(1, 10_000, Target::Directory(Some(work.clone())));
+        let assigned = assign(std::slice::from_ref(&tui), &[left, running]);
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(assigned["ses_running"], tui);
+    }
+
+    #[test]
+    fn only_recent_unfinished_turns_are_active() {
+        let open = LastMessage {
+            role: Some("assistant".into()),
+            created: 1_000,
+            completed: None,
+            question: 0,
+        };
+        let done = LastMessage {
+            completed: Some(2_000),
+            ..open.clone()
+        };
+        let now = ACTIVE_WINDOW_MS + 100_000;
+        assert!(is_active(Some(&open), None, now - 1_000, now));
+        assert!(!is_active(Some(&open), None, 1_000, now));
+        assert!(!is_active(Some(&done), None, now - 1_000, now));
+        assert!(is_active(Some(&done), Some(now - 5_000), now - 1_000, now));
     }
 
     fn holder(pid: u32, started_ms: u64, target: Target) -> Holder {
@@ -716,6 +821,52 @@ mod tests {
     }
 
     #[test]
+    fn a_running_background_subagent_keeps_the_parent_working() {
+        let done = LastMessage {
+            role: Some("assistant".into()),
+            created: 10_000,
+            completed: Some(11_000),
+            question: 0,
+        };
+        assert_eq!(
+            held_state(Some(&done), Some(12_000), 5_000),
+            (SessionState::Working, "background task")
+        );
+        // A subagent turn cut off before the holder started is not work.
+        assert_eq!(
+            held_state(Some(&done), Some(1_000), 5_000),
+            (SessionState::NeedsInput, "waiting at prompt")
+        );
+    }
+
+    #[test]
+    fn an_idle_screen_yields_to_work_the_database_shows() {
+        let idle = Some((SessionState::NeedsInput, "waiting at prompt"));
+        let working = (SessionState::Working, "running turn");
+        let waiting = (SessionState::NeedsInput, "waiting at prompt");
+        assert_eq!(combine(idle, working), working);
+        assert_eq!(combine(idle, waiting), waiting);
+        let permission = (SessionState::NeedsInput, "permission requested");
+        assert_eq!(combine(Some(permission), working), permission);
+        assert_eq!(combine(None, working), working);
+    }
+
+    #[test]
+    fn the_earliest_possible_runner_bounds_what_counts_as_current() {
+        let work = PathBuf::from("/nonexistent-oav/work");
+        let holders = [
+            holder(1, 9_000, Target::Session("ses_a".into())),
+            holder(2, 3_000, Target::Directory(Some(work.clone()))),
+            holder(3, 1_000, Target::Session("ses_b".into())),
+        ];
+        assert_eq!(earliest_start(&holders, "ses_a", &work), Some(3_000));
+        assert_eq!(
+            earliest_start(&holders, "ses_c", Path::new("/nonexistent-oav/else")),
+            None
+        );
+    }
+
+    #[test]
     fn database_state_ignores_turns_older_than_the_holder() {
         let turn = |role: &str, created, completed, question| LastMessage {
             role: Some(role.into()),
@@ -724,28 +875,32 @@ mod tests {
             question,
         };
         assert_eq!(
-            held_state(Some(&turn("assistant", 10_000, None, 0)), 5_000).0,
+            held_state(Some(&turn("assistant", 10_000, None, 0)), None, 5_000).0,
             SessionState::Working
         );
         assert_eq!(
-            held_state(Some(&turn("user", 10_000, None, 0)), 5_000).0,
+            held_state(Some(&turn("user", 10_000, None, 0)), None, 5_000).0,
             SessionState::Working
         );
         assert_eq!(
-            held_state(Some(&turn("assistant", 10_000, None, 1)), 5_000),
+            held_state(Some(&turn("assistant", 10_000, None, 1)), None, 5_000),
             (SessionState::NeedsInput, "question asked")
         );
         assert_eq!(
-            held_state(Some(&turn("assistant", 10_000, Some(11_000), 0)), 5_000),
+            held_state(
+                Some(&turn("assistant", 10_000, Some(11_000), 0)),
+                None,
+                5_000
+            ),
             (SessionState::NeedsInput, "waiting at prompt")
         );
         // Left unfinished by a process that was killed before this one started.
         assert_eq!(
-            held_state(Some(&turn("assistant", 1_000, None, 0)), 60_000),
+            held_state(Some(&turn("assistant", 1_000, None, 0)), None, 60_000),
             (SessionState::NeedsInput, "waiting at prompt")
         );
         assert_eq!(
-            held_state(None, 5_000),
+            held_state(None, None, 5_000),
             (SessionState::NeedsInput, "waiting at prompt")
         );
     }

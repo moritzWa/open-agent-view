@@ -28,10 +28,12 @@ use crate::process::{CancellableProcessRunner, CommandRequest, CommandRunner};
 // json_object also preserves tabs/newlines in user titles and paths safely.
 // Subagent sessions (those with a parent) are listed under their parent's
 // running turn rather than as rows of their own. `last` is the newest message,
-// read through the (session_id, time_created) index, which live state needs.
-const GLOBAL_SESSION_ROWS: &str = "SELECT json_object('id', s.id, 'title', s.title, 'created', s.time_created, 'updated', s.time_updated, 'projectId', s.project_id, 'directory', s.directory, 'last', json((SELECT json_object('role', json_extract(m.data, '$.role'), 'created', m.time_created, 'completed', json_extract(m.data, '$.time.completed'), 'question', EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id AND json_extract(p.data, '$.tool') = 'question' AND json_extract(p.data, '$.state.status') IN ('pending', 'running'))) FROM message m WHERE m.session_id = s.id ORDER BY m.time_created DESC, m.id DESC LIMIT 1))) AS record FROM session s WHERE s.parent_id IS NULL";
+// read through the (session_id, time_created) index, which live state needs;
+// `child` is when the newest unfinished turn of a subagent session began.
+const GLOBAL_SESSION_ROWS: &str = "SELECT json_object('id', s.id, 'title', s.title, 'created', s.time_created, 'updated', s.time_updated, 'projectId', s.project_id, 'directory', s.directory, 'last', json((SELECT json_object('role', json_extract(m.data, '$.role'), 'created', m.time_created, 'completed', json_extract(m.data, '$.time.completed'), 'question', EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id AND json_extract(p.data, '$.tool') = 'question' AND json_extract(p.data, '$.state.status') IN ('pending', 'running'))) FROM message m WHERE m.session_id = s.id ORDER BY m.time_created DESC, m.id DESC LIMIT 1)), 'child', (SELECT MAX(m.time_created) FROM session c JOIN message m ON m.id = (SELECT m2.id FROM message m2 WHERE m2.session_id = c.id ORDER BY m2.time_created DESC, m2.id DESC LIMIT 1) WHERE c.parent_id = s.id AND (json_extract(m.data, '$.role') = 'user' OR json_extract(m.data, '$.time.completed') IS NULL))) AS record FROM session s WHERE s.parent_id IS NULL";
 const MAX_MODEL_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 const LAUNCH_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8);
+const OPENCODE_READY_MARKER: &str = "Ask anything";
 
 type HolderProbe = Arc<dyn Fn() -> Vec<Holder> + Send + Sync>;
 
@@ -367,9 +369,10 @@ impl OpenCodeController {
             validate_model(model)?;
             command.arg(format!("--model={model}"));
         }
-        // The `=` form keeps a prompt that starts with `-` from being read as
-        // an option. OpenCode submits it once the interface is ready.
-        command.arg(format!("--prompt={prompt}"));
+        // `--prompt` only prefills OpenCode's editor without submitting it, so
+        // the task is pasted and entered once the empty editor is on screen.
+        // Bracketed paste keeps multiline and slash-prefixed tasks as text.
+        let initial_input = format!("\x1b[200~{prompt}\x1b[201~\r").into_bytes();
         let launched_ms = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -378,7 +381,12 @@ impl OpenCodeController {
             "opencode:host:launch-{}",
             crate::native_session::new_session_id()?
         );
-        let exit = crate::native_session::run(command, &launch_key)?;
+        let exit = crate::native_session::run_with_initial_input_after_screen(
+            command,
+            &launch_key,
+            &initial_input,
+            OPENCODE_READY_MARKER,
+        )?;
         let session_id = poll_unique(
             "one new OpenCode session in the requested workspace",
             LAUNCH_DISCOVERY_TIMEOUT,
@@ -711,6 +719,7 @@ impl OpenCodeSource {
         let assigned = if holders.is_empty() {
             BTreeMap::new()
         } else {
+            let now = opencode_live::now_ms();
             let candidates = records
                 .iter()
                 .map(|record| Candidate {
@@ -718,6 +727,12 @@ impl OpenCodeSource {
                     directory: &record.directory,
                     created_ms: record.created,
                     updated_ms: record.updated,
+                    active: opencode_live::is_active(
+                        record.last.as_ref(),
+                        record.child,
+                        record.updated,
+                        now,
+                    ),
                 })
                 .collect::<Vec<_>>();
             opencode_live::assign(holders, &candidates)
@@ -726,10 +741,15 @@ impl OpenCodeSource {
             .into_iter()
             .map(|mut record| {
                 let last = record.last.take();
+                let child = record.child.take();
+                let since = opencode_live::earliest_start(holders, &record.id, &record.directory);
                 let mut session = normalize_record(record, self.runtime.clone());
                 if self.runtime == Runtime::Host {
                     let holder = assigned.get(&session.provider_session_id);
-                    apply_live_state(&mut session, last.as_ref(), holder);
+                    let since = since
+                        .or(holder.map(|holder| holder.started_ms))
+                        .unwrap_or(0);
+                    apply_live_state(&mut session, last.as_ref(), child, holder, since);
                 }
                 session
             })
@@ -786,7 +806,9 @@ impl OpenCodeSource {
 fn apply_live_state(
     session: &mut AgentSession,
     last: Option<&LastMessage>,
+    child: Option<u64>,
     holder: Option<&Holder>,
+    since: u64,
 ) {
     let background = crate::native_session::background_screen_contents(&session.id);
     let Some(pid) = background
@@ -796,12 +818,12 @@ fn apply_live_state(
     else {
         return;
     };
-    let (state, raw_state) = background
-        .as_ref()
-        .and_then(|(_, screen)| opencode_live::screen_state(screen))
-        .unwrap_or_else(|| {
-            opencode_live::held_state(last, holder.map_or(0, |holder| holder.started_ms))
-        });
+    let (state, raw_state) = opencode_live::combine(
+        background
+            .as_ref()
+            .and_then(|(_, screen)| opencode_live::screen_state(screen)),
+        opencode_live::held_state(last, child, since),
+    );
     session.state = state;
     session.raw_state = Some(raw_state.into());
     session.pid = Some(pid);
@@ -933,6 +955,8 @@ struct OpenCodeRecord {
     directory: PathBuf,
     #[serde(default)]
     last: Option<LastMessage>,
+    #[serde(default)]
+    child: Option<u64>,
 }
 
 pub fn parse_opencode_session_list(input: &str, runtime: Runtime) -> Result<Vec<AgentSession>> {
