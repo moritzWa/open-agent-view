@@ -8,20 +8,20 @@
 use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::net::TcpListener;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Stdio;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::thread;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Instant;
 use std::time::{Duration, SystemTime};
 
@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use crate::domain::SessionState;
 
 const RECORD_VERSION: u32 = 1;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -351,10 +351,32 @@ impl OpenCodeSupervisor {
             }
             Ok(())
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            // macOS has no pidfd, so the identity check and the signal are two
+            // steps. The window is a PID reuse within microseconds of a check
+            // that also matched the start time, command line, and listener.
+            if !verify_server(&record)? {
+                bail!("OpenCode server identity changed before shutdown");
+            }
+            verify_listener_owner(record.pid, record.port)?;
+            if unsafe { libc::kill(record.pid as libc::pid_t, libc::SIGTERM) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to stop exact OpenCode server");
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while verify_server(&record)? {
+                if Instant::now() >= deadline {
+                    bail!("timed out waiting for exact OpenCode server to exit");
+                }
+                thread::sleep(Duration::from_millis(40));
+            }
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = record;
-            bail!("durable OpenCode supervision currently requires Linux")
+            bail!("durable OpenCode supervision currently requires Linux or macOS")
         }
     }
 
@@ -383,27 +405,31 @@ impl OpenCodeSupervisor {
     }
 
     fn start_server(&self, sessions: BTreeMap<String, OwnedSession>) -> Result<ServerRecord> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = sessions;
-            bail!("durable OpenCode supervision currently requires Linux process identity verification")
+            bail!("durable OpenCode supervision currently requires Linux or macOS process identity verification")
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
             let port = listener.local_addr()?.port();
             drop(listener);
             let password = random_secret()?;
             let username = "opencode".to_owned();
+            use std::os::unix::process::CommandExt;
+
             let log = private_append_file(&self.state_dir.join("server.log"))?;
             let mut child = Command::new(&self.executable)
+                // The server outlives the dashboard, so it must not receive the
+                // interrupt or hangup the terminal sends to OAV's process group.
+                .process_group(0)
                 .args([
                     "serve",
                     "--hostname",
                     "127.0.0.1",
                     "--port",
                     &port.to_string(),
-                    "--pure",
                 ])
                 .env("OPENCODE_SERVER_USERNAME", &username)
                 .env("OPENCODE_SERVER_PASSWORD", &password)
@@ -994,7 +1020,7 @@ fn opencode_prompt_body(prompt: &str, model: Option<&str>) -> Result<Value> {
     Ok(body)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn random_secret() -> Result<String> {
     let mut bytes = [0_u8; 32];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
@@ -1032,7 +1058,7 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn private_append_file(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
@@ -1191,11 +1217,18 @@ fn record_uses_executable(record: &ServerRecord, configured: &str) -> bool {
             .and_then(|path| fs::canonicalize(path).ok());
         actual.is_some() && actual == resolve_host_executable(configured)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let actual = process_executable(record.pid)
+            .ok()
+            .and_then(|path| fs::canonicalize(path).ok());
+        actual.is_some() && actual == resolve_host_executable(configured)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     false
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn resolve_host_executable(executable: &str) -> Option<PathBuf> {
     let path = Path::new(executable);
     if path.components().count() > 1 {
@@ -1226,7 +1259,59 @@ fn process_state(pid: u32) -> Result<Option<String>> {
     Ok(Some(parse_process_stat(&stat)?.0))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn process_state(pid: u32) -> Result<Option<String>> {
+    match bsd_info(pid) {
+        Ok(info) if info.pbi_status == libc::SZOMB => Ok(Some("Z".into())),
+        Ok(_) => Ok(Some("R".into())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: u32) -> std::io::Result<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if read == size {
+        return Ok(info);
+    }
+    let error = std::io::Error::last_os_error();
+    if read <= 0 && error.raw_os_error() == Some(libc::ESRCH) {
+        return Err(std::io::ErrorKind::NotFound.into());
+    }
+    Err(error)
+}
+
+#[cfg(target_os = "macos")]
+fn process_executable(pid: u32) -> std::io::Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if length <= 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    buffer.truncate(length as usize);
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_state(_: u32) -> Result<Option<String>> {
     bail!("process-state verification is unavailable on this platform")
 }
@@ -1262,7 +1347,16 @@ fn parse_process_stat(stat: &str) -> Result<(String, String)> {
     Ok((state, start))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn process_start_token(pid: u32) -> Result<String> {
+    let info = bsd_info(pid)?;
+    Ok(format!(
+        "{}.{:06}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_start_token(_: u32) -> Result<String> {
     bail!("process start-token verification is unavailable on this platform")
 }
@@ -1272,7 +1366,84 @@ fn process_cmdline(pid: u32) -> Result<Vec<u8>> {
     fs::read(format!("/proc/{pid}/cmdline")).map_err(Into::into)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// The argument vector in Linux `/proc/PID/cmdline` form: each argument
+/// followed by a NUL. `KERN_PROCARGS2` returns argc, the executable path,
+/// alignment NULs, the arguments, and then the environment, which is skipped.
+#[cfg(target_os = "macos")]
+fn process_cmdline(pid: u32) -> Result<Vec<u8>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size: libc::size_t = 0;
+    let sized = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 {
+        return Err(missing_or_os_error(pid).into());
+    }
+    let mut buffer = vec![0_u8; size];
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return Err(missing_or_os_error(pid).into());
+    }
+    buffer.truncate(size);
+    parse_procargs2(&buffer)
+}
+
+#[cfg(target_os = "macos")]
+fn missing_or_os_error(pid: u32) -> std::io::Error {
+    let error = std::io::Error::last_os_error();
+    // KERN_PROCARGS2 reports EINVAL rather than ESRCH for an exited process.
+    match bsd_info(pid) {
+        Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => missing,
+        _ => error,
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_procargs2(buffer: &[u8]) -> Result<Vec<u8>> {
+    let count = buffer.get(..4).context("process arguments omitted argc")?;
+    let argc = i32::from_ne_bytes(count.try_into()?);
+    let argc = usize::try_from(argc).context("process arguments reported a negative argc")?;
+    let rest = &buffer[4..];
+    let path_end = rest
+        .iter()
+        .position(|byte| *byte == 0)
+        .context("process arguments omitted the executable path terminator")?;
+    let mut position = path_end;
+    while rest.get(position) == Some(&0) {
+        position += 1;
+    }
+    let mut cmdline = Vec::new();
+    for _ in 0..argc {
+        let argument = rest
+            .get(position..)
+            .context("process arguments ended before argc arguments")?;
+        let end = argument
+            .iter()
+            .position(|byte| *byte == 0)
+            .context("process argument omitted its terminator")?;
+        cmdline.extend_from_slice(&argument[..=end]);
+        position += end + 1;
+    }
+    Ok(cmdline)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_cmdline(_: u32) -> Result<Vec<u8>> {
     bail!("process command-line verification is unavailable on this platform")
 }
@@ -1307,7 +1478,28 @@ fn verify_listener_owner(pid: u32, port: u16) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn verify_listener_owner(pid: u32, port: u16) -> Result<()> {
+    let output = Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-a", "-p", &pid.to_string()])
+        .arg(format!("-iTCP@127.0.0.1:{port}"))
+        .args(["-sTCP:LISTEN", "-Fp"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("failed to run lsof for OpenCode listener verification")?;
+    let expected = format!("p{pid}");
+    let found = output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == expected);
+    if !found {
+        bail!("verified OpenCode process does not own the recorded loopback listener");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn verify_listener_owner(_: u32, _: u16) -> Result<()> {
     bail!("listener ownership verification is unavailable on this platform")
 }
@@ -1548,7 +1740,49 @@ mod tests {
         }));
     }
 
-    #[cfg(target_os = "linux")]
+    #[test]
+    fn procargs2_yields_only_the_arguments_in_proc_cmdline_form() {
+        let mut buffer = 2_i32.to_ne_bytes().to_vec();
+        buffer.extend_from_slice(b"/bin/opencode\0\0\0\0opencode\0serve\0SECRET=x\0");
+        assert_eq!(parse_procargs2(&buffer).unwrap(), b"opencode\0serve\0");
+        let mut truncated = 3_i32.to_ne_bytes().to_vec();
+        truncated.extend_from_slice(b"/bin/opencode\0opencode\0serve\0");
+        assert!(parse_procargs2(&truncated).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_process_identity_is_stable_and_an_exited_process_is_missing() {
+        let pid = std::process::id();
+        assert_eq!(
+            process_start_token(pid).unwrap(),
+            process_start_token(pid).unwrap()
+        );
+        let expected = std::env::args_os()
+            .flat_map(|argument| {
+                use std::os::unix::ffi::OsStrExt;
+                let mut bytes = argument.as_bytes().to_vec();
+                bytes.push(0);
+                bytes
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(process_cmdline(pid).unwrap(), expected);
+        assert_ne!(process_state(pid).unwrap().as_deref(), Some("Z"));
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let exited = child.id();
+        child.wait().unwrap();
+        assert_eq!(process_state(exited).unwrap(), None);
+        assert!(is_missing_process(
+            &process_start_token(exited).unwrap_err()
+        ));
+        assert!(is_missing_process(&process_cmdline(exited).unwrap_err()));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_bare_recorded_name_matches_the_same_canonical_running_executable() {
         let pid = std::process::id();

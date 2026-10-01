@@ -32,7 +32,7 @@ use open_agent_view::maintenance::{
     execute_completed_archive, plan_completed_archive, BulkArchiveReport,
 };
 use open_agent_view::migration::{MigrationClient, MigrationRegistry};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use open_agent_view::opencode_supervisor::OpenCodeSupervisor;
 use open_agent_view::pi_supervisor::run_pi_supervisor_daemon;
 #[cfg(target_os = "linux")]
@@ -616,7 +616,7 @@ fn main() -> Result<()> {
     let copilot_supervisor = copilot_enabled
         .then(|| CopilotSupervisor::host(cli.copilot_bin.clone()).map(Arc::new))
         .transpose()?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let opencode_supervisor = opencode_enabled
         .then(|| OpenCodeSupervisor::host(cli.opencode_bin.clone()).map(Arc::new))
         .transpose()?;
@@ -689,7 +689,22 @@ fn main() -> Result<()> {
                     .expect("OpenCode supervisor exists when OpenCode is enabled")
                     .clone(),
             );
-            #[cfg(not(target_os = "linux"))]
+            // Sessions recorded before the managed server existed stay
+            // listed and restorable through the ownership file.
+            #[cfg(target_os = "macos")]
+            let controller = OpenCodeController::managed(
+                cli.opencode_bin.clone(),
+                opencode_supervisor
+                    .as_ref()
+                    .expect("OpenCode supervisor exists when OpenCode is enabled")
+                    .clone(),
+            )
+            .with_ownership(
+                opencode_ownership
+                    .clone()
+                    .expect("OpenCode ownership exists when OpenCode is enabled"),
+            );
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let controller = OpenCodeController::host(cli.opencode_bin.clone()).with_ownership(
                 opencode_ownership
                     .clone()
@@ -886,7 +901,19 @@ fn main() -> Result<()> {
                     OpenCodeSource::managed_owned(cli.opencode_bin, supervisor)
                 }
             };
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(target_os = "macos")]
+            let source = {
+                let supervisor = opencode_supervisor
+                    .expect("OpenCode supervisor exists when OpenCode is enabled");
+                let ownership =
+                    opencode_ownership.expect("OpenCode ownership exists when OpenCode is enabled");
+                if request.include_external {
+                    OpenCodeSource::managed(cli.opencode_bin, supervisor).owned(ownership)
+                } else {
+                    OpenCodeSource::managed_owned(cli.opencode_bin, supervisor).owned(ownership)
+                }
+            };
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let source = OpenCodeSource::host(cli.opencode_bin).owned(
                 opencode_ownership.expect("OpenCode ownership exists when OpenCode is enabled"),
             );
