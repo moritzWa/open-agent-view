@@ -18,6 +18,7 @@ const SELECTED_BG: Color = Color::Rgb(58, 60, 61);
 const ACCENT: Color = Color::Rgb(89, 194, 201);
 const ATTENTION: Color = Color::Rgb(232, 191, 72);
 const COMPLETE: Color = Color::Rgb(101, 187, 120);
+const DANGER: Color = Color::Rgb(224, 108, 117);
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.size();
@@ -205,17 +206,21 @@ fn render_session_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
         let collapsed = app.collapsed.contains(&group.key);
         let suffix = collapsed.then(|| format!(" {}", group.sessions.len()));
-        lines.push(styled_line(
-            vec![Span::styled(
-                format!(
-                    "{}{}",
-                    sanitize_inline(&group.label),
-                    suffix.unwrap_or_default()
-                ),
-                Style::default().add_modifier(Modifier::BOLD),
-            )],
-            is_selected,
-        ));
+        let mut spans = vec![Span::styled(
+            format!(
+                "{}{}",
+                sanitize_inline(&group.label),
+                suffix.unwrap_or_default()
+            ),
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        if let Some(verb) = is_selected.then(|| app.pending_removal_verb()).flatten() {
+            spans.push(Span::styled(
+                format!("  ctrl+x again to {verb}"),
+                Style::default().fg(DANGER),
+            ));
+        }
+        lines.push(styled_line(spans, is_selected));
 
         if collapsed {
             continue;
@@ -234,6 +239,7 @@ fn render_session_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 area.width,
                 is_selected,
                 app.live_animation_visible(),
+                is_selected.then(|| app.pending_removal_verb()).flatten(),
             ));
         }
         let hidden = app.hidden_session_count(group);
@@ -343,6 +349,7 @@ fn render_session_row(
     width: u16,
     selected: bool,
     live_animation_visible: bool,
+    pending_removal: Option<&str>,
 ) -> Line<'static> {
     let symbol = state_symbol(session.state, live_animation_visible);
     let symbol_style = Style::default().fg(state_color(session.state));
@@ -381,14 +388,23 @@ fn render_session_row(
     };
     let fixed = 5 + name_width + provider_width + display_width(&right);
     let summary_width = (width as usize).saturating_sub(fixed).max(1);
-    let summary = truncate(&format!("{state_prefix}{}", session.summary), summary_width);
+    let (summary, summary_style) = match pending_removal {
+        Some(verb) => (
+            format!("ctrl+x again to {verb}"),
+            Style::default().fg(DANGER),
+        ),
+        None => (
+            format!("{state_prefix}{}", session.summary),
+            Style::default().fg(DIM),
+        ),
+    };
+    let summary = pad_to_width(truncate(&summary, summary_width), summary_width);
     let name = pad_to_width(truncate(&session.name, name_width), name_width);
-    let summary = pad_to_width(summary, summary_width);
     let spans = vec![
         Span::styled(format!(" {symbol} "), symbol_style),
         Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(format!(" {provider} "), Style::default().fg(ACCENT)),
-        Span::styled(summary, Style::default().fg(DIM)),
+        Span::styled(summary, summary_style),
         Span::styled(right, Style::default().fg(DIM)),
     ];
     styled_line(spans, selected)
@@ -1351,17 +1367,6 @@ fn render_confirmation(frame: &mut Frame<'_>, _: &App, target: &ConfirmTarget, a
         ConfirmTarget::Archive { id } => {
             format!("Archive the exact session?\n\n{id}\n\nEnter confirms; escape keeps it.")
         }
-        ConfirmTarget::Hide { session_ids } => format!(
-            "Hide {} session{} only from Open Agent View?{}\n\nProvider history and live processes are retained. Use `open-agent-view sessions hidden` and `open-agent-view sessions unhide SESSION_ID` to reverse this.\n\nEnter hides locally; escape keeps {} visible.",
-            session_ids.len(),
-            if session_ids.len() == 1 { "" } else { "s" },
-            if session_ids.len() == 1 { format!("\n\n{}", session_ids[0]) } else { String::new() },
-            if session_ids.len() == 1 { "it" } else { "them" }
-        ),
-        ConfirmTarget::Group { key, session_ids } => format!(
-            "Delete all {} sessions in {key}?\n\nEnter confirms; escape keeps them.",
-            session_ids.len()
-        ),
     };
     frame.render_widget(
         Paragraph::new(sanitize_multiline(&message))
@@ -1768,7 +1773,7 @@ mod tests {
         for (provider, expected) in providers {
             let mut item = session("recognizable-session", SessionState::Working);
             item.provider = provider;
-            let row = render_session_row(&item, ViewMode::Status, 120, false, true);
+            let row = render_session_row(&item, ViewMode::Status, 120, false, true, None);
             let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
 
             assert!(
@@ -1786,7 +1791,7 @@ mod tests {
             SessionState::Working,
         );
         item.provider = Provider::Antigravity;
-        let row = render_session_row(&item, ViewMode::Status, 120, false, true);
+        let row = render_session_row(&item, ViewMode::Status, 120, false, true, None);
         let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
 
         assert!(
@@ -1803,7 +1808,7 @@ mod tests {
         item.updated_at = Some(SystemTime::now() - Duration::from_secs(86_400));
 
         for width in [80, 120, 160] {
-            let row = render_session_row(&item, ViewMode::Status, width, false, true);
+            let row = render_session_row(&item, ViewMode::Status, width, false, true, None);
             let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
 
             assert_eq!(display_width(&text), width as usize);
@@ -1821,13 +1826,13 @@ mod tests {
     #[test]
     fn working_marker_blinks_without_changing_other_session_states() {
         let working = session("worker", SessionState::Working);
-        let visible = render_session_row(&working, ViewMode::Status, 120, false, true);
-        let dimmed = render_session_row(&working, ViewMode::Status, 120, false, false);
+        let visible = render_session_row(&working, ViewMode::Status, 120, false, true, None);
+        let dimmed = render_session_row(&working, ViewMode::Status, 120, false, false, None);
         assert_eq!(visible.spans[0].content, " ✳ ");
         assert_eq!(dimmed.spans[0].content, " · ");
 
         let completed = session("done", SessionState::Completed);
-        let completed = render_session_row(&completed, ViewMode::Status, 120, false, false);
+        let completed = render_session_row(&completed, ViewMode::Status, 120, false, false, None);
         assert_eq!(completed.spans[0].content, " • ");
     }
 

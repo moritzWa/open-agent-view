@@ -602,7 +602,7 @@ pub fn run_dashboard(
                                 &effect.hide_session_ids,
                             ) {
                                 Ok(count) => app.set_notice(format!(
-                                    "hid {count} session{} locally; provider history was retained",
+                                    "hid {count} session{} locally; provider history was retained · `open-agent-view sessions unhide SESSION_ID` restores",
                                     if count == 1 { "" } else { "s" }
                                 )),
                                 Err(error) => {
@@ -953,6 +953,13 @@ fn update_session_alias_from_app(
 
 fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
     if key.kind == KeyEventKind::Release {
+        return AppAction::None;
+    }
+    let removal_key =
+        key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x');
+    if !removal_key {
+        app.disarm_removal();
+    } else if key.kind == KeyEventKind::Repeat {
         return AppAction::None;
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2058,6 +2065,19 @@ mod tests {
 
         let mut locally_removed = app();
         locally_removed.snapshot.sessions[0].state = SessionState::Completed;
+        assert_eq!(
+            handle_key(&mut locally_removed, control_key('x')),
+            AppAction::None
+        );
+        handle_key(&mut locally_removed, key(KeyCode::Down));
+        handle_key(&mut locally_removed, key(KeyCode::Up));
+        assert_eq!(
+            handle_key(&mut locally_removed, control_key('x')),
+            AppAction::None
+        );
+        let mut held = control_key('x');
+        held.kind = KeyEventKind::Repeat;
+        assert_eq!(handle_key(&mut locally_removed, held), AppAction::None);
         assert_eq!(
             handle_key(&mut locally_removed, control_key('x')),
             AppAction::Hide {
