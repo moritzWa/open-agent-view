@@ -40,8 +40,9 @@ pub enum LaunchMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchPresentation {
     Background,
-    /// Bootstrap without blocking the dashboard, then open the exact returned
-    /// provider session once discovery confirms its stable ID.
+    /// Bootstrap without blocking the dashboard, then select the exact
+    /// returned provider session once discovery confirms its stable ID. The
+    /// dashboard stays on the list; Enter opens the native UI.
     DeferredForeground,
     Foreground,
 }

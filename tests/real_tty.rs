@@ -1371,7 +1371,7 @@ esac
 }
 
 #[test]
-fn foreground_claude_launch_attaches_full_screen_and_left_returns_to_the_new_row() {
+fn claude_launch_stays_on_the_dashboard_and_enter_attaches_full_screen() {
     let _serial = serialize_real_tty_test();
     let mut app = PtyApp::spawn_configured(110, 30, |command, home| {
         let executable = home.path().join("claude");
@@ -1427,6 +1427,15 @@ printf '%s\n' 'backgrounded · deadbeef'
     app.wait_for("animated Claude bootstrap", |screen| {
         screen.contains("launching Claude")
     });
+    app.wait_for("new Claude row on the dashboard", |screen| {
+        screen.contains("Open Agent View") && screen.contains("new-claude-task")
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        !app.screen().contains("CLAUDE FULL SCREEN ATTACH"),
+        "launch opened the new session instead of staying on the dashboard"
+    );
+    app.send(ENTER);
     app.wait_for("Claude native full-screen attach", |screen| {
         screen.contains("CLAUDE FULL SCREEN ATTACH")
     });

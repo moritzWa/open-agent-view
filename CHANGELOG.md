@@ -23,6 +23,10 @@ and future released versions are intended to follow Semantic Versioning.
   Pinned group at the top of the list and unpins it again, also from Peek. The
   row stays selected in its new group. The pin is remembered locally, kept
   while the session is hidden, and taken back if it cannot be saved.
+- `option+up` and `option+down` move the selected session one place within
+  its directory group, or within the Pinned group in either view. The order
+  is remembered locally, and new sessions still arrive at the top. macOS
+  Terminal's "Use Option as Meta key" arrows are recognized too.
 - A light dashboard palette. `--theme auto` (the default) follows the terminal
   background, then the operating system appearance, and switches live when
   the operating system appearance changes. `--theme dark` and `--theme light`
@@ -58,6 +62,10 @@ and future released versions are intended to follow Semantic Versioning.
 
 - Directory view lists each directory's sessions newest-created first instead
   of by state, so replying to a session no longer moves its row or the cursor.
+- Starting a task with Claude Code, Codex or OpenCode in the background no
+  longer opens the new session. The dashboard stays on the list with the new
+  row selected; Enter or Right opens it. Harnesses that can only start in
+  their own interface still take over the terminal.
 - Session rows follow Claude Code's agent view. In directory view the state
   word takes the state's color (Needs input and Review amber, Done green,
   Working in the normal text color) ahead of a grey summary, the harness name

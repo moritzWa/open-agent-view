@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender, TryRecvError, TrySendError};
@@ -62,7 +62,6 @@ struct PendingLaunch {
     provider: Provider,
     provider_session_id: String,
     known_session_ids: BTreeSet<String>,
-    open_when_visible: bool,
     deadline: Instant,
 }
 
@@ -89,7 +88,6 @@ struct LaunchWorkerResult {
     provider: Provider,
     model: Option<String>,
     prompt: String,
-    open_when_visible: bool,
     known_session_ids: BTreeSet<String>,
     result: Result<ControlOutcome, String>,
 }
@@ -101,7 +99,6 @@ struct LaunchJob {
     model: Option<String>,
     prompt: String,
     cwd: Option<PathBuf>,
-    open_when_visible: bool,
     known_session_ids: BTreeSet<String>,
 }
 
@@ -138,6 +135,31 @@ fn save_pin(
     app.select_and_reveal_session(session_id);
 }
 
+/// Persist a manual move the screen already shows, then reload what the
+/// registry holds, so a failed save puts the rows back.
+fn save_sort_keys(
+    app: &mut App,
+    pinned_sessions: &crate::pins::PinnedSessions,
+    session_order: &crate::order::SessionOrder,
+    pinned: bool,
+    keys: &[(String, u64)],
+) {
+    let saved = if pinned {
+        pinned_sessions.set_pinned_at(keys)
+    } else {
+        session_order.set(keys)
+    };
+    if let Err(error) = saved {
+        app.set_notice(format!("failed to save order: {error:#}"));
+    }
+    let selected = app.selected_session().map(|session| session.id.clone());
+    app.set_pins(pinned_sessions.pins());
+    app.set_sort_keys(session_order.sort_keys());
+    if let Some(session_id) = selected {
+        app.select_and_reveal_session(&session_id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_dashboard(
     engine: &DiscoveryEngine,
@@ -146,6 +168,7 @@ pub fn run_dashboard(
     control: &ControlHub,
     hidden_sessions: HiddenSessions,
     pinned_sessions: crate::pins::PinnedSessions,
+    session_order: crate::order::SessionOrder,
     last_harness: crate::last_harness::LastHarness,
     session_aliases: SessionAliases,
     migrations: MigrationServices,
@@ -223,6 +246,7 @@ pub fn run_dashboard(
     );
     app.set_yolo(control.yolo_enabled(), control.yolo_supported_providers());
     app.set_pins(pinned_sessions.pins());
+    app.set_sort_keys(session_order.sort_keys());
     app.color_scheme = color_scheme;
     let scheme_watcher = SchemeWatcher::spawn(theme_preference);
     let mut terminal = TerminalSession::enter()?;
@@ -245,6 +269,7 @@ pub fn run_dashboard(
     let mut next_live_animation = Instant::now() + LIVE_SESSION_ANIMATION_INTERVAL;
     let mut needs_draw = true;
     let mut input_burst = InputBurst::default();
+    let mut event_reader = MetaArrowReader::default();
     schedule_refresh(
         &refresh_tx,
         &discovery_request_for_pending_launch(&current_request, pending_launch.as_ref()),
@@ -286,22 +311,9 @@ pub fn run_dashboard(
                     let changed = snapshot != app.snapshot;
                     app.replace_snapshot(snapshot);
                     resolve_pending_reveal(&mut app, &mut pending_reveal, complete, Instant::now());
-                    if let Some(session_id) =
-                        select_pending_launch(&mut app, pending_launch.as_ref())
-                    {
-                        let open_when_visible = pending_launch
-                            .as_ref()
-                            .is_some_and(|pending| pending.open_when_visible);
+                    if select_pending_launch(&mut app, pending_launch.as_ref()).is_some() {
                         pending_launch = None;
                         pending_launch_retry_at = None;
-                        if open_when_visible {
-                            refresh_after_current |= handle_action_legacy(
-                                &mut terminal,
-                                &mut app,
-                                AppAction::Open { session_id },
-                                control,
-                            );
-                        }
                     }
                     if complete {
                         refresh_in_flight = false;
@@ -361,7 +373,6 @@ pub fn run_dashboard(
                                             provider: completed.provider,
                                             provider_session_id,
                                             known_session_ids: completed.known_session_ids,
-                                            open_when_visible: completed.open_when_visible,
                                             deadline: Instant::now() + LAUNCH_DISCOVERY_TIMEOUT,
                                         }
                                     });
@@ -421,7 +432,6 @@ pub fn run_dashboard(
                                             provider: completed.request.target,
                                             provider_session_id: outcome.session_id,
                                             known_session_ids: BTreeSet::new(),
-                                            open_when_visible: false,
                                             deadline: Instant::now() + LAUNCH_DISCOVERY_TIMEOUT,
                                         });
                                         pending_launch_retry_at = None;
@@ -525,11 +535,11 @@ pub fn run_dashboard(
         } else {
             refresh_interval.saturating_sub(last_refresh.elapsed())
         };
-        if event::poll(until_refresh.min(Duration::from_millis(50)))? {
+        if event_reader.poll(until_refresh.min(Duration::from_millis(50)))? {
             for event_index in 0..MAX_READY_EVENTS_PER_TICK {
-                let event = match event::read()? {
+                let event = match event_reader.read()? {
                     Event::Key(key) => {
-                        let more_input = event::poll(InputBurst::lookahead(&key))?;
+                        let more_input = event_reader.poll(InputBurst::lookahead(&key))?;
                         match input_burst.classify(
                             key,
                             Instant::now(),
@@ -559,6 +569,16 @@ pub fn run_dashboard(
                         let mut effect = match action {
                             AppAction::SetPin { session_id, pinned } => {
                                 save_pin(&mut app, &pinned_sessions, &session_id, pinned);
+                                ActionEffect::default()
+                            }
+                            AppAction::SetSortKeys { pinned, keys } => {
+                                save_sort_keys(
+                                    &mut app,
+                                    &pinned_sessions,
+                                    &session_order,
+                                    pinned,
+                                    &keys,
+                                );
                                 ActionEffect::default()
                             }
                             AppAction::BrowseHidden => {
@@ -691,8 +711,8 @@ pub fn run_dashboard(
                                         )
                                     }
                                     Ok(
-                                        presentation @ (LaunchPresentation::Background
-                                        | LaunchPresentation::DeferredForeground),
+                                        LaunchPresentation::Background
+                                        | LaunchPresentation::DeferredForeground,
                                     ) => {
                                         let known_session_ids =
                                             provider_session_ids(&app, &provider);
@@ -710,8 +730,6 @@ pub fn run_dashboard(
                                                 model,
                                                 prompt,
                                                 cwd,
-                                                open_when_visible: presentation
-                                                    == LaunchPresentation::DeferredForeground,
                                                 known_session_ids,
                                             },
                                             launch_tx.clone(),
@@ -745,7 +763,6 @@ pub fn run_dashboard(
                                 provider: intent.provider,
                                 provider_session_id: intent.provider_session_id,
                                 known_session_ids: intent.known_session_ids,
-                                open_when_visible: false,
                                 deadline: Instant::now() + LAUNCH_DISCOVERY_TIMEOUT,
                             });
                             pending_launch_retry_at = None;
@@ -815,7 +832,7 @@ pub fn run_dashboard(
                 }
                 if app.should_quit
                     || event_index + 1 == MAX_READY_EVENTS_PER_TICK
-                    || !event::poll(Duration::ZERO)?
+                    || !event_reader.poll(Duration::ZERO)?
                 {
                     break;
                 }
@@ -948,7 +965,6 @@ fn schedule_launch_job(
             provider: job.provider,
             model: job.model,
             prompt: job.prompt,
-            open_when_visible: job.open_when_visible,
             known_session_ids: job.known_session_ids,
             result,
         });
@@ -1190,6 +1206,73 @@ struct InputBurst {
     pasted_line_break: bool,
 }
 
+/// Rejoins Option+arrow from terminals that send it as ESC plus the plain
+/// arrow sequence (macOS Terminal with "Use Option as Meta key"). crossterm
+/// reads `ESC ESC [ A` as Esc followed by typed `[A`.
+#[derive(Default)]
+struct MetaArrowReader {
+    pending: VecDeque<Event>,
+}
+
+impl MetaArrowReader {
+    fn poll(&mut self, timeout: Duration) -> std::io::Result<bool> {
+        if !self.pending.is_empty() {
+            return Ok(true);
+        }
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> std::io::Result<Event> {
+        self.read_with(event::read, event::poll)
+    }
+
+    fn read_with(
+        &mut self,
+        mut read: impl FnMut() -> std::io::Result<Event>,
+        mut poll: impl FnMut(Duration) -> std::io::Result<bool>,
+    ) -> std::io::Result<Event> {
+        if let Some(event) = self.pending.pop_front() {
+            return Ok(event);
+        }
+        let first = read()?;
+        let plain_char = |event: &Event| match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press && plain_key(key) => {
+                match key.code {
+                    KeyCode::Char(character) => Some(character),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let is_escape = matches!(
+            &first,
+            Event::Key(key)
+                if key.code == KeyCode::Esc && key.kind == KeyEventKind::Press && plain_key(key)
+        );
+        if !is_escape || !poll(Duration::ZERO)? {
+            return Ok(first);
+        }
+        let second = read()?;
+        if !matches!(plain_char(&second), Some('[' | 'O')) || !poll(Duration::ZERO)? {
+            self.pending.push_back(second);
+            return Ok(first);
+        }
+        let third = read()?;
+        let arrow = match plain_char(&third) {
+            Some('A') => KeyCode::Up,
+            Some('B') => KeyCode::Down,
+            Some('C') => KeyCode::Right,
+            Some('D') => KeyCode::Left,
+            _ => {
+                self.pending.push_back(second);
+                self.pending.push_back(third);
+                return Ok(first);
+            }
+        };
+        Ok(Event::Key(KeyEvent::new(arrow, KeyModifiers::ALT)))
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum BurstInput {
     Key(KeyEvent),
@@ -1349,6 +1432,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> AppAction {
     if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Backspace {
         app.delete_previous_word();
         return AppAction::None;
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) && app.overlay == Overlay::None {
+        match key.code {
+            KeyCode::Up => return app.move_selected_session(-1),
+            KeyCode::Down => return app.move_selected_session(1),
+            _ => {}
+        }
     }
     if key.code == KeyCode::Enter
         && key
@@ -1796,7 +1886,7 @@ fn dispatch_action<T: DashboardTerminal, C: DashboardControl>(
                 }
             }
         }
-        AppAction::SetPin { .. } => ActionEffect::default(),
+        AppAction::SetPin { .. } | AppAction::SetSortKeys { .. } => ActionEffect::default(),
         AppAction::Hide { session_ids } => ActionEffect {
             hide_session_ids: session_ids,
             ..ActionEffect::default()
@@ -1875,6 +1965,7 @@ fn handle_action_legacy<T: DashboardTerminal, C: DashboardControl>(
         | AppAction::Migrate { .. }
         | AppAction::Hide { .. }
         | AppAction::SetPin { .. }
+        | AppAction::SetSortKeys { .. }
         | AppAction::BrowseHidden
         | AppAction::Unhide { .. }
         | AppAction::Restore { .. } => false,
@@ -3703,6 +3794,70 @@ mod tests {
         assert_eq!(*control.calls.lock().unwrap(), vec!["launch:build"]);
     }
 
+    fn read_split(bytes: &[Event]) -> Vec<Event> {
+        let mut source: VecDeque<Event> = bytes.iter().cloned().collect();
+        let mut reader = MetaArrowReader::default();
+        let mut events = Vec::new();
+        while !source.is_empty() || !reader.pending.is_empty() {
+            let remaining = std::cell::RefCell::new(&mut source);
+            events.push(
+                reader
+                    .read_with(
+                        || Ok(remaining.borrow_mut().pop_front().unwrap()),
+                        |_| Ok(!remaining.borrow().is_empty()),
+                    )
+                    .unwrap(),
+            );
+        }
+        events
+    }
+
+    #[test]
+    fn meta_prefixed_arrows_become_option_arrows() {
+        let char_key = |character| Event::Key(key(KeyCode::Char(character)));
+        let escape = Event::Key(key(KeyCode::Esc));
+        assert_eq!(
+            read_split(&[escape.clone(), char_key('['), char_key('A')]),
+            [Event::Key(modified_key(KeyCode::Up, KeyModifiers::ALT))]
+        );
+        assert_eq!(
+            read_split(&[escape.clone(), char_key('O'), char_key('B')]),
+            [Event::Key(modified_key(KeyCode::Down, KeyModifiers::ALT))]
+        );
+        assert_eq!(
+            read_split(&[escape.clone(), char_key('['), char_key('x')]),
+            [escape.clone(), char_key('['), char_key('x')]
+        );
+        assert_eq!(
+            read_split(&[escape.clone(), char_key('q')]),
+            [escape.clone(), char_key('q')]
+        );
+        assert_eq!(read_split(&[escape.clone()]), [escape]);
+    }
+
+    #[test]
+    fn option_arrows_move_the_selected_session_on_the_dashboard() {
+        let mut app = app();
+        let mut second = app.snapshot.sessions[0].clone();
+        second.id = "second".into();
+        second.name = "second".into();
+        second.started_at = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.snapshot.sessions.push(second);
+        app.replace_snapshot(app.snapshot.clone());
+        app.toggle_view();
+        app.selection = Some(SelectionKey::Session("second".into()));
+
+        assert!(matches!(
+            handle_key(&mut app, modified_key(KeyCode::Down, KeyModifiers::ALT)),
+            AppAction::SetSortKeys { pinned: false, .. }
+        ));
+        assert!(matches!(
+            handle_key(&mut app, modified_key(KeyCode::Up, KeyModifiers::ALT)),
+            AppAction::SetSortKeys { pinned: false, .. }
+        ));
+        assert_eq!(app.selection, Some(SelectionKey::Session("second".into())));
+    }
+
     #[test]
     fn slow_launch_job_does_not_block_keyboard_state_changes() {
         let (sender, receiver) = mpsc::channel();
@@ -3713,7 +3868,6 @@ mod tests {
                 model: None,
                 prompt: "build".into(),
                 cwd: None,
-                open_when_visible: false,
                 known_session_ids: BTreeSet::from(["pi:host:old".into()]),
             },
             sender,
@@ -3739,7 +3893,6 @@ mod tests {
         assert_eq!(completed.sequence, 7);
         assert_eq!(completed.provider, Provider::Pi);
         assert_eq!(completed.prompt, "build");
-        assert!(!completed.open_when_visible);
         assert_eq!(
             completed.known_session_ids,
             BTreeSet::from(["pi:host:old".into()])
@@ -3767,7 +3920,6 @@ mod tests {
             provider: Provider::Pi,
             provider_session_id: "same".into(),
             known_session_ids: BTreeSet::new(),
-            open_when_visible: false,
             deadline: Instant::now() + Duration::from_secs(1),
         };
 
@@ -3801,7 +3953,6 @@ mod tests {
             provider: Provider::MuseCode,
             provider_session_id: "provisional".into(),
             known_session_ids: BTreeSet::from(["muse:host:old".into()]),
-            open_when_visible: false,
             deadline: Instant::now() + Duration::from_secs(1),
         };
 
@@ -3829,7 +3980,6 @@ mod tests {
             provider: Provider::Codex,
             provider_session_id: "exact".into(),
             known_session_ids: BTreeSet::new(),
-            open_when_visible: false,
             deadline: Instant::now() + Duration::from_secs(1),
         };
 

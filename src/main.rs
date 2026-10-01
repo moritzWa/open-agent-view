@@ -1035,6 +1035,7 @@ fn main() -> Result<()> {
         &control,
         hidden_sessions,
         PinnedSessions::load_default()?,
+        open_agent_view::order::SessionOrder::load_default()?,
         last_harness,
         session_aliases,
         MigrationServices::new(migration_client, migration_registry),
