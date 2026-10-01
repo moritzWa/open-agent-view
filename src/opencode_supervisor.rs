@@ -126,7 +126,9 @@ impl OpenCodeSupervisor {
             .collect::<Vec<_>>()
             .join(" ");
         let path = with_directory_query("/session", cwd);
-        let response = self.request_json(&record, "POST", &path, Some(&json!({"title": title})))?;
+        // A caller-supplied title disables OpenCode's generated title, so the
+        // prompt words stay a local placeholder until the provider names it.
+        let response = self.request_json(&record, "POST", &path, Some(&json!({})))?;
         let id = response
             .get("id")
             .and_then(Value::as_str)
@@ -193,6 +195,11 @@ impl OpenCodeSupervisor {
             )?
             else {
                 continue;
+            };
+            let title = if is_default_title(&title) {
+                owned.title.clone()
+            } else {
+                title
             };
             if updated_at_ms <= owned.updated_at_ms && title == owned.title {
                 continue;
@@ -843,6 +850,30 @@ fn provider_session_metadata(value: &Value, session_id: &str) -> Result<Option<(
     Ok(Some((title.to_owned(), updated_at_ms)))
 }
 
+/// OpenCode's placeholder title (`New session - <ISO timestamp>`), which it
+/// replaces with a generated one after the first turn.
+fn is_default_title(title: &str) -> bool {
+    let Some(stamp) = title
+        .strip_prefix("New session - ")
+        .or_else(|| title.strip_prefix("Child session - "))
+    else {
+        return false;
+    };
+    stamp.len() == 24
+        && stamp.ends_with('Z')
+        && stamp
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                4 | 7 => byte == b'-',
+                10 => byte == b'T',
+                13 | 16 => byte == b':',
+                19 => byte == b'.',
+                23 => byte == b'Z',
+                _ => byte.is_ascii_digit(),
+            })
+}
+
 fn latest_assistant_summary(value: &Value) -> Option<String> {
     let messages = value.as_array()?;
     messages
@@ -1369,6 +1400,14 @@ mod tests {
     fn encodes_basic_auth_and_url_components() {
         assert_eq!(base64_encode(b"opencode:secret"), "b3BlbmNvZGU6c2VjcmV0");
         assert_eq!(url_path_segment("ses_/ ?"), "ses_%2F%20%3F");
+    }
+
+    #[test]
+    fn recognizes_only_opencode_placeholder_titles() {
+        assert!(is_default_title("New session - 2026-10-01T17:42:05.123Z"));
+        assert!(is_default_title("Child session - 2026-10-01T17:42:05.123Z"));
+        assert!(!is_default_title("New session - custom"));
+        assert!(!is_default_title("Fix oav session titles"));
     }
 
     #[test]
