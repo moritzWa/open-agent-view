@@ -75,6 +75,9 @@ struct DetachedSession {
     child: Option<std::process::Child>,
     warning: Option<String>,
     drain: Option<PtyDrain>,
+    /// Started by [`prewarm`] and never opened. Its idle screen says nothing
+    /// about the session, so it stays out of dashboard status and discovery.
+    prewarmed: bool,
 }
 
 /// Reads the provider's pseudo-terminal while the dashboard is in front, so a
@@ -88,6 +91,11 @@ struct PtyDrain {
 
 #[cfg(unix)]
 static DETACHED: OnceLock<Mutex<BTreeMap<String, DetachedSession>>> = OnceLock::new();
+
+/// Keys whose frontend is in front right now, so a concurrent [`prewarm`]
+/// does not park a second client for the same session.
+#[cfg(unix)]
+static FOREGROUND: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
 
 /// Run or reattach one provider-native client. Non-TTY callers retain the
 /// ordinary inherited-stdio behavior used by scripts and unit-test fixtures.
@@ -236,6 +244,7 @@ pub fn resume(session_key: &str) -> Result<NativeSessionExit> {
         if !terminal_is_interactive() {
             bail!("resuming a native session requires an interactive terminal");
         }
+        let _foreground = ForegroundGuard::enter(session_key);
         let detached =
             take_detached(session_key)?.context("the background terminal is no longer running")?;
         let (child, master, screen, warning) = detached.into_frontend()?;
@@ -256,7 +265,13 @@ pub fn detached_session_keys() -> Vec<String> {
         };
         return registry
             .lock()
-            .map(|registry| registry.keys().cloned().collect())
+            .map(|registry| {
+                registry
+                    .iter()
+                    .filter(|(_, session)| !session.prewarmed)
+                    .map(|(key, _)| key.clone())
+                    .collect()
+            })
             .unwrap_or_default();
     }
     #[cfg(not(unix))]
@@ -285,6 +300,9 @@ pub fn background_screen_contents(session_key: &str) -> Option<(u32, String)> {
             drop(dead);
             return None;
         };
+        if session.prewarmed {
+            return None;
+        }
         let contents = session.drain.as_ref()?.contents.lock().ok()?.clone();
         Some((pid, contents))
     }
@@ -406,6 +424,103 @@ pub fn rename_key(from: &str, to: &str) -> Result<()> {
     Ok(())
 }
 
+/// Start a provider frontend behind the dashboard so the first open attaches
+/// to a client that has already booted and drawn its history. Returns whether
+/// a client was started; an existing or foreground frontend for the key wins.
+pub fn prewarm(command: Command, session_key: &str) -> Result<bool> {
+    validate_session_key(session_key)?;
+    #[cfg(unix)]
+    {
+        if !terminal_is_interactive() {
+            return Ok(false);
+        }
+        park_prewarmed(command, session_key)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        Ok(false)
+    }
+}
+
+#[cfg(unix)]
+fn park_prewarmed(mut command: Command, session_key: &str) -> Result<bool> {
+    if is_held(session_key) {
+        return Ok(false);
+    }
+    let (mut child, master) = spawn_pty(&mut command)?;
+    let size = terminal_size(libc::STDIN_FILENO).unwrap_or(libc::winsize {
+        ws_row: FALLBACK_TERMINAL_ROWS,
+        ws_col: FALLBACK_TERMINAL_COLUMNS,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    });
+    let drain = match start_output_drain(master, vt100::Parser::new(size.ws_row, size.ws_col, 0)) {
+        Ok(drain) => drain,
+        Err(error) => {
+            signal_group(child.id(), libc::SIGKILL);
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let mut session = DetachedSession {
+        child: Some(child),
+        warning: None,
+        drain: Some(drain),
+        prewarmed: true,
+    };
+    let mut registry = detached_registry()
+        .lock()
+        .map_err(|_| anyhow!("provider-native background session registry lock was poisoned"))?;
+    if registry.contains_key(session_key) || in_foreground(session_key) {
+        drop(registry);
+        terminate_detached(&mut session);
+        return Ok(false);
+    }
+    registry.insert(session_key.to_owned(), session);
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn is_held(session_key: &str) -> bool {
+    in_foreground(session_key)
+        || detached_registry()
+            .lock()
+            .map(|registry| registry.contains_key(session_key))
+            .unwrap_or(true)
+}
+
+#[cfg(unix)]
+fn in_foreground(session_key: &str) -> bool {
+    FOREGROUND
+        .get_or_init(Default::default)
+        .lock()
+        .map(|keys| keys.contains(session_key))
+        .unwrap_or(true)
+}
+
+#[cfg(unix)]
+struct ForegroundGuard(String);
+
+#[cfg(unix)]
+impl ForegroundGuard {
+    fn enter(session_key: &str) -> Self {
+        if let Ok(mut keys) = FOREGROUND.get_or_init(Default::default).lock() {
+            keys.insert(session_key.to_owned());
+        }
+        Self(session_key.to_owned())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ForegroundGuard {
+    fn drop(&mut self) {
+        if let Ok(mut keys) = FOREGROUND.get_or_init(Default::default).lock() {
+            keys.remove(&self.0);
+        }
+    }
+}
+
 #[cfg(unix)]
 fn terminal_is_interactive() -> bool {
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 && libc::isatty(libc::STDOUT_FILENO) == 1 }
@@ -418,6 +533,7 @@ fn run_pty(
     initial_input: Option<ScreenTriggeredInput>,
     warning: Option<String>,
 ) -> Result<NativeSessionExit> {
+    let _foreground = ForegroundGuard::enter(session_key);
     let detached = take_detached(session_key)?;
     let (child, master, screen, fresh, warning) = match detached {
         Some(detached) => {
@@ -780,7 +896,7 @@ fn bridge_session(
             // aborts an in-flight model request.
             restore_dashboard_terminal_modes(&mut stdout)?;
             let drain = start_output_drain(master, screen)?;
-            detached_registry()
+            let replaced = detached_registry()
                 .lock()
                 .map_err(|_| anyhow!("provider-native background registry lock was poisoned"))?
                 .insert(
@@ -789,8 +905,12 @@ fn bridge_session(
                         child: Some(child),
                         warning,
                         drain: Some(drain),
+                        prewarmed: false,
                     },
                 );
+            if let Some(mut replaced) = replaced {
+                terminate_detached(&mut replaced);
+            }
             return Ok(NativeSessionExit::Backgrounded);
         }
         if redraw_restore_at.is_some_and(|at| Instant::now() >= at) {
@@ -1846,6 +1966,7 @@ mod tests {
                 child: Some(child),
                 warning: None,
                 drain: Some(drain),
+                prewarmed: false,
             },
         );
         pid
@@ -1923,6 +2044,56 @@ mod tests {
         assert!(contents.contains("LARGE_OUTPUT_DONE"), "{contents}");
         signal_group(child.id(), libc::SIGKILL);
         let _ = child.wait();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prewarmed_frontend_stays_out_of_status_until_it_is_opened() {
+        let key = "provider:host:prewarmed";
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'ctrl+p commands'; exec sleep 30"]);
+        assert!(park_prewarmed(command, key).unwrap());
+        assert!(is_backgrounded(key));
+        assert!(background_screen_contents(key).is_none());
+        assert!(!detached_session_keys().iter().any(|item| item == key));
+
+        let mut second = Command::new("sh");
+        second.args(["-c", "exec sleep 30"]);
+        assert!(!park_prewarmed(second, key).unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut child, _master, screen, _warning) = loop {
+            let detached = take_detached(key).unwrap().expect("prewarmed frontend");
+            if detached
+                .drain
+                .as_ref()
+                .is_some_and(|drain| drain.contents.lock().unwrap().contains("ctrl+p"))
+                || Instant::now() >= deadline
+            {
+                break detached.into_frontend().unwrap();
+            }
+            detached_registry()
+                .lock()
+                .unwrap()
+                .insert(key.to_owned(), detached);
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(screen.screen().contents().contains("ctrl+p commands"));
+        signal_group(child.id(), libc::SIGKILL);
+        let _ = child.wait();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prewarm_yields_to_a_frontend_in_front() {
+        let key = "provider:host:prewarm-foreground";
+        let guard = ForegroundGuard::enter(key);
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        assert!(!park_prewarmed(command, key).unwrap());
+        assert!(take_detached(key).unwrap().is_none());
+        drop(guard);
+        assert!(!in_foreground(key));
     }
 
     #[test]

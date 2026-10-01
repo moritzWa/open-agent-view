@@ -160,6 +160,43 @@ fn save_sort_keys(
     }
 }
 
+/// Pause between starting prewarmed frontends so a dashboard start does not
+/// boot every client at once.
+const PREWARM_STAGGER: Duration = Duration::from_millis(150);
+
+/// Boot the frontend of every listed OpenCode session behind the dashboard,
+/// each at most once per dashboard process, so opening one after a restart
+/// does not wait for a cold client.
+fn prewarm_listed_sessions(
+    control: &ControlHub,
+    snapshot: &SessionSnapshot,
+    attempted: &mut BTreeSet<String>,
+) {
+    let sessions: Vec<AgentSession> = snapshot
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.provider == Provider::OpenCode
+                && session.runtime == crate::domain::Runtime::Host
+        })
+        .filter(|session| attempted.insert(session.id.clone()))
+        .cloned()
+        .collect();
+    if sessions.is_empty() {
+        return;
+    }
+    let control = control.clone();
+    let _ = thread::Builder::new()
+        .name("native-prewarm".into())
+        .spawn(move || {
+            for session in sessions {
+                if matches!(control.prewarm(&session), Ok(true)) {
+                    thread::sleep(PREWARM_STAGGER);
+                }
+            }
+        });
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_dashboard(
     engine: &DiscoveryEngine,
@@ -274,6 +311,7 @@ pub fn run_dashboard(
     let mut needs_draw = true;
     let mut input_burst = InputBurst::default();
     let mut event_reader = MetaArrowReader::default();
+    let mut prewarm_attempted = BTreeSet::new();
     schedule_refresh(
         &refresh_tx,
         &discovery_request_for_pending_launch(&current_request, pending_launch.as_ref()),
@@ -320,6 +358,7 @@ pub fn run_dashboard(
                         pending_launch_retry_at = None;
                     }
                     if complete {
+                        prewarm_listed_sessions(control, &app.snapshot, &mut prewarm_attempted);
                         refresh_in_flight = false;
                         last_refresh = Instant::now();
                         if let Some(pending) = pending_launch.as_ref() {

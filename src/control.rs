@@ -191,6 +191,12 @@ pub trait ProviderController: Send + Sync {
         bail!("{} native open is unavailable", self.provider().label())
     }
 
+    /// Start the frontend [`Self::open`] would show, hidden behind the
+    /// dashboard, so the first open is instant. Returns whether one started.
+    fn prewarm(&self, _session: &AgentSession) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Open one exact session imported by session-migrate. The hub calls this
     /// only after matching OAV's private migration record; mutation authority
     /// is deliberately not inherited.
@@ -632,6 +638,19 @@ impl ControlHub {
         } else {
             controller.open(session)
         }
+    }
+
+    pub fn prewarm(&self, session: &AgentSession) -> Result<bool> {
+        self.ensure_provider_io()?;
+        let controller = self.controller(&session.provider)?;
+        if self
+            .migration_registry
+            .as_ref()
+            .is_some_and(|registry| registry.contains_exact(session))
+        {
+            return Ok(false);
+        }
+        controller.prewarm(session)
     }
 
     /// Every provider's restorable sessions, newest first. One provider's

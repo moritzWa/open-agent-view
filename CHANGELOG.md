@@ -62,6 +62,11 @@ and future released versions are intended to follow Semantic Versioning.
 
 - ctrl+r opens the rename composer empty, so a new title is typed from
   scratch. The current name is shown in the composer's top border.
+- Every listed OpenCode session's interface starts behind the dashboard after
+  each refresh, so the first Enter/Right after a restart attaches in about
+  100ms instead of waiting seconds for a cold client to load its history.
+  These clients stay out of the row's status until opened and are stopped
+  when the dashboard quits.
 - The dashboard opens on the view it was last left in. Toggling between the
   status and directory views with ctrl+s is remembered across restarts.
 - Directory view lists each directory's sessions newest-created first instead

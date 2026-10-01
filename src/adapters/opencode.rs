@@ -305,10 +305,29 @@ impl ProviderController for OpenCodeController {
     }
 
     fn open(&self, session: &AgentSession) -> Result<ControlOutcome> {
+        native_outcome(
+            crate::native_session::run(self.native_command(session)?, &session.id)?,
+            &session.provider_session_id,
+            &session.name,
+        )
+    }
+
+    fn prewarm(&self, session: &AgentSession) -> Result<bool> {
+        // Without a durable server the native command is a full OpenCode
+        // process that would run turns itself, not a thin attach client.
+        if self.supervisor.is_none() {
+            return Ok(false);
+        }
+        crate::native_session::prewarm(self.native_command(session)?, &session.id)
+    }
+}
+
+impl OpenCodeController {
+    fn native_command(&self, session: &AgentSession) -> Result<Command> {
         if session.provider != Provider::OpenCode || session.runtime != Runtime::Host {
             bail!("the host OpenCode controller does not own this runtime");
         }
-        let command = if self.owned_session(session)?.is_some() {
+        Ok(if self.owned_session(session)?.is_some() {
             self.supervisor
                 .as_ref()
                 .context("managed OpenCode control is not configured")?
@@ -322,12 +341,7 @@ impl ProviderController for OpenCodeController {
                 .args(["--session", &session.provider_session_id])
                 .current_dir(&session.cwd);
             command
-        };
-        native_outcome(
-            crate::native_session::run(command, &session.id)?,
-            &session.provider_session_id,
-            &session.name,
-        )
+        })
     }
 }
 
