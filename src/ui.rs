@@ -477,13 +477,24 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             palette().dim
         }))
         .style(Style::default().bg(palette().bg));
-    if renaming {
-        block = block.title(Span::styled(
-            " rename session ",
+    if let Overlay::Composer(ComposerMode::Rename { session_id }) = &app.overlay {
+        const LABEL: &str = " rename session ";
+        let mut title = vec![Span::styled(
+            LABEL,
             Style::default()
                 .fg(palette().accent)
                 .add_modifier(Modifier::BOLD),
-        ));
+        )];
+        if let Some(session) = app.session_by_id(session_id) {
+            let room = usize::from(area.width).saturating_sub(display_width(LABEL) + 14);
+            if room > 0 {
+                title.push(Span::styled(
+                    format!("· current: {} ", truncate(&session.name, room)),
+                    Style::default().fg(palette().dim),
+                ));
+            }
+        }
+        block = block.title(Line::from(title));
     } else if let Overlay::Composer(ComposerMode::MigrationName { target, .. }) = &app.overlay {
         block = block.title(Span::styled(
             format!(" migrate to {} · choose local name ", target.label()),
@@ -2663,14 +2674,19 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let rendered = buffer_text(buffer);
 
-        assert!(rendered.contains("rename session"));
-        assert!(rendered.contains("name ❯ worker"));
+        assert!(rendered.contains("rename session · current: worker"));
+        assert!(!rendered.contains("name ❯ worker"));
         assert!(rendered.contains("type a new name"));
         assert!(rendered.contains("empty resets to provider name"));
         assert_eq!(buffer.get(0, 21).fg, palette().accent);
+        assert_eq!(terminal.get_cursor().unwrap(), (7, 21));
+
+        app.input = "fresh".into();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(buffer_text(buffer).contains("name ❯ fresh"));
         assert_eq!(buffer.get(7, 21).fg, palette().fg);
         assert_ne!(buffer.get(0, 21).fg, buffer.get(7, 21).fg);
-        assert_eq!(terminal.get_cursor().unwrap(), (13, 21));
     }
 
     #[test]

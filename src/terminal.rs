@@ -2683,7 +2683,7 @@ mod tests {
                 session_id: "worker".into()
             })
         );
-        assert_eq!(app.input, "worker");
+        assert_eq!(app.input, "");
 
         app.overlay = Overlay::Help;
         app.input.clear();

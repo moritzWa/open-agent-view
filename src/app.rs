@@ -525,6 +525,14 @@ impl App {
             .filter(|session| &session.id == id)
     }
 
+    pub fn session_by_id(&self, session_id: &str) -> Option<&AgentSession> {
+        let index = *self.session_indices.get(session_id)?;
+        self.snapshot
+            .sessions
+            .get(index)
+            .filter(|session| session.id == session_id)
+    }
+
     /// Whether the latest snapshot contains `session_id`, even when the
     /// current filter keeps it out of every group.
     pub fn snapshot_contains(&self, session_id: &str) -> bool {
@@ -1047,9 +1055,8 @@ impl App {
             return;
         };
         let session_id = session.id.clone();
-        let name = session.name.clone();
         self.notice = None;
-        self.set_input(name);
+        self.clear_input();
         self.overlay = Overlay::Composer(ComposerMode::Rename { session_id });
     }
 
@@ -3838,8 +3845,9 @@ mod tests {
         assert_eq!(app.input, "saved");
         assert_eq!(app.overlay, Overlay::Composer(ComposerMode::Filter));
 
+        app.input = "leftover".into();
         app.start_rename();
-        assert_eq!(app.input, "one");
+        assert_eq!(app.input, "");
         assert_eq!(
             app.overlay,
             Overlay::Composer(ComposerMode::Rename {

@@ -100,7 +100,6 @@ fn sqlite_harnesses_launch_foreground_detach_rename_and_resume_together() {
         });
         app.send(CTRL_R);
         app.wait_for("rename", |s| s.contains("rename session"));
-        app.send(b"\x15");
         app.send(format!("{provider}-renamed\r").as_bytes());
         app.wait_for("renamed row", |s| {
             s.contains(&format!("{provider}-renamed")) && !s.contains("rename session")
@@ -2527,7 +2526,8 @@ fn wide_real_tty_exercises_primary_interactions_and_restores_terminal() {
     app.send(CTRL_R);
     app.wait_for("rename composer", |screen| {
         screen.contains("rename session")
-            && screen.contains("name ❯ release-reviewer")
+            && screen.contains("current: release-reviewer")
+            && !screen.contains("name ❯ release-reviewer")
             && screen.contains("type a new name")
             && screen.contains("empty resets to provider name")
     });
@@ -2535,7 +2535,6 @@ fn wide_real_tty_exercises_primary_interactions_and_restores_terminal() {
     app.wait_for("rename cancellation", |screen| !screen.contains("name ❯"));
 
     app.send(CTRL_R);
-    app.send(&[0x7f; 16]);
     app.send(b"reviewer-display-name");
     app.send(ENTER);
     app.wait_for("local rename submission", |screen| {
