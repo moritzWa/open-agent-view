@@ -117,6 +117,11 @@ and future released versions are intended to follow Semantic Versioning.
   opening a session that another process is running does not make it look
   idle. A session in the middle of a turn is credited to the `opencode`
   process in its directory before a session that process merely created. Subagent sessions are no longer listed as separate rows. Live state works on macOS and Linux.
+- Going back into an OpenCode session no longer keeps a garbled screen until
+  the window is resized. OpenCode only repaints the cells it thinks changed and
+  ignores a resize signal at an unchanged size, so the bridge briefly gives it
+  one row less, hides the frame drawn at that size, and restores the real size
+  to make it repaint everything.
 
 ### Tests
 

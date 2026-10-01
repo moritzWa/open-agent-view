@@ -41,6 +41,12 @@ const FALLBACK_TERMINAL_ROWS: u16 = 24;
 const FALLBACK_TERMINAL_COLUMNS: u16 = 80;
 #[cfg(unix)]
 const SCREEN_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
+/// How long a resumed OpenCode frontend sees a one-row-shorter terminal before
+/// the real size returns. OpenCode ignores SIGWINCH when the size is unchanged
+/// and debounces resizes for 100ms, so the hold must outlast that for both
+/// sizes to be processed and a full repaint to happen.
+#[cfg(unix)]
+const RESUME_REDRAW_HOLD: Duration = Duration::from_millis(120);
 
 #[derive(Debug)]
 pub enum NativeSessionExit {
@@ -647,7 +653,6 @@ fn bridge_session(
         stdout.write_all(&screen.screen().state_formatted())?;
         stdout.flush()?;
         signal_group(child.id(), libc::SIGCONT);
-        signal_group(child.id(), libc::SIGWINCH);
     }
     if fresh {
         if let Some(warning) = warning.as_deref() {
@@ -660,6 +665,27 @@ fn bridge_session(
     let mut current_size = terminal_size(libc::STDIN_FILENO).ok();
     if let Some(size) = current_size {
         set_pty_size(master.as_raw_fd(), size)?;
+    }
+    let mut redraw_restore_at = None;
+    let mut hidden_queries = TerminalQueryScanner::default();
+    if !fresh {
+        // The physical screen can disagree with what OpenCode's diff renderer
+        // believes it drew, so make it see a real size change and repaint.
+        // Output at the shorter size stays hidden; only the repaint at the
+        // real size reaches the screen.
+        if let Some(size) =
+            current_size.filter(|size| size.ws_row > 1 && forces_redraw_on_resume(session_key))
+        {
+            set_pty_size(
+                master.as_raw_fd(),
+                libc::winsize {
+                    ws_row: size.ws_row - 1,
+                    ..size
+                },
+            )?;
+            redraw_restore_at = Some(Instant::now() + RESUME_REDRAW_HOLD);
+        }
+        signal_group(child.id(), libc::SIGWINCH);
     }
     loop {
         let mut descriptors = [
@@ -682,7 +708,11 @@ fn bridge_session(
             }
         }
         if descriptors[0].revents & libc::POLLIN != 0 {
-            copy_available(&mut master, &mut stdout, &mut screen)?;
+            if redraw_restore_at.is_some() {
+                absorb_available(&mut master, &mut screen, &mut hidden_queries)?;
+            } else {
+                copy_available(&mut master, &mut stdout, &mut screen)?;
+            }
             forward_ready_initial_input(&mut initial_input, &screen, &mut master)?;
         }
         if descriptors[1].revents & libc::POLLIN != 0 {
@@ -762,6 +792,13 @@ fn bridge_session(
             master.flush()?;
         }
         return_gesture.update(&mut stdout, &screen)?;
+        if redraw_restore_at.is_some_and(|at| Instant::now() >= at) {
+            redraw_restore_at = None;
+            if let Some(size) = current_size {
+                set_pty_size(master.as_raw_fd(), size)?;
+                signal_group(child.id(), libc::SIGWINCH);
+            }
+        }
         if let Ok(size) = terminal_size(libc::STDIN_FILENO) {
             if current_size
                 .map(|current| !same_terminal_size(current, size))
@@ -1101,6 +1138,35 @@ fn copy_available(
     }
     output.flush()?;
     Ok(())
+}
+
+/// Read provider output into the screen model without drawing it, answering
+/// terminal queries the way the background drain does.
+#[cfg(unix)]
+fn absorb_available(
+    master: &mut std::fs::File,
+    screen: &mut vt100::Parser,
+    queries: &mut TerminalQueryScanner,
+) -> Result<()> {
+    set_nonblocking(master.as_raw_fd(), true)?;
+    let mut bytes = [0_u8; 8192];
+    loop {
+        match master.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(count) => process_detached_output(&bytes[..count], screen, queries, master),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Only OpenCode is known to repaint its whole screen on a real resize, which
+/// hiding its output at the temporary size depends on.
+#[cfg(unix)]
+fn forces_redraw_on_resume(session_key: &str) -> bool {
+    session_key.starts_with("opencode:")
 }
 
 #[cfg(unix)]
@@ -1721,6 +1787,34 @@ mod tests {
         );
         assert!(replies.is_empty());
         assert!(screen.screen().contents().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn output_absorbed_during_the_resume_redraw_still_updates_the_screen() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf hidden-frame; sleep 2"]);
+        let (mut child, mut master) = spawn_pty(&mut command).unwrap();
+        let mut screen = vt100::Parser::new(24, 80, 0);
+        let mut queries = TerminalQueryScanner::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !screen.screen().contents().contains("hidden-frame") {
+            assert!(Instant::now() < deadline, "{}", screen.screen().contents());
+            absorb_available(&mut master, &mut screen, &mut queries).unwrap();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_opencode_sessions_force_a_redraw_on_resume() {
+        assert!(forces_redraw_on_resume("opencode:host:ses_1"));
+        assert!(forces_redraw_on_resume("opencode:host:launch-abc"));
+        assert!(!forces_redraw_on_resume("claude:host:abc"));
+        assert!(!forces_redraw_on_resume("codex:portable:new"));
+        assert!(!forces_redraw_on_resume("setup:OpenCode"));
     }
 
     #[cfg(unix)]
