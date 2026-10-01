@@ -107,6 +107,7 @@ pub fn run_dashboard(
     refresh_interval: Duration,
     control: &ControlHub,
     hidden_sessions: HiddenSessions,
+    last_harness: crate::last_harness::LastHarness,
     session_aliases: SessionAliases,
     migrations: MigrationServices,
 ) -> Result<()> {
@@ -523,52 +524,61 @@ pub fn run_dashboard(
                                 provider,
                                 model,
                                 prompt,
-                            } => match control.launch_presentation(&provider) {
-                                Ok(LaunchPresentation::Foreground) => {
+                            } => {
+                                if let Err(error) = last_harness.save(&provider) {
                                     app.set_notice(format!(
-                                        "starting {} native session…",
-                                        provider.label()
+                                        "failed to remember harness: {error:#}"
                                     ));
-                                    terminal.terminal.draw(|frame| ui::render(frame, &app))?;
-                                    dispatch_foreground_launch(
-                                        &mut terminal,
-                                        &mut app,
-                                        provider,
-                                        model,
-                                        prompt,
-                                        control,
-                                    )
                                 }
-                                Ok(
-                                    presentation @ (LaunchPresentation::Background
-                                    | LaunchPresentation::DeferredForeground),
-                                ) => {
-                                    let known_session_ids = provider_session_ids(&app, &provider);
-                                    latest_launch_sequence = latest_launch_sequence.wrapping_add(1);
-                                    launching_provider = Some(provider.clone());
-                                    launch_animation_tick = 0;
-                                    next_launch_animation = Instant::now();
-                                    app.set_notice(format!("launching {}…", provider.label()));
-                                    schedule_launch(
-                                        control.clone(),
-                                        LaunchJob {
-                                            sequence: latest_launch_sequence,
+                                match control.launch_presentation(&provider) {
+                                    Ok(LaunchPresentation::Foreground) => {
+                                        app.set_notice(format!(
+                                            "starting {} native session…",
+                                            provider.label()
+                                        ));
+                                        terminal.terminal.draw(|frame| ui::render(frame, &app))?;
+                                        dispatch_foreground_launch(
+                                            &mut terminal,
+                                            &mut app,
                                             provider,
                                             model,
                                             prompt,
-                                            open_when_visible: presentation
-                                                == LaunchPresentation::DeferredForeground,
-                                            known_session_ids,
-                                        },
-                                        launch_tx.clone(),
-                                    );
-                                    ActionEffect::default()
+                                            control,
+                                        )
+                                    }
+                                    Ok(
+                                        presentation @ (LaunchPresentation::Background
+                                        | LaunchPresentation::DeferredForeground),
+                                    ) => {
+                                        let known_session_ids =
+                                            provider_session_ids(&app, &provider);
+                                        latest_launch_sequence =
+                                            latest_launch_sequence.wrapping_add(1);
+                                        launching_provider = Some(provider.clone());
+                                        launch_animation_tick = 0;
+                                        next_launch_animation = Instant::now();
+                                        app.set_notice(format!("launching {}…", provider.label()));
+                                        schedule_launch(
+                                            control.clone(),
+                                            LaunchJob {
+                                                sequence: latest_launch_sequence,
+                                                provider,
+                                                model,
+                                                prompt,
+                                                open_when_visible: presentation
+                                                    == LaunchPresentation::DeferredForeground,
+                                                known_session_ids,
+                                            },
+                                            launch_tx.clone(),
+                                        );
+                                        ActionEffect::default()
+                                    }
+                                    Err(error) => {
+                                        app.set_notice(format!("launch failed: {error:#}"));
+                                        ActionEffect::default()
+                                    }
                                 }
-                                Err(error) => {
-                                    app.set_notice(format!("launch failed: {error:#}"));
-                                    ActionEffect::default()
-                                }
-                            },
+                            }
                             other => dispatch_action(&mut terminal, &mut app, other, control),
                         };
                         if let Some(include_completed) = effect.completed_visibility {

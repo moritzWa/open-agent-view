@@ -10,6 +10,7 @@ pub mod doctor;
 pub mod domain;
 pub(crate) mod fs_util;
 pub mod hidden;
+pub mod last_harness;
 pub mod maintenance;
 pub mod migration;
 pub mod native_session;

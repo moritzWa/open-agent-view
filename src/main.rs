@@ -25,6 +25,7 @@ use open_agent_view::control::{ControlHub, ControlHubConfig};
 use open_agent_view::doctor::{diagnose, render_text};
 use open_agent_view::domain::Provider;
 use open_agent_view::hidden::{HiddenSessionRecord, HiddenSessions};
+use open_agent_view::last_harness::LastHarness;
 use open_agent_view::maintenance::{
     execute_completed_archive, plan_completed_archive, BulkArchiveReport,
 };
@@ -420,15 +421,15 @@ struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     managed_docker_registry: Option<PathBuf>,
 
-    /// Initial coding-agent or Terminal harness used by the new-session composer.
+    /// Initial coding-agent or Terminal harness used by the new-session
+    /// composer. Defaults to the harness of the last launch, then Claude.
     #[arg(
         long = "harness",
         visible_alias = "launch-provider",
         value_name = "HARNESS",
-        value_enum,
-        default_value_t = LaunchProvider::Claude
+        value_enum
     )]
-    launch_provider: LaunchProvider,
+    launch_provider: Option<LaunchProvider>,
 
     /// Working directory used for newly launched sessions.
     #[arg(long, value_name = "PATH")]
@@ -554,26 +555,10 @@ fn main() -> Result<()> {
         Some(path) => path,
         None => std::env::current_dir()?,
     };
+    let last_harness = LastHarness::load_default()?;
     let launch_provider = match cli.launch_provider {
-        LaunchProvider::Claude => Provider::Claude,
-        LaunchProvider::Codex => Provider::Codex,
-        LaunchProvider::Pi => Provider::Pi,
-        LaunchProvider::OpenCode => Provider::OpenCode,
-        LaunchProvider::Cursor => Provider::Cursor,
-        LaunchProvider::Copilot => Provider::GitHubCopilot,
-        LaunchProvider::Antigravity => Provider::Antigravity,
-        LaunchProvider::MistralVibe => Provider::MistralVibe,
-        LaunchProvider::Muse => Provider::MuseCode,
-        LaunchProvider::Qwen => Provider::QwenCode,
-        LaunchProvider::Kimi => Provider::KimiCode,
-        LaunchProvider::Omp => Provider::OhMyPi,
-        LaunchProvider::Grok => Provider::Grok,
-        LaunchProvider::Kilo => Provider::KiloCode,
-        LaunchProvider::OpenHands => Provider::OpenHands,
-        LaunchProvider::Hermes => Provider::Hermes,
-        LaunchProvider::MastraCode => Provider::MastraCode,
-        LaunchProvider::Devin => Provider::Devin,
-        LaunchProvider::Terminal => Provider::Terminal,
+        None => last_harness.provider().unwrap_or(Provider::Claude),
+        Some(provider) => launch_provider_domain(provider),
     };
     let pi_session_dir = if !pi_enabled {
         None
@@ -984,6 +969,7 @@ fn main() -> Result<()> {
         Duration::from_millis(cli.refresh_ms),
         &control,
         hidden_sessions,
+        last_harness,
         session_aliases,
         MigrationServices::new(migration_client, migration_registry),
     )?;
@@ -1592,6 +1578,30 @@ fn run_harness_setup(provider: LaunchProvider, confirmed: bool, cli: &Cli) -> Re
     }
     println!("✓ {label} setup completed. Return to Open Agent View and retry the model picker.");
     Ok(())
+}
+
+fn launch_provider_domain(provider: LaunchProvider) -> Provider {
+    match provider {
+        LaunchProvider::Claude => Provider::Claude,
+        LaunchProvider::Codex => Provider::Codex,
+        LaunchProvider::Pi => Provider::Pi,
+        LaunchProvider::OpenCode => Provider::OpenCode,
+        LaunchProvider::Cursor => Provider::Cursor,
+        LaunchProvider::Copilot => Provider::GitHubCopilot,
+        LaunchProvider::Antigravity => Provider::Antigravity,
+        LaunchProvider::MistralVibe => Provider::MistralVibe,
+        LaunchProvider::Muse => Provider::MuseCode,
+        LaunchProvider::Qwen => Provider::QwenCode,
+        LaunchProvider::Kimi => Provider::KimiCode,
+        LaunchProvider::Omp => Provider::OhMyPi,
+        LaunchProvider::Grok => Provider::Grok,
+        LaunchProvider::Kilo => Provider::KiloCode,
+        LaunchProvider::OpenHands => Provider::OpenHands,
+        LaunchProvider::Hermes => Provider::Hermes,
+        LaunchProvider::MastraCode => Provider::MastraCode,
+        LaunchProvider::Devin => Provider::Devin,
+        LaunchProvider::Terminal => Provider::Terminal,
+    }
 }
 
 fn launch_provider_value(provider: LaunchProvider) -> &'static str {
@@ -2461,7 +2471,7 @@ mod tests {
         assert!(cli.include_external);
         assert_eq!(cli.history_limit, 250);
         assert_eq!(cli.cwd, Some(PathBuf::from("/project")));
-        assert_eq!(cli.launch_provider, LaunchProvider::Codex);
+        assert_eq!(cli.launch_provider, Some(LaunchProvider::Codex));
         assert_eq!(cli.launch_cwd, Some(PathBuf::from("/launch")));
         assert_eq!(cli.refresh_ms, 250);
         assert_eq!(cli.docker_containers, vec!["explicit-container"]);
@@ -2514,11 +2524,11 @@ mod tests {
             let cli =
                 Cli::try_parse_from(["open-agent-view", "--json", "--launch-provider", value])
                     .unwrap();
-            assert_eq!(cli.launch_provider, expected);
+            assert_eq!(cli.launch_provider, Some(expected));
         }
         let alias =
             Cli::try_parse_from(["open-agent-view", "--json", "--harness", "codex"]).unwrap();
-        assert_eq!(alias.launch_provider, LaunchProvider::Codex);
+        assert_eq!(alias.launch_provider, Some(LaunchProvider::Codex));
     }
 
     #[test]
