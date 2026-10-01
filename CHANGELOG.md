@@ -60,6 +60,10 @@ and future released versions are intended to follow Semantic Versioning.
 
 ### Changed
 
+- Ctrl+X no longer opens a confirmation dialog to delete or hide a session or
+  group. The first press shows `ctrl+x again to delete` (or `to hide`) on the
+  row and the second press acts; any other key cancels. A stop still counts as
+  the first press, so stop-then-delete remains Ctrl+X twice.
 - ctrl+r opens the rename composer empty, so a new title is typed from
   scratch. The current name is shown in the composer's top border.
 - The 15 most recently active listed OpenCode sessions have their interface
