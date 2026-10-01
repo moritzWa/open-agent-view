@@ -1,7 +1,9 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -163,38 +165,53 @@ fn save_sort_keys(
 /// Pause between starting prewarmed frontends so a dashboard start does not
 /// boot every client at once.
 const PREWARM_STAGGER: Duration = Duration::from_millis(150);
+/// Each idle client holds a few hundred MB and redraws on every server event,
+/// so only the most recently active sessions are kept warm.
+const PREWARM_LIMIT: usize = 15;
 
-/// Boot the frontend of every listed OpenCode session behind the dashboard,
-/// each at most once per dashboard process, so opening one after a restart
-/// does not wait for a cold client.
+/// Keep the frontends of the most recently active listed OpenCode sessions
+/// booted behind the dashboard, so opening one after a restart does not wait
+/// for a cold client. Prewarmed clients that fall out of that set are stopped;
+/// frontends the user has opened are left alone.
 fn prewarm_listed_sessions(
     control: &ControlHub,
     snapshot: &SessionSnapshot,
-    attempted: &mut BTreeSet<String>,
+    busy: &Arc<AtomicBool>,
 ) {
-    let sessions: Vec<AgentSession> = snapshot
+    if busy.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let mut sessions: Vec<AgentSession> = snapshot
         .sessions
         .iter()
         .filter(|session| {
             session.provider == Provider::OpenCode
                 && session.runtime == crate::domain::Runtime::Host
         })
-        .filter(|session| attempted.insert(session.id.clone()))
         .cloned()
         .collect();
-    if sessions.is_empty() {
-        return;
-    }
+    sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    sessions.truncate(PREWARM_LIMIT);
+    let keep: BTreeSet<String> = sessions.iter().map(|session| session.id.clone()).collect();
     let control = control.clone();
-    let _ = thread::Builder::new()
+    let worker_busy = Arc::clone(busy);
+    let spawned = thread::Builder::new()
         .name("native-prewarm".into())
         .spawn(move || {
+            crate::native_session::release_prewarmed_except(&keep);
             for session in sessions {
+                if crate::native_session::holds(&session.id) {
+                    continue;
+                }
                 if matches!(control.prewarm(&session), Ok(true)) {
                     thread::sleep(PREWARM_STAGGER);
                 }
             }
+            worker_busy.store(false, Ordering::Release);
         });
+    if spawned.is_err() {
+        busy.store(false, Ordering::Release);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -312,7 +329,7 @@ pub fn run_dashboard(
     let mut needs_draw = true;
     let mut input_burst = InputBurst::default();
     let mut event_reader = MetaArrowReader::default();
-    let mut prewarm_attempted = BTreeSet::new();
+    let prewarm_busy = Arc::new(AtomicBool::new(false));
     schedule_refresh(
         &refresh_tx,
         &discovery_request_for_pending_launch(&current_request, pending_launch.as_ref()),
@@ -359,7 +376,7 @@ pub fn run_dashboard(
                         pending_launch_retry_at = None;
                     }
                     if complete {
-                        prewarm_listed_sessions(control, &app.snapshot, &mut prewarm_attempted);
+                        prewarm_listed_sessions(control, &app.snapshot, &prewarm_busy);
                         refresh_in_flight = false;
                         last_refresh = Instant::now();
                         if let Some(pending) = pending_launch.as_ref() {

@@ -62,11 +62,12 @@ and future released versions are intended to follow Semantic Versioning.
 
 - ctrl+r opens the rename composer empty, so a new title is typed from
   scratch. The current name is shown in the composer's top border.
-- Every listed OpenCode session's interface starts behind the dashboard after
-  each refresh, so the first Enter/Right after a restart attaches in about
-  100ms instead of waiting seconds for a cold client to load its history.
-  These clients stay out of the row's status until opened and are stopped
-  when the dashboard quits. They are told the terminal's colors match the
+- The 15 most recently active listed OpenCode sessions have their interface
+  started behind the dashboard, so the first Enter/Right after a restart
+  attaches in about 100ms instead of waiting seconds for a cold client to
+  load its history. A session that drops out of the 15 has its unopened
+  client stopped. These clients stay out of the row's status until opened and
+  are stopped when the dashboard quits. They are told the terminal's colors match the
   dashboard's light or dark scheme, so OpenCode does not fall back to its dark
   theme in a light terminal.
 - The dashboard opens on the view it was last left in. Toggling between the

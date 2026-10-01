@@ -506,6 +506,47 @@ fn park_prewarmed(mut command: Command, session_key: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Whether this process holds a frontend for the key, in front or behind.
+pub fn holds(session_key: &str) -> bool {
+    #[cfg(unix)]
+    {
+        is_held(session_key)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = session_key;
+        false
+    }
+}
+
+/// Stop prewarmed frontends that were never opened and are not in `keep`.
+pub fn release_prewarmed_except(keep: &std::collections::BTreeSet<String>) {
+    #[cfg(unix)]
+    release_prewarmed_where(|key| !keep.contains(key));
+    #[cfg(not(unix))]
+    let _ = keep;
+}
+
+#[cfg(unix)]
+fn release_prewarmed_where(release: impl Fn(&str) -> bool) {
+    let Ok(mut registry) = detached_registry().lock() else {
+        return;
+    };
+    let stale: Vec<String> = registry
+        .iter()
+        .filter(|(key, session)| session.prewarmed && release(key))
+        .map(|(key, _)| key.clone())
+        .collect();
+    let released: Vec<DetachedSession> = stale
+        .iter()
+        .filter_map(|key| registry.remove(key))
+        .collect();
+    drop(registry);
+    for mut session in released {
+        terminate_detached(&mut session);
+    }
+}
+
 #[cfg(unix)]
 fn is_held(session_key: &str) -> bool {
     in_foreground(session_key)
@@ -2213,6 +2254,29 @@ mod tests {
         assert!(screen.screen().contents().contains("ctrl+p commands"));
         signal_group(child.id(), libc::SIGKILL);
         let _ = child.wait();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn release_stops_only_prewarmed_frontends_outside_the_kept_set() {
+        let kept = "provider:host:release-kept";
+        let dropped = "provider:host:release-dropped";
+        let opened = "provider:host:release-opened";
+        for key in [kept, dropped] {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 30"]);
+            assert!(park_prewarmed(command, key).unwrap());
+        }
+        detach_for_test(opened, "exec sleep 30");
+        // Other tests share the registry, so release only this test's keys.
+        release_prewarmed_where(|key| key.starts_with("provider:host:release-") && key != kept);
+        assert!(holds(kept));
+        assert!(!holds(dropped));
+        assert!(holds(opened));
+        for key in [kept, opened] {
+            let mut session = take_detached(key).unwrap().unwrap();
+            terminate_detached(&mut session);
+        }
     }
 
     #[test]
