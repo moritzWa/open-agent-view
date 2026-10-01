@@ -313,6 +313,9 @@ impl ProviderController for OpenCodeController {
                 .as_ref()
                 .context("managed OpenCode control is not configured")?
                 .native_attach_command(&session.provider_session_id)?
+        } else if let Some(supervisor) = self.supervisor.as_ref().filter(|_| session.cwd.is_dir()) {
+            supervisor
+                .native_attach_command_for_external(&session.provider_session_id, &session.cwd)?
         } else {
             let mut command = Command::new(&self.executable);
             command

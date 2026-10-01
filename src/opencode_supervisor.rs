@@ -294,7 +294,26 @@ impl OpenCodeSupervisor {
         Ok(build_native_attach_command(
             &self.executable,
             &record,
-            owned,
+            &owned.id,
+            &owned.cwd,
+        ))
+    }
+
+    /// Attach a native TUI to a session this supervisor did not create. Its
+    /// turns then run in the durable server rather than in a TUI process the
+    /// dashboard owns, so quitting the dashboard does not abort them.
+    pub fn native_attach_command_for_external(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+    ) -> Result<Command> {
+        let _lock = StateLock::acquire(&self.lock_path)?;
+        let record = self.ensure_server_locked()?;
+        Ok(build_native_attach_command(
+            &self.executable,
+            &record,
+            session_id,
+            cwd,
         ))
     }
 
@@ -591,17 +610,18 @@ fn require_owned<'a>(record: &'a ServerRecord, session_id: &str) -> Result<&'a O
 fn build_native_attach_command(
     executable: &str,
     record: &ServerRecord,
-    owned: &OwnedSession,
+    session_id: &str,
+    cwd: &Path,
 ) -> Command {
     let mut command = Command::new(executable);
     command
         .arg("attach")
         .arg(format!("http://127.0.0.1:{}", record.port))
-        .args(["--session", &owned.id, "--dir"])
-        .arg(&owned.cwd)
+        .args(["--session", session_id, "--dir"])
+        .arg(cwd)
         .env("OPENCODE_SERVER_USERNAME", &record.username)
         .env("OPENCODE_SERVER_PASSWORD", &record.password)
-        .current_dir(&owned.cwd);
+        .current_dir(cwd);
     command
 }
 
@@ -1716,7 +1736,7 @@ mod tests {
             sessions: BTreeMap::from([(owned.id.clone(), owned.clone())]),
         };
 
-        let command = build_native_attach_command("/bin/opencode", &record, &owned);
+        let command = build_native_attach_command("/bin/opencode", &record, &owned.id, &owned.cwd);
         let arguments = command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
