@@ -58,6 +58,8 @@ and future released versions are intended to follow Semantic Versioning.
 
 - The dashboard opens on the view it was last left in. Toggling between the
   status and directory views with ctrl+s is remembered across restarts.
+- Directory view lists each directory's sessions newest-created first instead
+  of by state, so replying to a session no longer moves its row or the cursor.
 - Session rows follow Claude Code's agent view. In directory view the state
   word takes the state's color (Needs input and Review amber, Done green,
   Working in the normal text color) ahead of a grey summary, the harness name
