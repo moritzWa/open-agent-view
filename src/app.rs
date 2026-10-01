@@ -1619,10 +1619,22 @@ impl App {
         if let Some(group) = self.pinned_group(pinned) {
             ordered.push(group);
         }
-        ordered.extend(groups.into_iter().map(|(path, sessions)| Group {
-            key: format!("cwd:{}", path.display()),
-            label: abbreviate_home(&path),
-            sessions,
+        ordered.extend(groups.into_iter().map(|(path, mut sessions)| {
+            // Keep rows still while sessions change state, so replying to one
+            // does not move it (and the cursor) elsewhere in its directory.
+            sessions.sort_by(|left, right| {
+                let left = &self.snapshot.sessions[*left];
+                let right = &self.snapshot.sessions[*right];
+                right
+                    .started_at
+                    .cmp(&left.started_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            Group {
+                key: format!("cwd:{}", path.display()),
+                label: abbreviate_home(&path),
+                sessions,
+            }
         }));
         ordered
     }
@@ -3545,6 +3557,35 @@ mod tests {
         assert_eq!(app.selection, Some(SelectionKey::Session("one".into())));
         app.toggle_view();
         assert_eq!(app.view_mode, ViewMode::Status);
+    }
+
+    #[test]
+    fn directory_view_orders_sessions_by_creation_not_state() {
+        let started = |id: &str, state, secs| {
+            let mut item = session(id, state);
+            item.started_at = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+            item
+        };
+        let mut app = app_with(vec![
+            started("old", SessionState::ReadyForReview, 1),
+            started("new", SessionState::Working, 3),
+            started("mid", SessionState::Completed, 2),
+        ]);
+        app.toggle_view();
+        let order = |app: &App| -> Vec<String> {
+            app.group_cache[0]
+                .sessions
+                .iter()
+                .map(|index| app.snapshot.sessions[*index].id.clone())
+                .collect()
+        };
+        assert_eq!(order(&app), ["new", "mid", "old"]);
+
+        let mut snapshot = app.snapshot.clone();
+        snapshot.sessions[0].state = SessionState::Working;
+        snapshot.sessions[1].state = SessionState::ReadyForReview;
+        app.replace_snapshot(snapshot);
+        assert_eq!(order(&app), ["new", "mid", "old"]);
     }
 
     #[test]
